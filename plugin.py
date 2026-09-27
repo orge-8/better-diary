@@ -1,0 +1,1056 @@
+"""better-diary: 两阶段日记生成插件。
+
+对比旧 diary_plugin 的核心改进：
+1. 两阶段生成 —— 阶段一按块提取"值得写的事"并打分，阶段二只喂精选事件成文，
+   避免 50k 时间线一次进 prompt 导致模型按时间顺序线性复述聊天记录；
+2. 反 AI 腔规则 + 强制引用聊天原话，日记有记忆点而不是转述；
+3. 字数软控制（模型侧遵守），不做硬截断砍句子；
+4. 天气/心情由模型随文生成，替代关键词计数猜测。
+"""
+
+import asyncio
+import copy
+import datetime
+import json
+import logging
+import re
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any, cast
+
+from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase
+from pydantic import field_validator
+
+if __package__:  # 包式加载（Runner 真机：插件目录作为包，不在 sys.path 上）
+    from .bd_prompts import (
+        build_extract_prompt,
+        build_timeline,
+        build_write_prompt,
+        chunk_text,
+        date_display,
+        diary_output_problem,
+        ensure_date_line,
+        events_to_text,
+        parse_events,
+        strip_diary_output,
+    )
+    from .bd_cookie import CookieStore
+else:  # 平铺兜底（脚本直跑 / 旧测试夹具）
+    from bd_prompts import (
+        build_extract_prompt,
+        build_timeline,
+        build_write_prompt,
+        chunk_text,
+        date_display,
+        diary_output_problem,
+        ensure_date_line,
+        events_to_text,
+        parse_events,
+        strip_diary_output,
+    )
+    from bd_cookie import CookieStore
+
+logger = logging.getLogger("plugin.org.civetc.better-diary")
+
+# 发送单条消息的最大长度（QQ 文本安全线）
+_SEND_LIMIT = 1500
+
+# 与 PluginSection.config_version 的默认值保持一致（配置垫片要用）
+_DEFAULT_CONFIG_VERSION = "1.0.0"
+
+
+# ---------------------------------------------------------------- 配置模型
+
+
+def _as_str_list(value: Any) -> Any:
+    """把 config.toml 里常见的「字符串形式的列表」友好地归一化为 list。
+
+    真机踩坑（v1.2.3）：用户在 config.toml 里很容易写成
+
+        admin_ids = "123456789"          # 而不是 ["123456789"]
+        target_chats = "group:123456"
+
+    这层归一化只能拦住「配置里**已经有** ``[plugin].config_version``」的那条支线：
+    SDK 的 ``normalize_plugin_config`` 顺序是「先版本检查 → 再 pydantic 校验」，
+    缺少 ``[plugin]`` 节的配置会在更早一步就抛 ``PluginConfigVersionError``。
+    （真机上更早一步还有 **Runner 自己**的那道版本检查，详见类里的注册期防御注释——
+    所以遇到「插件初始化失败」的正确动作是**换掉 config.toml**，不是改这里的代码。）
+    """
+
+    if value is None:
+        return []
+    if isinstance(value, str):
+        normalized = value.replace("，", ",").replace(";", ",").replace("\n", ",")
+        return [item.strip() for item in normalized.split(",") if item.strip()]
+    return value
+
+
+class PluginSection(PluginConfigBase):
+    """插件基础配置。"""
+
+    enabled: bool = Field(default=True, description="是否启用插件")
+    config_version: str = Field(default=_DEFAULT_CONFIG_VERSION, description="配置版本")
+
+
+class DiarySection(PluginConfigBase):
+    """日记生成配置。"""
+
+    word_target: int = Field(default=250, description="日记目标字数（正文）")
+    max_events: int = Field(default=3, description="日记最多写几件事")
+    min_messages: int = Field(default=20, description="当天消息少于此数不生成日记")
+    chunk_chars: int = Field(default=6000, description="时间线分块字符数")
+    max_chunks: int = Field(default=8, description="最多送入选材的分块数")
+    persona_override: str = Field(default="", description="覆盖 Host 人设；留空则读取主程序人设")
+    style_extra: str = Field(default="", description="追加到写作规则后的额外风格要求")
+    filter_mode: str = Field(default="all", description="聊天过滤：all / whitelist / blacklist")
+    target_chats: list[str] = Field(default_factory=list, description='过滤目标列表，格式 "group:群号" 或 "private:QQ号"')
+
+    _norm_target_chats = field_validator("target_chats", mode="before")(_as_str_list)
+
+
+class ScheduleSection(PluginConfigBase):
+    """定时任务配置。"""
+
+    enabled: bool = Field(default=True, description="是否启用每日定时生成")
+    time: str = Field(default="23:30", description="每天生成时间，HH:MM（Host 本地时区）")
+    notify_chats: list[str] = Field(default_factory=list, description='定时发布后通知哪些聊天，格式 "group:群号" / "private:QQ号" / 裸 stream_id；留空则不发通知')
+
+    _norm_notify_chats = field_validator("notify_chats", mode="before")(_as_str_list)
+
+
+class QzoneSection(PluginConfigBase):
+    """QQ空间发布配置（日记成品只发这里）。"""
+
+    enabled: bool = Field(default=True, description="日记生成后是否发布到QQ空间")
+    auto_cookie: bool = Field(default=True, description="自动获取 cookie：先试 napcat-adapter API，再试 NapCat HTTP 服务器，最后用手动兜底配置")
+    refresh_interval_min: int = Field(default=60, description="自动取 cookie 的节流间隔（分钟）")
+    napcat_http_host: str = Field(default="127.0.0.1", description="NapCat HTTP 服务器地址（MaiBot 1.3.0+ 无 adapter 时的主要 cookie 来源）")
+    napcat_http_port: str = Field(default="3000", description="NapCat HTTP 服务器端口（NapCat WebUI 网络配置里开启的那个 HTTP Server）")
+    napcat_http_token: str = Field(default="", description="NapCat HTTP 服务器的 token（未设置鉴权可留空）")
+    uin: str = Field(default="", description="手动兜底 cookie 的 QQ 号（自动获取失败时才用到；纯数字）")
+    p_skey: str = Field(default="", description="手动兜底 cookie 的 p_skey（可留空）")
+    skey: str = Field(default="", description="手动兜底 cookie 的 skey（可留空）")
+    timeout_seconds: int = Field(default=20, description="发布请求超时（秒）")
+
+
+class LLMSection(PluginConfigBase):
+    """LLM 调用配置。"""
+
+    task_name: str = Field(default="utils", description="Host 模型任务名")
+    temperature: float = Field(default=0.8, description="成文温度")
+    extract_temperature: float = Field(default=0.2, description="选材温度（建议低温保证 JSON 稳定）")
+    timeout_seconds: int = Field(default=180, description="单次 LLM 调用超时（秒）")
+
+
+class SecuritySection(PluginConfigBase):
+    """安全配置。"""
+
+    admin_ids: list[str] = Field(default_factory=list, description="管理员 QQ 列表，兼容 '123' 与 'qq:123' 写法；留空时全部放行")
+
+    _norm_admin_ids = field_validator("admin_ids", mode="before")(_as_str_list)
+
+
+class BetterDiaryConfig(PluginConfigBase):
+    """插件配置总模型。"""
+
+    plugin: PluginSection = Field(default_factory=PluginSection)
+    diary: DiarySection = Field(default_factory=DiarySection)
+    schedule: ScheduleSection = Field(default_factory=ScheduleSection)
+    qzone: QzoneSection = Field(default_factory=QzoneSection)
+    llm: LLMSection = Field(default_factory=LLMSection)
+    security: SecuritySection = Field(default_factory=SecuritySection)
+
+
+# ---------------------------------------------------------------- 插件主体
+
+
+class BetterDiaryPlugin(MaiBotPlugin):
+    """两阶段日记生成插件。日记成品只发布到 QQ 空间，聊天内仅回报执行状态。"""
+
+    config_model = BetterDiaryConfig
+
+    # 类级默认：不跑 on_load（如冒烟测试直接实例化）也能安全访问
+    _generating = False
+    _sched_task = None
+    _cookie_store = None
+    _cfg_fallback_warned = False
+
+    # ------------------------------------------------------------ 注册期防御
+    #
+    # 真机踩坑总览（v1.2.1 → v1.2.5）：
+    #   1) 导入期 —— 插件目录不在 sys.path，平铺导入必挂（v1.2.1 修，双路径导入）；
+    #   2) 配置期 —— 真因是**插件目录里的旧 config.toml**（v1.2.5 确认）。
+    #
+    # ★ 先记住这个层级划分，否则会一直在错误的地方改代码：
+    #
+    #   扫描 plugins/ → 读 _manifest.json → 校验依赖
+    #      → 导入 plugin.py → create_plugin() → 注入 ctx
+    #      → 配置注入：读 config.toml → extract_plugin_config_version   ← Runner 侧
+    #      → on_load()                                                  ← 才轮到本插件代码
+    #
+    #   宿主对两者的说法不同：
+    #     「插件初始化失败」= 挂在配置注入之前（**本插件代码一行都没执行**）
+    #     「插件加载失败」  = on_load 抛的异常
+    #   看到「初始化失败」就别改插件源码 —— 改不动的。
+    #
+    #   真机实录的最常见成因：`plugin.config_version` 是 **Host 1.2.3 引入的硬性要求**，
+    #   而 config.toml 由旧宿主生成、没有这个键；宿主一升级，Runner 就读不过。
+    #   唯一的解法是换个合法 config.toml（删掉重生成，或 WebUI 保存一次）。
+    #
+    #   版本检查逻辑在 `runner/runner_main.py::extract_plugin_config_version`，
+    #   即 **Runner 自己的代码**，不在下面这个 SDK 方法里。
+    #
+    # 下面这层防御只覆盖「配置已过 Runner 版本检查、但在 SDK 侧出了问题」的情况
+    # （SDK 2.8.1 源码确认）：
+    #   MaiBotPlugin.set_plugin_config:191  normalize_plugin_config(...)  ← 裸调用，无 try
+    #   normalize_plugin_config:173/178     extract_plugin_config_version(...)
+    #   normalize_plugin_config:175/180     validate_plugin_config(...)
+    #   两类调用都会抛，且**版本检查排在合并默认值之前**；
+    #   而 set_plugin_config:200 那次 pydantic 校验是有 try 的（只 warning），
+    #   所以这一层里唯一裸奔的入口是 normalize_plugin_config。
+
+    def _log_info(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        """best-effort 记录 INFO：日志器自身不可用时静默，绝不丢给宿主。"""
+        try:
+            self._get_logger().info(msg, *args, **kwargs)
+        except Exception:  # noqa: BLE001 - 日志失败不能反过来拖垮加载
+            pass
+
+    def _log_error(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        """best-effort 记录 ERROR：日志器自身不可用时静默，绝不丢给宿主。"""
+        try:
+            self._get_logger().error(msg, *args, **kwargs)
+        except Exception:  # noqa: BLE001 - 同上
+            pass
+
+    @staticmethod
+    def _merge_with_defaults(defaults: Mapping[str, Any], raw: Mapping[str, Any]) -> dict[str, Any]:
+        """把用户配置递归合并进默认配置，保留用户已填的值。
+
+        兜底时用它而不是直接用模型默认值：直接丢默认会把用户填的
+        uin / p_skey / admin_ids 一起抹掉，比配置写错更糟。
+        """
+
+        merged: dict[str, Any] = copy.deepcopy(dict(defaults))
+        for key, value in raw.items():
+            current = merged.get(key)
+            if isinstance(value, Mapping) and isinstance(current, dict):
+                merged[str(key)] = BetterDiaryPlugin._merge_with_defaults(
+                    cast(Mapping[str, Any], current), value
+                )
+            else:
+                merged[str(key)] = copy.deepcopy(value)
+        return merged
+
+    @staticmethod
+    def _sanitize_config(config: Any) -> Any:
+        """交给 SDK 之前，把 ``[plugin].config_version`` 补齐。
+
+        SDK 会**先**对原始配置做版本检查、**再**合并默认值，所以「用户少写了
+        ``[plugin]`` 节」这种最常见的情况会先抛 ``PluginConfigVersionError``。
+        这里补上版本号，属于对宿主配置格式的兼容垫片（非 Mapping 原样透传，
+        交给 SDK 自己的默认值分支处理）。
+        """
+
+        if not isinstance(config, Mapping):
+            return config
+        data: dict[str, Any] = dict(config)
+        raw_section = data.get("plugin")
+        section: dict[str, Any] = dict(raw_section) if isinstance(raw_section, Mapping) else {}
+        if not str(section.get("config_version") or "").strip():
+            section["config_version"] = _DEFAULT_CONFIG_VERSION
+        data["plugin"] = section
+        return data
+
+    @staticmethod
+    def _reset_path(target: dict[str, Any], defaults: Mapping[str, Any], loc: tuple[Any, ...]) -> bool:
+        """把 ``loc`` 指向的字段就地还原成默认值。返回是否真的改了东西。"""
+
+        if not loc:
+            return False
+        cursor: Any = target
+        default_cursor: Any = defaults
+        for key in loc[:-1]:
+            if not isinstance(cursor, dict) or key not in cursor:
+                return False
+            cursor = cursor[key]
+            default_cursor = default_cursor.get(key, {}) if isinstance(default_cursor, Mapping) else {}
+        last = loc[-1]
+        if not isinstance(cursor, dict) or last not in cursor:
+            return False
+        if isinstance(default_cursor, Mapping) and last in default_cursor:
+            cursor[last] = copy.deepcopy(default_cursor[last])
+        else:
+            cursor.pop(last, None)
+        return True
+
+    @classmethod
+    def _repair_config(cls, config_class: Any, merged: dict[str, Any], defaults: Mapping[str, Any]) -> Any:
+        """逐字段修复配置：只把**真正非法**的字段还原为默认值，其余用户值全部保留。
+
+        直接「整体丢回模型默认值」会把用户填的 uin / p_skey / admin_ids 一起抹掉，
+        比配置写错更糟。这里读 pydantic 的 ``ValidationError.errors()`` 拿到出错字段的
+        ``loc``，定点还原后重试，直到通过或无法再修。
+        """
+
+        candidate = copy.deepcopy(dict(merged))
+        for _ in range(24):  # 字段数量级上限，兼作死循环保险
+            try:
+                return config_class.model_validate(candidate)
+            except Exception as exc:  # noqa: BLE001
+                errors = getattr(exc, "errors", None)
+                if not callable(errors):
+                    return None
+                try:
+                    collected = errors()
+                except Exception:  # noqa: BLE001
+                    return None
+                repaired = False
+                for err in collected:
+                    loc = tuple(err.get("loc") or ())
+                    if cls._reset_path(candidate, defaults, loc):
+                        repaired = True
+                if not repaired:
+                    return None
+        return None
+
+    def set_plugin_config(self, config: dict[str, Any]) -> None:
+        """覆写 SDK 的 ``set_plugin_config``：配置问题绝不拖垮插件注册。
+
+        **注意作用范围**：这层拦的是「配置已过 Runner 版本检查、但 SDK 侧仍出错」的情况。
+        若宿主报的是「插件**初始化**失败」且日志里本插件零输出，说明挂在更上游的
+        Runner 配置注入（版本检查）——那里改不动，只能换 config.toml。详见类注释。
+
+        SDK 在这一层没有整体 try，任何配置异常都会冒泡到宿主，
+        而宿主只回一句「插件注册失败: <id>: 插件初始化失败」，现场信息全部丢失。
+        这里做两件事：
+
+        1. 先补 ``plugin.config_version``，消掉 SDK 侧的版本检查误报；
+        2. 仍然失败时用「默认配置 + 用户已有值」兜底，并把**真实异常**连同
+           traceback 写进日志——下一次排查不用再靠猜。
+        """
+
+        sanitized = self._sanitize_config(config)
+        try:
+            super().set_plugin_config(sanitized)
+            return
+        except Exception as exc:  # noqa: BLE001 - 必须兜住，否则整个插件注册失败
+            self._log_error(
+                "插件配置注入失败，已回退「默认配置 + 用户已有值」。真实原因如下"
+                "（请据此修 config.toml，常见的是缺 [plugin].config_version）：%s",
+                exc,
+                exc_info=True,
+            )
+
+        # ---- 兜底路径：语义上等价于「配置坏了也要能加载」
+        try:
+            defaults = type(self).build_default_config()
+        except Exception:  # noqa: BLE001
+            defaults = {}
+        raw = sanitized if isinstance(sanitized, Mapping) else {}
+        try:
+            merged = self._merge_with_defaults(defaults, cast(Mapping[str, Any], raw))
+        except Exception:  # noqa: BLE001
+            merged = dict(defaults)
+        section = merged.get("plugin")
+        if not isinstance(section, dict):
+            section = {}
+            merged["plugin"] = section
+        section.setdefault("config_version", _DEFAULT_CONFIG_VERSION)
+
+        config_class = type(self).get_config_model()
+        if config_class is None:
+            self._plugin_config_data = merged
+            self._plugin_config_instance = None
+            return
+        instance = self._repair_config(config_class, merged, defaults)
+        if instance is None:
+            # 连逐字段修复都救不回来（例如模型本身有问题）：退回纯默认值，但要说清楚
+            self._plugin_config_data = merged
+            self._log_error("回退配置无法逐字段修复，本次运行使用模型默认值")
+        else:
+            # 修好的配置回写：宿主下次持久化时会顺带把 config.toml 自愈成合法格式
+            self._plugin_config_data = instance.model_dump(mode="python")
+        self._plugin_config_instance = instance
+
+    @property
+    def config(self) -> BetterDiaryConfig:
+        """覆写 SDK 的 ``config``：配置实例缺失时回退默认配置。
+
+        这是一道**下游**保险。真正的上游保险是 ``set_plugin_config`` 覆写：
+        如果配置注入失败，SDK 会把 ``_plugin_config_instance`` 留成 None，
+        此后**任何** ``self.config`` 访问都会抛
+        ``RuntimeError("当前插件配置尚未完成注入")`` —— ``on_load`` 第一行就挂。
+        这里兜底成默认配置，保证插件至少能加载并跑起来；真正原因写进日志。
+        """
+        try:
+            return super().config
+        except Exception as exc:  # noqa: BLE001 - 兜底必须捕获全部
+            if not self._cfg_fallback_warned:
+                type(self)._cfg_fallback_warned = True
+                self._log_error(
+                    "插件配置不可用，已回退默认配置继续加载；请检查 config.toml 字段类型"
+                    '（列表项须写成 ["xxx"] 形式）：%s',
+                    exc,
+                    exc_info=True,
+                )
+            return self._fallback_config()
+
+    def _fallback_config(self) -> BetterDiaryConfig:
+        cache = getattr(self, "_fallback_cfg_cache", None)
+        if cache is None:
+            cache = BetterDiaryConfig()
+            self._fallback_cfg_cache = cache
+        return cache
+
+    async def on_load(self) -> None:
+        self._generating = False
+        self._sched_task: asyncio.Task | None = None
+        try:
+            # 各子步骤分层防御：任一失败都只记日志，绝不让插件注册整体失败
+            try:
+                self._cookie_store = self._build_cookie_store()
+            except Exception as exc:  # noqa: BLE001
+                self._cookie_store = None
+                self._log_error("cookie 组件初始化失败（插件仍可加载）：%s", exc, exc_info=True)
+            if self.config.schedule.enabled:
+                try:
+                    self._start_scheduler()
+                except Exception as exc:  # noqa: BLE001
+                    self._log_error("调度器启动失败（插件仍可加载）：%s", exc, exc_info=True)
+            self._log_info(
+                "better-diary 已加载：定时 %s（%s），字数目标 %d，发布目标 %s",
+                self.config.schedule.time if self.config.schedule.enabled else "关闭",
+                self.config.llm.task_name,
+                self.config.diary.word_target,
+                "QQ空间" if self.config.qzone.enabled else "仅存档",
+            )
+        except Exception as exc:  # noqa: BLE001
+            # 最后一道闸：on_load 绝不能把异常抛给宿主，否则同一条「插件初始化失败」
+            self._log_error("better-diary 加载流程异常（已吞掉，插件保持已注册）：%s", exc, exc_info=True)
+
+    async def on_unload(self) -> None:
+        if self._sched_task is not None:
+            self._sched_task.cancel()
+            self._sched_task = None
+        self._log_info("better-diary 已卸载")
+
+    async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
+        del config_data, version
+        # SDK 的 scope 取值为 "self" / "bot" / "model"；"plugin"/"all" 为兼容旧写法
+        if scope not in ("self", "plugin", "all"):
+            return
+        # cookie 来源/节流配置可能变了，重建 store（磁盘缓存自动恢复）
+        try:
+            self._cookie_store = self._build_cookie_store()
+        except Exception as exc:  # noqa: BLE001
+            self._log_error("cookie 组件重建失败：%s", exc, exc_info=True)
+        # 定时设置变更时重启调度器
+        if self._sched_task is not None:
+            self._sched_task.cancel()
+            self._sched_task = None
+        if self.config.schedule.enabled:
+            try:
+                self._start_scheduler()
+            except Exception as exc:  # noqa: BLE001
+                self._log_error("调度器重启失败：%s", exc, exc_info=True)
+        self._log_info("配置已热重载，调度器状态: %s", "运行中" if self.config.schedule.enabled else "停用")
+
+    # ------------------------------------------------------------ 命令区
+
+    @Command(
+        "diary",
+        description="生成指定日期（默认今天）的日记并发布到QQ空间（管理员）",
+        pattern=r"^\s*[/／]\s*(?:日记|diary)(?:\s+(?P<date>\d{4}-\d{1,2}-\d{1,2}))?\s*$",
+    )
+    async def cmd_diary(self, matched_groups: dict | None = None, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, int]:
+        if not self._is_admin(kwargs):
+            self.ctx.logger.info("diary 命令被静默拒绝（非管理员）")
+            return True, "", 2
+        if not stream_id:
+            return True, "缺少聊天流，无法回复", 2
+        raw = (matched_groups or {}).get("date") or ""
+        date_str = self._normalize_date(raw) if raw else self._today_str()
+        if date_str == "":
+            await self.ctx.send.text("日期格式不对，用 /日记 2026-09-26 这种写法。", stream_id)
+            return True, "", 2
+
+        if self._generating:
+            await self.ctx.send.text("正在生成上一篇日记，先等等。", stream_id)
+            return True, "", 2
+
+        await self.ctx.send.text(f"开始生成 {date_display(date_str)} 的日记，大概一两分钟。", stream_id)
+        ok, result = await self._generate_for_date(date_str)
+        if not ok:
+            await self.ctx.send.text(f"日记没写成：{result}", stream_id)
+            return True, "", 2
+
+        # 日记成品只发QQ空间，聊天里只回报状态；正文用 /日记查看 回看
+        if self.config.qzone.enabled:
+            pub_ok, pub_msg = await self._publish_to_qzone(result)
+            if pub_ok:
+                await self.ctx.send.text(
+                    f"{date_display(date_str)} 的日记已发布到QQ空间（{len(result)} 字）。"
+                    f"想回看用 /日记查看 {date_str}",
+                    stream_id,
+                )
+            else:
+                await self.ctx.send.text(
+                    f"日记写好了（{len(result)} 字），但发QQ空间失败：{pub_msg}。"
+                    f"想回看用 /日记查看 {date_str}",
+                    stream_id,
+                )
+        else:
+            await self.ctx.send.text(
+                f"日记已生成并存档（{len(result)} 字）。QQ空间发布未启用，想回看用 /日记查看 {date_str}",
+                stream_id,
+            )
+        return True, "", 2
+
+    @Command(
+        "diary_view",
+        description="查看已保存的日记",
+        pattern=r"^\s*[/／]\s*(?:日记查看|查看日记)\s*(?P<date>\d{4}-\d{1,2}-\d{1,2})?\s*$",
+    )
+    async def cmd_diary_view(self, matched_groups: dict | None = None, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, int]:
+        del kwargs
+        if not stream_id:
+            return True, "缺少聊天流，无法回复", 2
+        raw = (matched_groups or {}).get("date") or ""
+        date_str = self._normalize_date(raw) if raw else self._today_str()
+        diary = self._load_diaries().get(date_str)
+        if not diary or not diary.get("content"):
+            await self.ctx.send.text(f"{date_str} 没有存档的日记。", stream_id)
+            return True, "", 2
+        await self._send_long(str(diary.get("content")), stream_id)
+        return True, "", 2
+
+    @Command(
+        "diary_help",
+        description="查看日记插件用法",
+        pattern=r"^\s*[/／]\s*(?:日记帮助|diary_help)\s*$",
+    )
+    async def cmd_diary_help(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, int]:
+        del kwargs
+        if not stream_id:
+            return True, "缺少聊天流，无法回复", 2
+        await self.ctx.send.text(
+            "better-diary 用法：\n"
+            "/日记 —— 生成今天的日记并发布到QQ空间（管理员）\n"
+            "/日记 2026-09-26 —— 生成指定日期的日记并发布（管理员）\n"
+            "/日记查看 [日期] —— 在聊天里回看已存档的日记\n"
+            "/日记帮助 —— 本说明",
+            stream_id,
+        )
+        return True, "", 2
+
+    # ------------------------------------------------------------ 权限
+
+    def _is_admin(self, kwargs: dict) -> bool:
+        """自管 admin_ids：留空 fail-open；拒绝不发言只留日志。"""
+        if bool(kwargs.get("is_local_operator")):
+            return True
+        admins = {str(a).split(":")[-1].strip().lower() for a in (self.config.security.admin_ids or [])}
+        if not admins:
+            return True
+        user_id = str(kwargs.get("user_id") or "")
+        if not user_id:
+            msg = kwargs.get("message") or {}
+            info = msg.get("message_info") or {} if isinstance(msg, dict) else {}
+            user_info = info.get("user_info") or {} if isinstance(info, dict) else {}
+            user_id = str(user_info.get("user_id", "") or "")
+        return bool(user_id) and user_id.lower() in admins
+
+    # ------------------------------------------------------------ 定时调度
+
+    def _start_scheduler(self) -> None:
+        self._sched_task = asyncio.create_task(self._schedule_loop())
+
+    def _seconds_until_next(self, hhmm: str) -> float:
+        try:
+            hour, minute = (int(x) for x in hhmm.split(":"))
+            hour = max(0, min(23, hour))
+            minute = max(0, min(59, minute))
+        except (ValueError, AttributeError):
+            hour, minute = 23, 30
+        now = datetime.datetime.now()
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            target += datetime.timedelta(days=1)
+        return (target - now).total_seconds()
+
+    async def _schedule_loop(self) -> None:
+        try:
+            while True:
+                delay = self._seconds_until_next(self.config.schedule.time)
+                self.ctx.logger.info("定时日记将在 %.0f 秒后运行", delay)
+                await asyncio.sleep(delay)
+                await self._scheduled_run()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.ctx.logger.error("调度器异常退出: %s", exc, exc_info=True)
+
+    async def _scheduled_run(self) -> None:
+        if self._generating:
+            return
+        date_str = self._today_str()
+        ok, result = await self._generate_for_date(date_str)
+        if not ok:
+            self.ctx.logger.warning("定时日记生成失败 %s: %s", date_str, result)
+            await self._notify_chats(f"今日日记没写成：{result}")
+            return
+        if not self.config.qzone.enabled:
+            self.ctx.logger.info("定时日记已生成并存档（%d 字）；QQ空间发布未启用", len(result))
+            return
+        pub_ok, pub_msg = await self._publish_to_qzone(result)
+        if pub_ok:
+            self.ctx.logger.info("定时日记已发布到QQ空间（%d 字）", len(result))
+            await self._notify_chats(f"今日日记已发布到QQ空间（{len(result)} 字）。")
+        else:
+            self.ctx.logger.error("定时日记发布QQ空间失败: %s", pub_msg)
+            await self._notify_chats(f"今日日记写好了，但发布QQ空间失败：{pub_msg}")
+
+    async def _notify_chats(self, text: str) -> None:
+        """定时发布后向配置的聊天发通知（notify_chats 为空则完全静默）。"""
+        for target in self.config.schedule.notify_chats or []:
+            stream_id = await self._resolve_stream_id(str(target))
+            if not stream_id:
+                self.ctx.logger.warning("定时通知目标 %s 无法解析到聊天流", target)
+                continue
+            try:
+                await self.ctx.send.text(text, stream_id)
+            except Exception as exc:
+                self.ctx.logger.error("定时通知发送到 %s 失败: %s", target, exc)
+
+    def _build_cookie_store(self) -> CookieStore:
+        qz = self.config.qzone
+        napcat_http = None
+        if qz.napcat_http_host.strip() and qz.napcat_http_port.strip():
+            napcat_http = {
+                "host": qz.napcat_http_host.strip(),
+                "port": qz.napcat_http_port.strip(),
+                "token": qz.napcat_http_token.strip(),
+            }
+        return CookieStore(
+            self._data_dir(),
+            api_call=self._adapter_api_call,
+            napcat_http=napcat_http,
+            interval_sec=max(60, qz.refresh_interval_min) * 60,
+            logger=self.ctx.logger,
+        )
+
+    async def _adapter_api_call(self, name: str, params: dict) -> Any:
+        """napcat-adapter API 调用入口（注入给 CookieStore；1.3.0 无 adapter 时会抛错，由 CookieStore 降级）。"""
+        return await self.ctx.api.call(name, params=params)
+
+    def _manual_cookies(self) -> dict | None:
+        """手动配置的兜底 cookie（[qzone].uin/p_skey 非空时生效）。"""
+        qz = self.config.qzone
+        if not qz.uin.strip() or not qz.p_skey.strip():
+            return None
+        uin = qz.uin.strip()
+        return {
+            "uin": uin if uin.startswith("o") else f"o0{uin}",
+            "p_skey": qz.p_skey.strip(),
+            "skey": qz.skey.strip(),
+        }
+
+    async def _resolve_cookies(self, force_refresh: bool = False) -> dict | None:
+        """取 cookie：auto_cookie 时走 CookieStore 三级来源（adapter → NapCat HTTP → 缓存），失败兜底手动配置。"""
+        if self.config.qzone.auto_cookie and self._cookie_store is not None:
+            cookies = await self._cookie_store.get_cookies(force=force_refresh)
+            if cookies:
+                return cookies
+        return self._manual_cookies()
+
+    async def _publish_to_qzone(self, content: str) -> tuple[bool, str]:
+        """发布日记到QQ空间。返回 (成功, tid或原因)。登录态失效时自动重取一次再试。"""
+        if __package__:  # 包式加载（Runner 真机）
+            from .bd_qzone import CookieExpiredError, PublishUnavailableError, QzonePublisher
+        else:  # 平铺兜底（脚本直跑）
+            from bd_qzone import CookieExpiredError, PublishUnavailableError, QzonePublisher
+
+        cookies = await self._resolve_cookies()
+        if not cookies:
+            return False, (
+                "拿不到QQ空间cookie：adapter 与 NapCat HTTP 都没取到且无手动兜底。"
+                "请在 NapCat WebUI 开启 HTTP 服务器并填好 [qzone].napcat_http_host/port，或手动填 [qzone].uin/p_skey"
+            )
+
+        publisher = QzonePublisher(cookies)
+        try:
+            return await publisher.publish_text(content, timeout=max(5, self.config.qzone.timeout_seconds))
+        except PublishUnavailableError as exc:
+            return False, f"{exc}（无需 httpx 时可把 [qzone].enabled 关掉，日记仍会存档）"
+        except CookieExpiredError:
+            self.ctx.logger.warning("QQ空间登录态失效，强制重取 cookie 重试一次")
+            fresh = await self._resolve_cookies(force_refresh=True)
+            if not fresh:
+                return False, "QQ空间登录态失效，且自动重取 cookie 失败（检查 NapCat 是否在线、HTTP 服务器是否开启）"
+            if fresh == cookies:
+                return False, "QQ空间登录态失效，重取到的 cookie 未变化（bot 登录态可能真的过期了）"
+            publisher = QzonePublisher(fresh)
+            try:
+                return await publisher.publish_text(content, timeout=max(5, self.config.qzone.timeout_seconds))
+            except CookieExpiredError:
+                return False, "QQ空间登录态失效（重取后仍失效），请检查 bot 登录状态"
+            except Exception as exc:
+                return False, f"发布异常（{type(exc).__name__}）: {exc}"
+        except Exception as exc:
+            return False, f"发布异常（{type(exc).__name__}）: {exc}"
+
+    async def _resolve_stream_id(self, target: str) -> str:
+        """'group:123' / 'private:456' / 裸 stream_id -> 聊天流 ID。"""
+        target = str(target).strip()
+        m = re.match(r"^(group|private|user):(\S+)$", target, re.IGNORECASE)
+        if not m:
+            return target  # 已是 stream_id
+        kind, ident = m.group(1).lower(), m.group(2)
+        try:
+            if kind == "group":
+                result = await self.ctx.chat.get_stream_by_group_id(ident)
+            else:
+                result = await self.ctx.chat.get_stream_by_user_id(ident)
+        except Exception as exc:
+            self.ctx.logger.warning("解析 %s 失败: %s", target, exc)
+            return ""
+        return self._extract_stream_id(result)
+
+    @staticmethod
+    def _extract_stream_id(result: Any) -> str:
+        """从各种可能的返回形态里挖 stream_id。"""
+        if isinstance(result, str):
+            return result.strip()
+        if isinstance(result, list) and result:
+            return BetterDiaryPlugin._extract_stream_id(result[0])
+        if isinstance(result, dict):
+            for key in ("stream_id", "session_id", "chat_id", "id"):
+                val = result.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+        return ""
+
+    # ------------------------------------------------------------ 主流程
+
+    def _today_str(self) -> str:
+        return datetime.date.today().strftime("%Y-%m-%d")
+
+    def _normalize_date(self, raw: str) -> str:
+        m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})$", raw.strip())
+        if not m:
+            return ""
+        try:
+            return datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3))).strftime("%Y-%m-%d")
+        except ValueError:
+            return ""
+
+    async def _fetch_messages(self, start_ts: float, end_ts: float) -> list[dict[str, Any]]:
+        """按过滤模式抓取当天消息（跨聊天合并，按时间排序）。"""
+        mode = (self.config.diary.filter_mode or "all").lower()
+        targets = [str(t) for t in (self.config.diary.target_chats or []) if str(t).strip()]
+
+        if mode == "whitelist":
+            if not targets:
+                return []
+            all_msgs: list[dict[str, Any]] = []
+            for target in targets:
+                stream_id = await self._resolve_stream_id(target)
+                if not stream_id:
+                    self.ctx.logger.warning("白名单目标 %s 解析失败，跳过", target)
+                    continue
+                msgs = await self._query_messages(start_ts, end_ts, stream_id)
+                all_msgs.extend(msgs)
+            all_msgs.sort(key=lambda m: _ts_of(m))
+            return all_msgs
+
+        msgs = await self._query_messages(start_ts, end_ts, "")
+        if mode == "blacklist" and targets:
+            blocked_groups, blocked_users = _split_targets(targets)
+            msgs = [
+                m for m in msgs
+                if _group_of(m) not in blocked_groups
+                and (not _group_of(m) or _user_of(m) not in blocked_users)
+            ]
+        msgs.sort(key=lambda m: _ts_of(m))
+        return msgs
+
+    async def _query_messages(self, start_ts: float, end_ts: float, chat_id: str) -> list[dict[str, Any]]:
+        kwargs: dict[str, Any] = {
+            "limit": 0,
+            "limit_mode": "earliest",
+            "filter_mai": False,
+            "filter_command": False,
+        }
+        try:
+            if chat_id:
+                result = await self.ctx.message.get_by_time_in_chat(
+                    chat_id, str(start_ts), str(end_ts), **kwargs
+                )
+            else:
+                kwargs.pop("filter_command", None)  # get_by_time 不接受该参数
+                result = await self.ctx.message.get_by_time(
+                    str(start_ts), str(end_ts), **kwargs
+                )
+        except Exception as exc:
+            self.ctx.logger.error("消息查询失败 (chat_id=%s): %s", chat_id, exc)
+            raise RuntimeError(f"消息查询失败: {exc}") from exc
+
+        # SDK 已归一化出 messages 字段；兼容信封形态
+        if isinstance(result, dict):
+            if not result.get("success", True):
+                raise RuntimeError(f"消息查询返回失败: {result.get('error', '未知错误')}")
+            result = result.get("messages")
+        if not isinstance(result, list):
+            return []
+        return [m for m in result if isinstance(m, dict)]
+
+    async def _resolve_persona(self) -> str:
+        if self.config.diary.persona_override.strip():
+            return self.config.diary.persona_override.strip()
+        try:
+            value = await self.ctx.config.get("personality.personality", "")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        except Exception as exc:
+            self.ctx.logger.debug("读取 Host 人设失败: %s", exc)
+        return "是个爱聊天、心比较软的机器人。"
+
+    async def _call_llm(self, prompt: str, temperature: float) -> str:
+        """LLM 调用：显式绕过 ctx.llm.generate 的 30s RPC 默认超时。"""
+        timeout_ms = max(30, int(self.config.llm.timeout_seconds)) * 1000
+        call_capability = getattr(self.ctx, "call_capability", None)
+        payload = {
+            "prompt": prompt,
+            "model": "",
+            "task_name": self.config.llm.task_name,
+            "temperature": temperature,
+        }
+        if callable(call_capability):
+            result = await call_capability("llm.generate", timeout_ms=timeout_ms, **payload)
+        else:  # 老 SDK 兜底
+            result = await self.ctx.llm.generate(**payload)
+        if not isinstance(result, dict) or not result.get("success", True):
+            err = result.get("error", "未知错误") if isinstance(result, dict) else type(result).__name__
+            raise RuntimeError(f"LLM 调用失败: {err}")
+        return str(result.get("response") or result.get("content") or "")
+
+    async def _extract_events(self, timeline: str, date_str: str) -> list[dict[str, Any]]:
+        """阶段一：分块选材 + 打分 + 合并排序。"""
+        chunks = chunk_text(timeline, self.config.diary.chunk_chars, self.config.diary.max_chunks)
+        if not chunks:
+            return []
+        sem = asyncio.Semaphore(3)
+
+        async def run_one(chunk: str) -> list[dict[str, Any]]:
+            async with sem:
+                try:
+                    raw = await self._call_llm(
+                        build_extract_prompt(date_str, chunk),
+                        self.config.llm.extract_temperature,
+                    )
+                    return parse_events(raw)
+                except Exception as exc:
+                    self.ctx.logger.warning("选材分块失败（跳过）: %s", exc)
+                    return []
+
+        results = await asyncio.gather(*(run_one(c) for c in chunks))
+        merged: list[dict[str, Any]] = [e for chunk_events in results for e in chunk_events]
+        merged.sort(key=lambda e: e["score"], reverse=True)
+        # 简单去重：what 前 16 字相同视为同一件事
+        seen: set[str] = set()
+        unique: list[dict[str, Any]] = []
+        for e in merged:
+            key = e["what"][:16]
+            if key not in seen:
+                seen.add(key)
+                unique.append(e)
+        return unique
+
+    async def _generate_for_date(self, date_str: str) -> tuple[bool, str]:
+        """生成并保存指定日期的日记。成功返回 (True, 日记全文)。"""
+        if self._generating:
+            return False, "已有生成任务在进行"
+        self._generating = True
+        try:
+            return await self._generate_inner(date_str)
+        finally:
+            self._generating = False
+
+    async def _generate_inner(self, date_str: str) -> tuple[bool, str]:
+        try:
+            start_dt = datetime.datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            return False, f"日期格式错误: {date_str}"
+        start_ts = start_dt.timestamp()
+        end_ts = start_ts + 86400
+
+        messages = await self._fetch_messages(start_ts, end_ts)
+        min_msgs = max(0, self.config.diary.min_messages)
+        if len(messages) < min_msgs:
+            return False, f"当天消息太少（{len(messages)} 条，需要 {min_msgs} 条），不写日记"
+
+        bot_qq = await self._resolve_bot_qq()
+        timeline, stats = build_timeline(messages, bot_qq=bot_qq)
+        self.ctx.logger.info(
+            "时间线构建完成: 消息 %d 条（bot %d / 用户 %d），时间线 %d 字符",
+            stats["total"], stats["bot"], stats["user"], len(timeline),
+        )
+
+        # 阶段一：选材；失败或为空则降级用时间线末尾
+        events = await self._extract_events(timeline, date_display(date_str))
+        if events:
+            events = events[: max(1, self.config.diary.max_events)]
+            events_text = events_to_text(events)
+            self.ctx.logger.info("选材完成: %d 件入选", len(events))
+        else:
+            self.ctx.logger.warning("选材为空（解析失败或确实无事），降级用时间线末尾")
+            tail = timeline[-4000:]
+            events_text = "（选材环节没跑通，下面是当天聊天记录的末尾片段，从中挑你有印象的写）\n" + tail
+
+        # 阶段二：成文
+        persona = await self._resolve_persona()
+        name = await self._resolve_nickname()
+        prompt = build_write_prompt(
+            date_str=date_display(date_str),
+            events_text=events_text,
+            name=name,
+            persona=persona,
+            style_extra=self.config.diary.style_extra,
+            word_target=max(80, self.config.diary.word_target),
+            max_events=max(1, self.config.diary.max_events),
+        )
+        raw = await self._call_llm(prompt, self.config.llm.temperature)
+        stripped = strip_diary_output(raw)
+        # 发布前的语义闸：拒答 / 空输出 / 残句一律判失败，本日不存档也不发布。
+        # 日记成品会公开出现在 QQ 空间，绝不能把「抱歉，作为一个人工智能…」发出去。
+        problem = diary_output_problem(stripped)
+        if problem:
+            self.ctx.logger.error(
+                "日记成文不可用（%s），本日不存档、不发布；模型原文前 80 字: %s",
+                problem,
+                stripped[:80] or "（空）",
+            )
+            return False, f"模型没写出可用的日记（{problem}），本日不生成"
+        content = ensure_date_line(stripped, date_display(date_str))
+        self.ctx.logger.info("日记成文: %d 字（目标 %d）", len(content), self.config.diary.word_target)
+
+        self._save_diary(date_str, content, stats)
+        return True, content
+
+    async def _resolve_bot_qq(self) -> str:
+        try:
+            value = await self.ctx.config.get("bot.qq_account", 0)
+            if isinstance(value, dict):
+                value = value.get("value", 0)
+            return str(value or "")
+        except Exception as exc:
+            self.ctx.logger.debug("读取 bot.qq_account 失败: %s", exc)
+            return ""
+
+    async def _resolve_nickname(self) -> str:
+        try:
+            value = await self.ctx.config.get("bot.nickname", "")
+            if isinstance(value, dict):
+                value = value.get("value", "")
+            return str(value or "").strip()
+        except Exception as exc:
+            self.ctx.logger.debug("读取 bot.nickname 失败: %s", exc)
+            return ""
+
+    # ------------------------------------------------------------ 存档
+
+    def _data_dir(self) -> Path:
+        paths = getattr(self.ctx, "paths", None)
+        data_dir = getattr(paths, "data_dir", None) if paths is not None else None
+        if not data_dir:
+            data_dir = Path(__file__).resolve().parent / "data"  # 容错降级
+        return Path(data_dir)
+
+    def _store_path(self) -> Path:
+        return self._data_dir() / "diaries.json"
+
+    def _load_diaries(self) -> dict[str, Any]:
+        path = self._store_path()
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (json.JSONDecodeError, OSError):
+            return {}  # 坏即空
+
+    def _save_diary(self, date_str: str, content: str, stats: dict[str, int]) -> None:
+        path = self._store_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = self._load_diaries()
+            data[date_str] = {
+                "content": content,
+                "word_count": len(content),
+                "stats": stats,
+                "generated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(path)  # 原子替换
+        except OSError as exc:
+            self.ctx.logger.error("日记存档失败: %s", exc)
+
+    # ------------------------------------------------------------ 发送
+
+    async def _send_long(self, text: str, stream_id: str) -> None:
+        if len(text) <= _SEND_LIMIT:
+            await self.ctx.send.text(text, stream_id)
+            return
+        # 按空行分段，尽量整段发送
+        paragraphs = text.split("\n\n")
+        buf = ""
+        for para in paragraphs:
+            if buf and len(buf) + len(para) + 2 > _SEND_LIMIT:
+                await self.ctx.send.text(buf.strip(), stream_id)
+                buf = ""
+            buf += para + "\n\n"
+        if buf.strip():
+            await self.ctx.send.text(buf.strip(), stream_id)
+
+
+# ---------------------------------------------------------------- 模块级工具
+
+
+def _ts_of(msg: dict[str, Any]) -> float:
+    try:
+        return float(msg.get("timestamp", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _user_of(msg: dict[str, Any]) -> str:
+    info = msg.get("message_info") or {}
+    user = info.get("user_info") or {} if isinstance(info, dict) else {}
+    return str(user.get("user_id", "") or "")
+
+
+def _group_of(msg: dict[str, Any]) -> str:
+    info = msg.get("message_info") or {}
+    group = info.get("group_info") or {} if isinstance(info, dict) else {}
+    return str(group.get("group_id", "") or "")
+
+
+def _split_targets(targets: list[str]) -> tuple[set[str], set[str]]:
+    groups: set[str] = set()
+    users: set[str] = set()
+    for t in targets:
+        m = re.match(r"^(group|private|user):(\S+)$", t.strip(), re.IGNORECASE)
+        if m and m.group(1).lower() == "group":
+            groups.add(m.group(2))
+        elif m:
+            users.add(m.group(2))
+        else:
+            users.add(t.strip())
+    return groups, users
+
+
+def create_plugin() -> BetterDiaryPlugin:
+    """创建插件实例。"""
+    return BetterDiaryPlugin()
