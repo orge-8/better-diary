@@ -7,9 +7,10 @@ message_info.user_info.{user_id, user_nickname} / message_info.group_info.group_
 """
 
 import datetime
+import hashlib
 import json
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Mapping, Tuple
 
 # 单条消息在时间线里的最大文本长度（过长消息截断，保 token 预算）
 _MSG_TEXT_LIMIT = 80
@@ -73,6 +74,29 @@ def diary_output_problem(content: str) -> str:
     if len(body) < MIN_DIARY_CHARS:
         return f"输出过短（{len(body)} 字），疑似未成文"
     return ""
+
+
+def quote_attribution_risk(content: str, given_quotes: list[str]) -> str:
+    """引用体检（**非阻断**，只用于日志留痕）。可用返回空串，可疑返回原因。
+
+    真机反馈过的缺陷：模型把「」当成"待填占位"用，于是写出
+    ``「来首无名策岂不美哉 安排上了，好听」`` —— 别人的原话和自己的回复挤在同一对
+    引号里，读起来像整句都是日记作者说的。**归属错了，等于替别人说话。**
+
+    这里只做一件事：日记里出现了「」，但**没有任何一条素材原话被原样引用**
+    → 极度可疑（要么自造原话，要么引号边界写错），打一条 WARNING 供排查。
+    刻意不阻断：模型可能对原话做轻微改写，这时候误报比漏报更烦人。
+    """
+    body = content or ""
+    if "「" not in body or "」" not in body:
+        return ""
+    given = [str(q or "").strip() for q in given_quotes or []]
+    given = [q for q in given if q]
+    if not given:
+        return ""
+    if any(q in body for q in given):
+        return ""
+    return "日记里有「」但没有原样引用任何一条素材原话（可能自造原话或引号边界写错）"
 
 
 def _msg_time(msg: Dict[str, Any]) -> float:
@@ -229,6 +253,23 @@ def parse_events(text: str) -> List[Dict[str, Any]]:
     return [e for e in events if e["what"]]
 
 
+def event_id(date_str: str, event: Mapping[str, Any]) -> str:
+    """派生**稳定**的 event_id：同一件事重生成后 ID 不变。
+
+    借鉴 diary_writer 的 `normalize_daily_metadata`——ID 由内容哈希而来、
+    与生成次数无关，后续做去重、纠错、引用才有稳定的锚点。
+    """
+    seed = "\x1f".join(
+        (
+            str(date_str or ""),
+            str(event.get("who") or ""),
+            str(event.get("what") or ""),
+            str(event.get("quote") or ""),
+        )
+    )
+    return "ev_" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+
+
 def events_to_text(events: List[Dict[str, Any]]) -> str:
     """把精选事件列表渲染成阶段二的素材文本。"""
     if not events:
@@ -242,6 +283,130 @@ def events_to_text(events: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+# 结构化 META 块的分隔标记。模型在日记正文之后另起一段输出紧凑 JSON，
+# 供「证据链 + 跨天连续性」落盘用。**带标记之后的内容一律不进正文**——
+# 也就永远不会发布到 QQ 空间（解析失败也一样先切掉再解析）。
+META_MARKER = "===META==="
+
+# META 里只取这几个键，其余忽略（防模型乱塞东西）
+_META_KEYS = ("topics", "people", "projects", "unresolved")
+
+
+def split_meta(content: str) -> Tuple[str, Dict[str, Any]]:
+    """把「正文 + 结构化 META」拆开。返回 (正文, meta)。
+
+    **fail-open 但有硬边界**：标记之后的内容永远不进正文，哪怕 JSON 解析失败。
+    META 缺失或解析失败时 meta 为空 —— 只影响连续性与证据链的丰富度，
+    正文照常发布，绝不因此判失败。
+    """
+    if not content:
+        return "", {}
+    if META_MARKER not in content:
+        return content.strip(), {}
+    body, _, tail = content.partition(META_MARKER)
+    meta: Dict[str, Any] = {}
+    try:
+        start, end = tail.find("{"), tail.rfind("}")
+        if start != -1 and end > start:
+            data = json.loads(tail[start : end + 1])
+            if isinstance(data, dict):
+                for key in _META_KEYS:
+                    value = data.get(key)
+                    if isinstance(value, list):
+                        items = [sanitize_text(str(v), 40) for v in value if str(v or "").strip()]
+                        if items:
+                            meta[key] = items[:8]
+    except (json.JSONDecodeError, ValueError):
+        meta = {}
+    return body.strip(), meta
+
+
+def build_continuity_line(continuity: Mapping[str, Any]) -> str:
+    """把跨天连续性渲染成注入文本。没有任何线索时返回空串。
+
+    连续性只用于让日记有「延续感」（昨天聊到一半的话题今天接着提）。
+    它**不能证明今天发生了什么** —— 这条纪律写在 prompt 里（见 build_write_prompt 规则 6）。
+    """
+    if not isinstance(continuity, Mapping) or not continuity:
+        return ""
+    summary = str(continuity.get("previous_summary") or "").strip()
+    events = [str(x).strip() for x in (continuity.get("important_events") or []) if str(x).strip()]
+    projects = [str(x).strip() for x in (continuity.get("ongoing_projects") or []) if str(x).strip()]
+    topics = [str(x).strip() for x in (continuity.get("ongoing_topics") or []) if str(x).strip()]
+    unresolved = [str(x).strip() for x in (continuity.get("unresolved_items") or []) if str(x).strip()]
+    if not (summary or events or projects or topics or unresolved):
+        return ""
+    lines: List[str] = []
+    if summary:
+        lines.append(f"- 上一次写到：{summary}")
+    if topics:
+        lines.append("- 还在聊的话题：" + "、".join(topics[:6]))
+    if projects:
+        lines.append("- 手头还在进行的事：" + "、".join(projects[:6]))
+    if unresolved:
+        lines.append("- 还没个结果的：" + "、".join(unresolved[:6]))
+    if events:
+        lines.append("- 最近记下的事：" + "；".join(events[:3]))
+    return "前几篇日记留下的线索（仅供参考）：\n" + "\n".join(lines)
+
+
+def _dedupe(items: List[str], limit: int) -> List[str]:
+    """保序去重 + 截断（新的排前面）。"""
+    result: List[str] = []
+    for item in items:
+        text = str(item or "").strip()
+        if not text or text in result:
+            continue
+        result.append(text)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def update_continuity(
+    previous: Mapping[str, Any],
+    events: List[Dict[str, Any]],
+    meta: Mapping[str, Any],
+    *,
+    max_topics: int = 30,
+    max_projects: int = 20,
+    max_unresolved: int = 20,
+    max_events: int = 12,
+) -> Dict[str, Any]:
+    """把本次成文累积进跨天连续性状态（纯函数，便于单测）。
+
+    与 diary_writer 的 `continuity.py` 同构：只做「累积 + 保序去重 + 截断」，
+    **不调用 LLM**。没有 META 时退化成只用选材事件，连续性依然成立。
+    """
+    prev = previous if isinstance(previous, Mapping) else {}
+    meta_map = meta if isinstance(meta, Mapping) else {}
+    summaries = [
+        str(e.get("what") or "").strip()
+        for e in (events or [])
+        if isinstance(e, dict)
+    ]
+    summaries = [s for s in summaries if s]
+    return {
+        "previous_summary": "；".join(summaries[:3])[:800],
+        "important_events": _dedupe(
+            summaries + list(prev.get("important_events") or []), max_events
+        ),
+        "ongoing_projects": _dedupe(
+            list(meta_map.get("projects") or []) + list(prev.get("ongoing_projects") or []),
+            max_projects,
+        ),
+        "ongoing_topics": _dedupe(
+            list(meta_map.get("topics") or []) + list(prev.get("ongoing_topics") or []),
+            max_topics,
+        ),
+        "unresolved_items": _dedupe(
+            list(meta_map.get("unresolved") or []) + list(prev.get("unresolved_items") or []),
+            max_unresolved,
+        ),
+        "updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
 def build_write_prompt(
     *,
     date_str: str,
@@ -251,25 +416,54 @@ def build_write_prompt(
     style_extra: str = "",
     word_target: int = 250,
     max_events: int = 3,
+    temporal_anchor: str = "",
+    continuity_text: str = "",
 ) -> str:
-    """阶段二：基于精选素材写日记。"""
+    """阶段二：基于精选素材写日记。
+
+    Args:
+        temporal_anchor: 非空表示这是**补写**过去的某一天。此时要显式声明
+            素材里「今天/昨天/前天」的相对时间基准，否则模型会以真正的今天来解读。
+        continuity_text: 跨天连续性线索（见 :func:`build_continuity_line`），
+            只用于引出回顾与延续，不能当作「今天发生了什么」的依据。
+    """
     name_line = f"我的名字是{name}。" if name else ""
     persona_line = persona or "是一个爱聊天的机器人。"
-    style_line = f"\n6. {style_extra}" if style_extra else ""
+    style_line = f"\n8. {style_extra}" if style_extra else ""
+    anchor_block = ""
+    if temporal_anchor.strip():
+        anchor_block = (
+            f"\n⚠️ 这是**补写** {date_str} 的日记。素材与记忆里出现的"
+            f"「今天」「昨天」「前天」一律以 {temporal_anchor.strip()} 为基准来理解，"
+            "不是真正的今天。\n"
+        )
+    continuity_block = f"\n{continuity_text}\n" if continuity_text.strip() else ""
     return f"""{name_line}
 我{persona_line}
-
+{anchor_block}
 今天是 {date_str}。睡前翻了翻今天的聊天记录，值得记的事整理如下：
 
 {events_text}
-
+{continuity_block}
 现在以第一人称写一篇日记。规则（重要，逐条遵守）：
-1. 第一行固定为「{date_str}，X。」，X 从 晴/多云/阴/雨 里选一个贴合今天聊天氛围的，只选一个字都不许多。
+1. 第一行固定为 {date_str}，X。其中 X 从 晴/多云/阴/雨 里选一个贴合今天聊天氛围的，只选一个字都不许多。
 2. 只写上面你真想写的事，最多写 {max_events} 件，可以只写一两件。没劲的一天就写短点，三五句也行，绝不硬凑字数。
-3. 至少一处用「」原样引用素材里给的聊天原话。
+3. 至少一处用「」引用素材里给的聊天原话，并且**严格遵守引号边界**：
+   「」里面只能放**别人说过的原话、一字不改**；我自己的话一律写在引号**外面**。
+   错误写法：回了句「来首无名策岂不美哉 安排上了，好听」（把自己的回复也塞进了引号，读起来像整句都是我说的）
+   正确写法：有人提了《无名策》，回了句「来首无名策岂不美哉」，我说安排上了，好听。
+   另外，凡是引用聊天原话都用「」，不要用 "" 或 '' 代替；能顺带点出是谁说的更好。
 4. 禁止出现：开头问候语；结尾总结或展望（如"明天也要加油""真是充实的一天"）；"我意识到/我明白了/我突然发现"句式；连续感叹号；排比句。
 5. 像睡前随手写的：句子短，允许有点碎，允许口语和自嘲，想到哪写到哪，但别写成聊天记录复述。
-6. 全文 {word_target} 字左右（可上下浮动 80 字）。除第一行外就是日记正文：不要标题、不要 markdown、不要"日记"二字开头、不要任何前后缀或解释。{style_line}
+6. **事实纪律**：主观感受和情绪可以自由写；但**没有依据就不得制造**人物、地点、对话、结果或新的事实。
+   拿不准的地方用"好像""应该是""记不清了"这类不确定语气带过 —— 文风自由不等于客观事实可以补写。
+7. 上面的跨天线索（若有）只能用来引出想法、疑问、期待，或带原日期的回顾；
+   它**不能单独证明今天发生了什么**，今天的事必须有「值得记的事」作依据。
+8. 全文 {word_target} 字左右（可上下浮动 80 字）。除第一行外就是日记正文：不要标题、不要 markdown、不要"日记"二字开头、不要任何前后缀或解释。{style_line}
+
+日记正文写完后，另起一段只输出下面这两行（用于归档，**不会被发表**）：
+{META_MARKER}
+{{"topics": ["话题"], "people": ["提到的人"], "projects": ["手头的事"], "unresolved": ["还没个结果的"]}}
 
 日记正文："""
 

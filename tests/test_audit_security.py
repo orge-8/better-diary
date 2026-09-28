@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import importlib
 import sys
 from pathlib import Path
@@ -56,6 +57,13 @@ def make_messages(n: int):
         }
         for i in range(n)
     ]
+
+
+def _fake_query(msgs):
+    async def query(start_ts, end_ts, chat_id):
+        return msgs
+
+    return query
 
 
 def build_plugin(llm_reply: str, msgs):
@@ -470,3 +478,345 @@ def test_plugin_lifecycle_clean():
     allowed_prefixes = ("send.", "api.", "adapter.", "chat.", "message.", "llm.", "config.")
     for cap, _ in host.calls:
         assert cap.startswith(allowed_prefixes), f"调用了未声明的能力：{cap}"
+
+
+# ---------------------------------------------------------------- v1.2.8：不丢天 / 证据链 / 连续性
+
+def _writable_plugin(tmp_path):
+    """构造一个可真实生成、可捕获发布行为的插件。"""
+    plugin = build_plugin(
+        "随便写点东西当作日记正文来凑够二十个字吧，这算一段像样的日记。", make_messages(40)
+    )
+    plugin._data_dir = lambda: tmp_path  # type: ignore[assignment]
+    published: list[str] = []
+
+    async def fake_publish(content: str):
+        published.append(content)
+        return True, "ok"
+
+    plugin._publish_to_qzone = fake_publish  # type: ignore[assignment]
+    return plugin, published
+
+
+def test_catch_up_only_archives_never_publishes(tmp_path):
+    """补写缺档**只存档**，绝不触发 QQ 空间发布（公开空间不该冒出历史说说）。"""
+    plugin, published = _writable_plugin(tmp_path)
+    yesterday = (datetime.date.today() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+
+    results = asyncio.run(plugin._catch_up_missing())
+
+    assert results and all(ok for _, ok in results), results
+    assert published == [], f"补写绝不发布，实际发布了 {len(published)} 条"
+    archive = plugin._load_diaries()
+    assert yesterday in archive, f"缺档应被补写：{sorted(archive)}"
+    entry = archive[yesterday]
+    assert entry.get("material_mode") == "events"
+    assert entry.get("events"), "证据链应落盘（events 非空）"
+    assert all(e.get("event_id", "").startswith("ev_") for e in entry["events"])
+    assert plugin._load_continuity(), "连续性状态应被累积"
+
+
+def test_catch_up_is_idempotent(tmp_path):
+    """已有日记的日期不重复补写（补跑重复执行不会重刷）。"""
+    plugin, _ = _writable_plugin(tmp_path)
+    first = asyncio.run(plugin._catch_up_missing())
+    assert first
+    second = asyncio.run(plugin._catch_up_missing())
+    assert second == [], f"第二次补跑应无目标，实际 {second}"
+
+
+def test_non_today_diary_command_does_not_publish(tmp_path):
+    """手动 `/日记 <过去日期>` 同样只存档不发布。"""
+    plugin, published = _writable_plugin(tmp_path)
+    past = (datetime.date.today() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+
+    asyncio.run(plugin.cmd_diary(matched_groups={"date": past}, stream_id="s1", user_id="1"))
+
+    assert published == [], f"非当天的日记不应发布，实际发了 {len(published)} 条"
+
+
+def test_future_date_is_rejected_upfront(tmp_path):
+    """未来日期直接拦截，不落到「消息太少」的误导分支。"""
+    plugin, published = _writable_plugin(tmp_path)
+    future = (datetime.date.today() + datetime.timedelta(days=2)).strftime("%Y-%m-%d")
+
+    asyncio.run(plugin.cmd_diary(matched_groups={"date": future}, stream_id="s1", user_id="1"))
+
+    assert published == [] and plugin._load_diaries() == {}
+
+
+def test_continuity_accumulates_and_injects(tmp_path):
+    """跨天连续性：成文后累积，下一次成文时注入线索。"""
+    plugin, _ = _writable_plugin(tmp_path)
+    today = datetime.date.today().strftime("%Y-%m-%d")
+
+    ok, _ = asyncio.run(plugin._generate_for_date(today))
+    assert ok
+    cont = plugin._load_continuity()
+    assert cont, "连续性应被累积"
+    assert all(
+        k in cont
+        for k in ("previous_summary", "important_events", "ongoing_projects",
+                  "ongoing_topics", "unresolved_items")
+    ), cont
+    # 注入路径：连续性非空时，prompt 必须带上线索块
+    from better_diary_under_test.bd_prompts import build_write_prompt  # noqa: PLC0415
+
+    line = build_write_prompt.__globals__["build_continuity_line"](cont)
+    assert "上一次写到" in line
+
+
+def test_meta_never_leaks_into_published_content(tmp_path):
+    """模型若在正文后附了 META 块，发布内容里绝不能出现标记或 JSON。"""
+    plugin = build_plugin(
+        "2026年9月27日 星期日，晴。\n"
+        "今天聊了歌，挺开心。\n"
+        "===META===\n"
+        '{"topics":["歌"],"people":["甲"],"projects":[],"unresolved":[]}',
+        make_messages(40),
+    )
+    plugin._data_dir = lambda: tmp_path  # type: ignore[assignment]
+
+    ok, content = asyncio.run(plugin._generate_for_date("2026-09-27"))
+
+    assert ok
+    for marker in ("META", "===", '"topics"', "{"):
+        assert marker not in content, f"发布内容泄漏了归档元数据：{content!r}"
+    assert plugin._load_diaries()["2026-09-27"]["meta"].get("topics") == ["歌"]
+
+
+# ---------------------------------------------------------------- v1.3.1：静默阈值
+
+def _cfg_plugin(tmp_path, *, msgs=None, llm=None, **schedule):
+    plugin = MOD.create_plugin()
+    host = FakeHost(
+        returns={
+            "message.get_by_time": msgs or [],
+            "message.get_by_time_in_chat": msgs or [],
+        }
+    )
+    ctx = build_context("org.civetc.better-diary", rpc_call=host.rpc_call)
+    plugin._set_context(ctx)
+    cfg = get_default_config(MOD.BetterDiaryConfig)
+    cfg["schedule"].update(schedule)
+    if llm:
+        cfg["llm"].update(llm)
+    plugin.set_plugin_config(cfg)
+    plugin._data_dir = lambda: tmp_path  # type: ignore[assignment]
+    return plugin
+
+
+def _record_run(plugin):
+    calls: list[int] = []
+
+    async def fake_run():
+        calls.append(1)
+
+    plugin._scheduled_run = fake_run  # type: ignore[assignment]
+    return calls
+
+
+def test_silence_disabled_by_default_skips_check(tmp_path):
+    """阈值为 0（默认）= 完全旧行为，连消息查询都不发起。"""
+    plugin = _cfg_plugin(tmp_path)
+    assert int(plugin.config.schedule.wait_silent_minutes) == 0
+
+    async def must_not_call(minutes):
+        raise AssertionError("阈值为 0 时不该发起静默检查")
+
+    plugin._chat_is_quiet = must_not_call  # type: ignore[assignment]
+    calls = _record_run(plugin)
+    asyncio.run(plugin._run_main_with_silence_wait())
+    assert calls == [1]
+
+
+def test_silence_quiet_generates_immediately(tmp_path):
+    plugin = _cfg_plugin(tmp_path, wait_silent_minutes=30)
+
+    async def quiet(minutes):
+        return True
+
+    plugin._chat_is_quiet = quiet  # type: ignore[assignment]
+    calls = _record_run(plugin)
+    asyncio.run(plugin._run_main_with_silence_wait())
+    assert calls == [1]
+
+
+def test_silence_timeout_writes_anyway(tmp_path):
+    """等满上限照写 —— 不丢天优先（max_wait_hours=0 即不等）。"""
+    plugin = _cfg_plugin(tmp_path, wait_silent_minutes=30, max_wait_hours=0)
+
+    async def busy(minutes):
+        return False
+
+    plugin._chat_is_quiet = busy  # type: ignore[assignment]
+    calls = _record_run(plugin)
+    asyncio.run(plugin._run_main_with_silence_wait())
+    assert calls == [1]
+
+
+def test_chat_is_quiet_maps_recent_messages(tmp_path):
+    """最近有消息 → 不静默；无消息 → 静默。"""
+    busy = _cfg_plugin(tmp_path)
+    busy._query_messages = _fake_query(make_messages(3))  # type: ignore[assignment]
+    assert asyncio.run(busy._chat_is_quiet(30)) is False
+
+    quiet = _cfg_plugin(tmp_path)
+    quiet._query_messages = _fake_query([])  # type: ignore[assignment]
+    assert asyncio.run(quiet._chat_is_quiet(30)) is True
+
+
+def test_chat_is_quiet_failsafe_on_rpc_error(tmp_path):
+    """静默检查失败按「已静默」处理 —— 可选增强绝不能挡住当天日记。"""
+    plugin = _cfg_plugin(tmp_path)
+
+    async def boom(start_ts, end_ts, chat_id):
+        raise RuntimeError("消息查询失败")
+
+    plugin._query_messages = boom  # type: ignore[assignment]
+    assert asyncio.run(plugin._chat_is_quiet(30)) is True
+
+
+# ---------------------------------------------------------------- v1.3.2：网络超时韧性
+#
+# 真机实录（2026-09-28 09:00 启动补跑）：模型 Provider 集体网络超时
+# （30s APITimeoutError，日志里连着好几条 `遇到错误: 网络连接超时`），
+# MaiBot 侧依次切换模型、逐个耗尽重试，最终抛 Runner RPC 超时：
+#   src.plugin_runtime.protocol.errors.RPCError: [E_TIMEOUT] 请求 cap.call 超时 (180000ms)
+# 后果有两个：① 成文直接判失败，这一天白丢；② 异常穿透 _catch_up_missing，
+# 把整轮补跑打断，后面几天一起补不了。
+
+
+class FakeRPCError(Exception):
+    """模拟真机 RPCError（本地拿到的类不是同一个，所以用类名 + 文本判定）。"""
+
+
+def _timeout_exc() -> FakeRPCError:
+    return FakeRPCError("[E_TIMEOUT] 请求 cap.call 超时 (180000ms)")
+
+
+def test_timeout_error_detection_covers_real_rpc_text(tmp_path):
+    """超时判定必须认「真机 RPC 超时文本」与 asyncio.TimeoutError，且不误伤普通错误。"""
+    plugin = _cfg_plugin(tmp_path)
+    assert plugin._is_timeout_error(_timeout_exc()) is True
+    assert plugin._is_timeout_error(asyncio.TimeoutError()) is True
+    assert plugin._is_timeout_error(ValueError("格式不对")) is False
+    assert plugin._is_timeout_error(RuntimeError("模型没写出可用的日记（空输出）")) is False
+
+
+def test_write_retry_recovers_from_timeout(tmp_path):
+    """成文首次超时、重试成功 —— 这是真机那次丢天的直接修复点。"""
+    plugin = _cfg_plugin(tmp_path, llm={"write_retry": 1, "retry_backoff_seconds": 0})
+    calls: list[int] = []
+
+    async def flaky(prompt, temperature):
+        calls.append(1)
+        if len(calls) == 1:
+            raise _timeout_exc()
+        return "正文"
+
+    plugin._call_llm = flaky  # type: ignore[assignment]
+    assert asyncio.run(plugin._call_llm_with_retry("p", 0.8, stage="日记成文")) == "正文"
+    assert len(calls) == 2
+
+
+def test_write_retry_does_not_retry_non_timeout(tmp_path):
+    """非超时失败不重试 —— 重试也没用，只是白等。"""
+    plugin = _cfg_plugin(tmp_path, llm={"write_retry": 3, "retry_backoff_seconds": 0})
+    calls: list[int] = []
+
+    async def broken(prompt, temperature):
+        calls.append(1)
+        raise ValueError("格式不对")
+
+    plugin._call_llm = broken  # type: ignore[assignment]
+    with pytest.raises(ValueError):
+        asyncio.run(plugin._call_llm_with_retry("p", 0.8, stage="日记成文"))
+    assert len(calls) == 1
+
+
+def test_write_retry_gives_up_after_configured_attempts(tmp_path):
+    """重试次数用完就抛，绝不无限重试。"""
+    plugin = _cfg_plugin(tmp_path, llm={"write_retry": 2, "retry_backoff_seconds": 0})
+    calls: list[int] = []
+
+    async def always_timeout(prompt, temperature):
+        calls.append(1)
+        raise _timeout_exc()
+
+    plugin._call_llm = always_timeout  # type: ignore[assignment]
+    with pytest.raises(FakeRPCError):
+        asyncio.run(plugin._call_llm_with_retry("p", 0.8, stage="日记成文"))
+    assert len(calls) == 3, "write_retry=2 应为「首次 + 2 次重试」"
+
+
+def test_generate_recovers_from_transient_timeout(tmp_path, monkeypatch):
+    """端到端回归：成文首次超时、重试成功 → 该天照常成文并落盘。"""
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    plugin = _cfg_plugin(
+        tmp_path, msgs=make_messages(40), llm={"write_retry": 1, "retry_backoff_seconds": 0}
+    )
+    writes: list[int] = []
+
+    async def flaky(prompt, temperature):
+        if "只输出 JSON 数组" in prompt:  # 阶段一选材
+            return '[{"who": "甲", "what": "聊了一件事", "quote": "原话", "score": 4}]'
+        writes.append(1)
+        if len(writes) == 1:
+            raise _timeout_exc()
+        return "2026年9月26日 星期六，晴。\n今天群里聊了新出的那首歌，挺好的，睡前记一笔。"
+
+    plugin._call_llm = flaky  # type: ignore[assignment]
+
+    ok, content = asyncio.run(plugin._generate_for_date("2026-09-26"))
+
+    assert ok is True, content
+    assert len(writes) == 2, "应当重试一次后成功"
+    assert plugin._load_diaries()["2026-09-26"]["content"]
+
+
+def test_catch_up_isolates_single_day_failure(tmp_path):
+    """单天补写异常必须就地收敛：不能把整轮补跑打断、饿死后面几天。"""
+    plugin = _cfg_plugin(tmp_path, catch_up_enabled=True, catch_up_days=3)
+    targets = plugin._catch_up_targets()
+    assert len(targets) == 3
+    boom_day, later_day = targets[1], targets[2]
+    calls: list[str] = []
+
+    async def fake_generate(date_str):
+        calls.append(date_str)
+        if date_str == boom_day:
+            raise _timeout_exc()
+        return True, "正文"
+
+    plugin._generate_for_date = fake_generate  # type: ignore[assignment]
+    results = asyncio.run(plugin._catch_up_missing())
+
+    assert calls == targets, "单天异常后仍要把剩余日期跑完"
+    by_date = dict(results)
+    assert by_date[boom_day] is False
+    assert by_date[later_day] is True
+
+
+def test_catch_up_budget_stops_remaining_days(tmp_path, monkeypatch):
+    """总预算到点就停手，剩余日期留给下一轮 —— 网络全崩时别长时间挂着。"""
+    plugin = _cfg_plugin(
+        tmp_path, catch_up_enabled=True, catch_up_days=3, catch_up_budget_minutes=1
+    )
+    clock = {"t": 0.0}
+
+    class FakeTime:
+        @staticmethod
+        def monotonic() -> float:
+            return clock["t"]
+
+    monkeypatch.setattr(MOD, "time", FakeTime)
+
+    async def slow_generate(date_str):
+        clock["t"] += 120.0  # 每天耗时 2 分钟，超过 1 分钟预算
+        return True, "正文"
+
+    plugin._generate_for_date = slow_generate  # type: ignore[assignment]
+    results = asyncio.run(plugin._catch_up_missing())
+
+    assert len(results) == 1, "超预算后不该继续补后面的日期"

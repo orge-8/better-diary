@@ -14,6 +14,7 @@ import datetime
 import json
 import logging
 import re
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
@@ -23,6 +24,7 @@ from pydantic import field_validator
 
 if __package__:  # 包式加载（Runner 真机：插件目录作为包，不在 sys.path 上）
     from .bd_prompts import (
+        build_continuity_line,
         build_extract_prompt,
         build_timeline,
         build_write_prompt,
@@ -30,13 +32,19 @@ if __package__:  # 包式加载（Runner 真机：插件目录作为包，不在
         date_display,
         diary_output_problem,
         ensure_date_line,
+        event_id,
         events_to_text,
         parse_events,
+        quote_attribution_risk,
+        split_meta,
         strip_diary_output,
+        update_continuity,
     )
     from .bd_cookie import CookieStore
+    from .bd_search import format_hits, on_this_day, search_diaries
 else:  # 平铺兜底（脚本直跑 / 旧测试夹具）
     from bd_prompts import (
+        build_continuity_line,
         build_extract_prompt,
         build_timeline,
         build_write_prompt,
@@ -44,11 +52,16 @@ else:  # 平铺兜底（脚本直跑 / 旧测试夹具）
         date_display,
         diary_output_problem,
         ensure_date_line,
+        event_id,
         events_to_text,
         parse_events,
+        quote_attribution_risk,
+        split_meta,
         strip_diary_output,
+        update_continuity,
     )
     from bd_cookie import CookieStore
+    from bd_search import format_hits, on_this_day, search_diaries
 
 logger = logging.getLogger("plugin.org.civetc.better-diary")
 
@@ -114,6 +127,13 @@ class ScheduleSection(PluginConfigBase):
     enabled: bool = Field(default=True, description="是否启用每日定时生成")
     time: str = Field(default="23:30", description="每天生成时间，HH:MM（Host 本地时区）")
     notify_chats: list[str] = Field(default_factory=list, description='定时发布后通知哪些聊天，格式 "group:群号" / "private:QQ号" / 裸 stream_id；留空则不发通知')
+    catch_up_enabled: bool = Field(default=True, description="补写缺档：插件启动与次日兜底各扫一次，给没有日记的日期补写（只存档、不发布）")
+    catch_up_days: int = Field(default=3, description="补写最多往前看几天（不含今天）。这个上界同时充当「生效日」，绝不追溯更早的空档")
+    fallback_time: str = Field(default="04:10", description="次日凌晨的兜底补写时刻，HH:MM；留空或与 time 相同则关闭兜底")
+    wait_silent_minutes: int = Field(default=0, description="静默阈值：到点时若最近 N 分钟内还有新消息，就等人停下再写。0 = 关闭（到点直接写，旧行为）")
+    retry_interval_minutes: int = Field(default=30, description="还没静默时，每隔多少分钟再看一次")
+    max_wait_hours: int = Field(default=3, description="最多等多久；等满就照常生成（不丢天优先）。0 = 第一次发现没静默就直接写")
+    catch_up_budget_minutes: int = Field(default=0, description="一轮补跑的总时长上限（分钟）。0 = 不限制。超预算就停手，剩余日期交给下一轮兜底（网络全崩时避免长时间占用）")
 
     _norm_notify_chats = field_validator("notify_chats", mode="before")(_as_str_list)
 
@@ -140,6 +160,8 @@ class LLMSection(PluginConfigBase):
     temperature: float = Field(default=0.8, description="成文温度")
     extract_temperature: float = Field(default=0.2, description="选材温度（建议低温保证 JSON 稳定）")
     timeout_seconds: int = Field(default=180, description="单次 LLM 调用超时（秒）")
+    write_retry: int = Field(default=1, description="成文阶段遇到**超时**类失败时额外重试几次。0 = 不重试（超时即判失败）")
+    retry_backoff_seconds: int = Field(default=20, description="成文重试前的等待秒数。给网络抖动一点恢复时间，避免紧接着撞同一堵墙")
 
 
 class SecuritySection(PluginConfigBase):
@@ -172,6 +194,7 @@ class BetterDiaryPlugin(MaiBotPlugin):
     # 类级默认：不跑 on_load（如冒烟测试直接实例化）也能安全访问
     _generating = False
     _sched_task = None
+    _catchup_task = None
     _cookie_store = None
     _cfg_fallback_warned = False
 
@@ -222,6 +245,36 @@ class BetterDiaryPlugin(MaiBotPlugin):
             self._get_logger().error(msg, *args, **kwargs)
         except Exception:  # noqa: BLE001 - 同上
             pass
+
+    def _log_warning(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        """best-effort 记录 WARNING。
+
+        专门给**异常兜底分支**用：兜底分支的职责是「无论如何都要把控制权交回去」，
+        若在 except 里直接 `self.ctx.logger.warning(...)`，日志器本身不可用时会把
+        异常再次抛出，反而破坏了兜底。这里沿用 _log_info/_log_error 的安全语义。
+        """
+        try:
+            self._get_logger().warning(msg, *args, **kwargs)
+        except Exception:  # noqa: BLE001 - 日志失败不能反过来破坏兜底逻辑
+            pass
+
+    # 超时类异常的判据（按类名 + 文本，**不能只靠 isinstance**）。
+    # 真机实测：LLM 调用超时抛的是 Runner 的 RPCError
+    #   `[E_TIMEOUT] 请求 cap.call 超时 (180000ms)`（rpc_client.py 里 `raise RPCError(...) from None`）
+    # **不是** asyncio.TimeoutError；而且真机那个异常类与本地 devkit 的不是同一个对象，
+    # 依赖 isinstance 会在本地假绿、真机判不出来。cause 是 None（from None），所以也查不了链。
+    _TIMEOUT_TYPE_HINTS = ("timeout", "e_timeout")
+    _TIMEOUT_TEXT_HINTS = ("timeout", "timed out", "e_timeout", "超时")
+
+    @classmethod
+    def _is_timeout_error(cls, exc: BaseException) -> bool:
+        """异常是不是「超时」类。超时可重试（网络抖动），其余多数重试也没用。"""
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+            return True
+        if any(h in type(exc).__name__.lower() for h in cls._TIMEOUT_TYPE_HINTS):
+            return True
+        text = str(exc).lower()
+        return any(h in text for h in cls._TIMEOUT_TEXT_HINTS)
 
     @staticmethod
     def _merge_with_defaults(defaults: Mapping[str, Any], raw: Mapping[str, Any]) -> dict[str, Any]:
@@ -418,6 +471,12 @@ class BetterDiaryPlugin(MaiBotPlugin):
                     self._start_scheduler()
                 except Exception as exc:  # noqa: BLE001
                     self._log_error("调度器启动失败（插件仍可加载）：%s", exc, exc_info=True)
+                # 启动补跑：补上「上次离线期间」缺掉的日记（只存档、不发布）。
+                # 用独立 task 跑，绝不阻塞 on_load。
+                try:
+                    self._start_catch_up()
+                except Exception as exc:  # noqa: BLE001
+                    self._log_error("启动补跑未能开始（插件仍可加载）：%s", exc, exc_info=True)
             self._log_info(
                 "better-diary 已加载：定时 %s（%s），字数目标 %d，发布目标 %s",
                 self.config.schedule.time if self.config.schedule.enabled else "关闭",
@@ -433,6 +492,9 @@ class BetterDiaryPlugin(MaiBotPlugin):
         if self._sched_task is not None:
             self._sched_task.cancel()
             self._sched_task = None
+        if self._catchup_task is not None:
+            self._catchup_task.cancel()
+            self._catchup_task = None
         self._log_info("better-diary 已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
@@ -454,6 +516,12 @@ class BetterDiaryPlugin(MaiBotPlugin):
                 self._start_scheduler()
             except Exception as exc:  # noqa: BLE001
                 self._log_error("调度器重启失败：%s", exc, exc_info=True)
+            # 只在新启用补写时补跑一次；重复热重载不会重刷（补跑本身幂等）
+            if self._catchup_task is None or self._catchup_task.done():
+                try:
+                    self._start_catch_up()
+                except Exception as exc:  # noqa: BLE001
+                    self._log_error("补跑未能开始：%s", exc, exc_info=True)
         self._log_info("配置已热重载，调度器状态: %s", "运行中" if self.config.schedule.enabled else "停用")
 
     # ------------------------------------------------------------ 命令区
@@ -475,18 +543,30 @@ class BetterDiaryPlugin(MaiBotPlugin):
             await self.ctx.send.text("日期格式不对，用 /日记 2026-09-26 这种写法。", stream_id)
             return True, "", 2
 
+        today = self._today_str()
+        if date_str > today:
+            # 别落到「消息太少」的分支上去——那是误导性提示
+            await self.ctx.send.text(f"{date_display(date_str)} 还没到呢，我可不会预言。", stream_id)
+            return True, "", 2
+
         if self._generating:
             await self.ctx.send.text("正在生成上一篇日记，先等等。", stream_id)
             return True, "", 2
 
-        await self.ctx.send.text(f"开始生成 {date_display(date_str)} 的日记，大概一两分钟。", stream_id)
+        is_today = date_str == today
+        await self.ctx.send.text(
+            f"开始{'生成' if is_today else '补写'} {date_display(date_str)} 的日记，大概一两分钟。",
+            stream_id,
+        )
         ok, result = await self._generate_for_date(date_str)
         if not ok:
             await self.ctx.send.text(f"日记没写成：{result}", stream_id)
             return True, "", 2
 
-        # 日记成品只发QQ空间，聊天里只回报状态；正文用 /日记查看 回看
-        if self.config.qzone.enabled:
+        # 日记成品只发QQ空间，聊天里只回报状态；正文用 /日记查看 回看。
+        # ★ 只有**当天**的日记才发布：补写/兜底的一律只存档，
+        #   否则公开空间会突然冒出一条「昨天」的历史说说。
+        if is_today and self.config.qzone.enabled:
             pub_ok, pub_msg = await self._publish_to_qzone(result)
             if pub_ok:
                 await self.ctx.send.text(
@@ -500,9 +580,15 @@ class BetterDiaryPlugin(MaiBotPlugin):
                     f"想回看用 /日记查看 {date_str}",
                     stream_id,
                 )
-        else:
+        elif is_today:
             await self.ctx.send.text(
                 f"日记已生成并存档（{len(result)} 字）。QQ空间发布未启用，想回看用 /日记查看 {date_str}",
+                stream_id,
+            )
+        else:
+            await self.ctx.send.text(
+                f"{date_display(date_str)} 的日记已补写并存档（{len(result)} 字）。"
+                f"非当天的日记不发布到QQ空间，想看用 /日记查看 {date_str}",
                 stream_id,
             )
         return True, "", 2
@@ -537,11 +623,101 @@ class BetterDiaryPlugin(MaiBotPlugin):
         await self.ctx.send.text(
             "better-diary 用法：\n"
             "/日记 —— 生成今天的日记并发布到QQ空间（管理员）\n"
-            "/日记 2026-09-26 —— 生成指定日期的日记并发布（管理员）\n"
+            "/日记 2026-09-26 —— 补写指定日期的日记，只存档不发布（管理员）\n"
             "/日记查看 [日期] —— 在聊天里回看已存档的日记\n"
+            "/日记来源 [日期] —— 查看某天日记依据了哪些选材事件\n"
+            "/问日记 <关键词> —— 搜历史日记（本地检索，不调用模型）\n"
+            "/那年今日 —— 往年同月同日的日记\n"
             "/日记帮助 —— 本说明",
             stream_id,
         )
+        return True, "", 2
+
+    @Command(
+        "diary_ask",
+        description="按关键词搜索历史日记（本地检索，不调用模型）",
+        pattern=r"^\s*[/／]\s*(?:问日记|diary_ask)(?:\s+(?P<query>.+?))?\s*$",
+    )
+    async def cmd_diary_ask(self, matched_groups: dict | None = None, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, int]:
+        del kwargs
+        if not stream_id:
+            return True, "缺少聊天流，无法回复", 2
+        query = str((matched_groups or {}).get("query") or "").strip()
+        if not query:
+            await self.ctx.send.text(
+                "问什么？用 /问日记 萤火虫 这种写法，多个词用空格隔开（都要命中才算）。",
+                stream_id,
+            )
+            return True, "", 2
+        # 零 LLM：纯本地字符串匹配，成本可以忽略，不设节流
+        hits = search_diaries(self._load_diaries(), query)
+        await self._send_long(
+            format_hits(f"问「{query}」", hits, f"没找到含「{query}」的日记。"),
+            stream_id,
+        )
+        return True, "", 2
+
+    @Command(
+        "diary_on_this_day",
+        description="查看往年同月同日的日记（本地检索，不调用模型）",
+        pattern=r"^\s*[/／]\s*(?:那年今日|diary_on_this_day)\s*$",
+    )
+    async def cmd_diary_on_this_day(self, matched_groups: dict | None = None, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, int]:
+        del matched_groups, kwargs
+        if not stream_id:
+            return True, "缺少聊天流，无法回复", 2
+        today = datetime.date.today()
+        hits = on_this_day(self._load_diaries(), today)
+        await self._send_long(
+            format_hits(
+                f"那年今日（{today.month}月{today.day}日）",
+                hits,
+                f"往年 {today.month} 月 {today.day} 日还没有日记。",
+            ),
+            stream_id,
+        )
+        return True, "", 2
+
+    @Command(
+        "diary_sources",
+        description="查看某天日记依据的选材事件（证据链）",
+        pattern=r"^\s*[/／]\s*(?:日记来源|diary_sources)\s*(?P<date>\d{4}-\d{1,2}-\d{1,2})?\s*$",
+    )
+    async def cmd_diary_sources(self, matched_groups: dict | None = None, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, int]:
+        del kwargs
+        if not stream_id:
+            return True, "缺少聊天流，无法回复", 2
+        raw = (matched_groups or {}).get("date") or ""
+        date_str = self._normalize_date(raw) if raw else self._today_str()
+        entry = self._load_diaries().get(date_str)
+        if not entry or not entry.get("content"):
+            await self.ctx.send.text(f"{date_str} 没有存档的日记。", stream_id)
+            return True, "", 2
+        mode = str(entry.get("material_mode") or "").strip()
+        lines: list[str] = [f"{date_str} 的日记依据（素材模式：{mode or '旧版存档'}）："]
+        events = entry.get("events") if isinstance(entry.get("events"), list) else []
+        if events:
+            for e in events:
+                if not isinstance(e, dict):
+                    continue
+                line = f"- {e.get('who') or '?'}：{e.get('what') or ''}"
+                if e.get("quote"):
+                    line += f"（原话：「{e['quote']}」）"
+                lines.append(line)
+        else:
+            lines.append("- 该日期没有结构化选材事件（旧版存档，或选材降级用时间线末尾写成）")
+        meta = entry.get("meta") if isinstance(entry.get("meta"), dict) else {}
+        if meta:
+            for key, label in (
+                ("topics", "话题"),
+                ("people", "提到的人"),
+                ("projects", "手头的事"),
+                ("unresolved", "还没个结果的"),
+            ):
+                values = [str(v) for v in (meta.get(key) or []) if str(v).strip()]
+                if values:
+                    lines.append(f"- {label}：" + "、".join(values[:8]))
+        await self._send_long("\n".join(lines), stream_id)
         return True, "", 2
 
     # ------------------------------------------------------------ 权限
@@ -566,33 +742,209 @@ class BetterDiaryPlugin(MaiBotPlugin):
     def _start_scheduler(self) -> None:
         self._sched_task = asyncio.create_task(self._schedule_loop())
 
-    def _seconds_until_next(self, hhmm: str) -> float:
+    def _start_catch_up(self) -> None:
+        """启动一次补跑（后台 task，绝不阻塞 on_load）。"""
+        if not self.config.schedule.catch_up_enabled:
+            return
+        self._catchup_task = asyncio.create_task(self._catch_up_run())
+
+    @staticmethod
+    def _parse_hhmm(hhmm: str) -> tuple[int, int] | None:
+        """解析 HH:MM。空串或非法返回 None（表示「该时间点未配置」）。"""
+        raw = str(hhmm or "").strip()
+        if not raw:
+            return None
         try:
-            hour, minute = (int(x) for x in hhmm.split(":"))
-            hour = max(0, min(23, hour))
-            minute = max(0, min(59, minute))
+            hour, minute = (int(x) for x in raw.split(":"))
         except (ValueError, AttributeError):
-            hour, minute = 23, 30
+            return None
+        return max(0, min(23, hour)), max(0, min(59, minute))
+
+    def _seconds_until_next(self, hhmm: str) -> float:
+        parsed = self._parse_hhmm(hhmm)
+        if parsed is None:
+            return float("inf")  # 未配置 → 永不触发
+        hour, minute = parsed
         now = datetime.datetime.now()
         target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         if target <= now:
             target += datetime.timedelta(days=1)
         return (target - now).total_seconds()
 
+    def _fallback_hhmm(self) -> str:
+        """兜底时刻。留空或与主时间相同 → 视为关闭。"""
+        raw = str(self.config.schedule.fallback_time or "").strip()
+        main = str(self.config.schedule.time or "").strip()
+        if not raw or raw == main:
+            return ""
+        return raw
+
+    def _next_fire(self) -> tuple[float, str]:
+        """下一次触发：返回 (秒数, 类型)，类型 ∈ {"main", "fallback"}。"""
+        main_delay = self._seconds_until_next(self.config.schedule.time)
+        fallback = self._fallback_hhmm()
+        fb_delay = self._seconds_until_next(fallback) if fallback else float("inf")
+        if fb_delay < main_delay:
+            return fb_delay, "fallback"
+        return main_delay, "main"
+
     async def _schedule_loop(self) -> None:
         try:
             while True:
-                delay = self._seconds_until_next(self.config.schedule.time)
-                self.ctx.logger.info("定时日记将在 %.0f 秒后运行", delay)
+                delay, kind = self._next_fire()
+                if delay == float("inf"):
+                    # 两个时间点都没配（time 有默认值，理论上到不了这里）：
+                    # 睡一小时再看，不要空转烧 CPU
+                    await asyncio.sleep(3600)
+                    continue
+                self.ctx.logger.info("定时日记将在 %.0f 秒后运行（%s）", delay, kind)
                 await asyncio.sleep(delay)
-                await self._scheduled_run()
+                if kind == "fallback":
+                    await self._catch_up_run()
+                else:
+                    await self._run_main_with_silence_wait()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             self.ctx.logger.error("调度器异常退出: %s", exc, exc_info=True)
 
+    # ------------------------------------------------------------ 静默阈值（等人停下再写）
+
+    async def _run_main_with_silence_wait(self) -> None:
+        """主触发入口：先按静默阈值等人停下，等满上限就照常生成（**不丢天优先**）。
+
+        阈值为 0 时完全等价于旧行为（到点直接写），不发起任何额外消息查询。
+        """
+        minutes = max(0, int(self.config.schedule.wait_silent_minutes))
+        if minutes <= 0:
+            await self._scheduled_run()
+            return
+        hours = max(0, int(self.config.schedule.max_wait_hours))
+        deadline = (
+            datetime.datetime.now() + datetime.timedelta(hours=hours)
+            if hours > 0
+            else datetime.datetime.min  # 0 = 不等，第一次发现没静默就直接写
+        )
+        attempt = 0
+        while True:
+            if await self._chat_is_quiet(minutes):
+                if attempt:
+                    self.ctx.logger.info("聊天已静默超过 %d 分钟，开始生成今日日记", minutes)
+                await self._scheduled_run()
+                return
+            attempt += 1
+            if datetime.datetime.now() >= deadline:
+                self.ctx.logger.warning(
+                    "等待静默超时（已等 %d 次，上限 %d 小时），照常生成今日日记（不丢天优先）",
+                    attempt, hours,
+                )
+                await self._scheduled_run()
+                return
+            interval = max(1, int(self.config.schedule.retry_interval_minutes))
+            self.ctx.logger.info(
+                "最近 %d 分钟内还有新消息，%d 分钟后再看（第 %d 次等待）", minutes, interval, attempt
+            )
+            await asyncio.sleep(interval * 60)
+
+    async def _chat_is_quiet(self, minutes: int) -> bool:
+        """最近 ``minutes`` 分钟内是否没有任何新消息（全库）。
+
+        查询失败按「已静默」处理并留日志 —— 这是可选的体验增强，绝不能因为它
+        挡住当天日记（不丢天优先）。
+        """
+        now = datetime.datetime.now()
+        start = now - datetime.timedelta(minutes=max(1, minutes))
+        try:
+            msgs = await self._query_messages(start.timestamp(), now.timestamp(), "")
+        except Exception as exc:  # noqa: BLE001
+            self._log_warning("静默检查失败（按已静默处理，照常生成）: %s", exc)
+            return True
+        if msgs:
+            self.ctx.logger.info("静默检查：最近 %d 分钟内还有 %d 条新消息", minutes, len(msgs))
+            return False
+        return True
+
+    # ------------------------------------------------------------ 补跑（不丢天）
+
+    def _catch_up_targets(self) -> list[str]:
+        """待补写的日期，**由早到晚**排列（先补老的，跨天连续性才对得上）。"""
+        days = max(0, int(self.config.schedule.catch_up_days))
+        if days <= 0:
+            return []
+        today = datetime.date.today()
+        return [
+            (today - datetime.timedelta(days=offset)).strftime("%Y-%m-%d")
+            for offset in range(days, 0, -1)
+        ]
+
+    async def _catch_up_missing(self) -> list[tuple[str, bool]]:
+        """给没有日记的日期补写。**只存档、不发布**。返回 [(日期, 是否成功)]。
+
+        幂等：以存档里是否已有该日期为准，重复启动不会重刷。
+
+        两道保险（真机实测补充）：
+        - **单天异常不进结果**：某天的补写抛异常绝不能让整轮补跑崩掉、把后面几天一起饿死。
+        - **总预算**：`catch_up_budget_minutes > 0` 时，用完整轮就停手；剩余日期留给
+          下一轮兜底。网络整体不可用时，避免在启动补跑里长时间挂着重试。
+        """
+        existing = self._load_diaries()
+        results: list[tuple[str, bool]] = []
+        budget_min = max(0, int(self.config.schedule.catch_up_budget_minutes))
+        deadline = time.monotonic() + budget_min * 60 if budget_min > 0 else None
+        for date_str in self._catch_up_targets():
+            if deadline is not None and time.monotonic() >= deadline:
+                self.ctx.logger.warning(
+                    "补跑已达总预算 %d 分钟，剩余日期留给下一轮兜底", budget_min
+                )
+                break
+            if str(existing.get(date_str, {}).get("content") or "").strip():
+                continue
+            self.ctx.logger.info("补写缺档 %s", date_str)
+            try:
+                ok, result = await self._generate_for_date(date_str)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                # 单天失败必须就地收敛：否则后面的日期一天都补不了
+                self.ctx.logger.error("补写 %s 异常（跳过本日，继续后面几天）: %s", date_str, exc)
+                results.append((date_str, False))
+                continue
+            if ok:
+                results.append((date_str, True))
+                await self._notify_chats(
+                    f"补写了 {date_str} 的日记（{len(result)} 字），已存档、未发布到QQ空间。"
+                    f"想看用 /日记查看 {date_str}"
+                )
+            else:
+                results.append((date_str, False))
+                self.ctx.logger.warning("补写 %s 未成功：%s", date_str, result)
+        return results
+
+    async def _catch_up_run(self) -> None:
+        """补跑入口：启动补跑与兜底时刻都走这里。任何异常只记日志，不能拖垮调度器。"""
+        if not self.config.schedule.catch_up_enabled:
+            return
+        try:
+            if self._generating:
+                self.ctx.logger.info("补跑跳过：已有生成任务在进行")
+                return
+            results = await self._catch_up_missing()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self.ctx.logger.error("补跑异常: %s", exc, exc_info=True)
+            return
+        if not results:
+            self.ctx.logger.info("补跑结束：没有需要补写的日期")
+            return
+        done = [d for d, ok in results if ok]
+        self.ctx.logger.info(
+            "补跑结束：尝试 %d 天，成功 %d 天（%s）", len(results), len(done), "、".join(done) or "无"
+        )
+
     async def _scheduled_run(self) -> None:
         if self._generating:
+            self.ctx.logger.warning("定时日记跳过：已有生成任务在进行（次日兜底会补写）")
             return
         date_str = self._today_str()
         ok, result = await self._generate_for_date(date_str)
@@ -835,6 +1187,34 @@ class BetterDiaryPlugin(MaiBotPlugin):
             raise RuntimeError(f"LLM 调用失败: {err}")
         return str(result.get("response") or result.get("content") or "")
 
+    async def _call_llm_with_retry(self, prompt: str, temperature: float, *, stage: str) -> str:
+        """成文阶段专用：**只对超时类失败**做有限重试。
+
+        真机实录（2026-09-28 09:00 补跑）：模型 Provider 集体网络超时（30s APITimeoutError，
+        日志里连着好几条 `遇到错误: 网络连接超时`），MaiBot 侧依次切换模型、逐个耗尽重试，
+        最终以 Runner RPC 超时收尾 —— 补跑直接在这一天炸掉。
+
+        为什么值得重试：Provider 超时是**网络抖动**性质，隔一会儿换一个模型往往就好了；
+        而格式/语义类失败重试纯属浪费。**非超时异常一律原样抛出，不重试。**
+        """
+        attempts = max(0, int(self.config.llm.write_retry)) + 1
+        backoff = max(0, int(self.config.llm.retry_backoff_seconds))
+        for attempt in range(1, attempts + 1):
+            try:
+                return await self._call_llm(prompt, temperature)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                if attempt >= attempts or not self._is_timeout_error(exc):
+                    raise
+                self._log_warning(
+                    "%s 第 %d/%d 次调用超时，%d 秒后重试: %s",
+                    stage, attempt, attempts, backoff, exc,
+                )
+                if backoff:
+                    await asyncio.sleep(backoff)
+        raise RuntimeError(f"{stage}调用失败")  # pragma: no cover - 循环必然 return 或 raise
+
     async def _extract_events(self, timeline: str, date_str: str) -> list[dict[str, Any]]:
         """阶段一：分块选材 + 打分 + 合并排序。"""
         chunks = chunk_text(timeline, self.config.diary.chunk_chars, self.config.diary.max_chunks)
@@ -851,7 +1231,10 @@ class BetterDiaryPlugin(MaiBotPlugin):
                     )
                     return parse_events(raw)
                 except Exception as exc:
-                    self.ctx.logger.warning("选材分块失败（跳过）: %s", exc)
+                    # 区分超时与其它失败：超时通常意味着「模型池整体不可用」，
+                    # 成文阶段会因此降级失败，日志上看得出因果才排得动
+                    kind = "超时" if self._is_timeout_error(exc) else "失败"
+                    self.ctx.logger.warning("选材分块%s（跳过本块）: %s", kind, exc)
                     return []
 
         results = await asyncio.gather(*(run_one(c) for c in chunks))
@@ -899,8 +1282,10 @@ class BetterDiaryPlugin(MaiBotPlugin):
 
         # 阶段一：选材；失败或为空则降级用时间线末尾
         events = await self._extract_events(timeline, date_display(date_str))
+        used_events: list[dict[str, Any]] = []
         if events:
             events = events[: max(1, self.config.diary.max_events)]
+            used_events = events
             events_text = events_to_text(events)
             self.ctx.logger.info("选材完成: %d 件入选", len(events))
         else:
@@ -911,6 +1296,9 @@ class BetterDiaryPlugin(MaiBotPlugin):
         # 阶段二：成文
         persona = await self._resolve_persona()
         name = await self._resolve_nickname()
+        is_today = date_str == self._today_str()
+        # 跨天连续性：只用于引出回顾与延续，**不能当作「今天发生了什么」的依据**（纪律写进 prompt）
+        continuity = self._load_continuity()
         prompt = build_write_prompt(
             date_str=date_display(date_str),
             events_text=events_text,
@@ -919,23 +1307,48 @@ class BetterDiaryPlugin(MaiBotPlugin):
             style_extra=self.config.diary.style_extra,
             word_target=max(80, self.config.diary.word_target),
             max_events=max(1, self.config.diary.max_events),
+            # 补写过去的日期必须声明相对时间的基准，否则模型会按「真正的今天」解读素材里的「昨天」
+            temporal_anchor="" if is_today else date_display(date_str),
+            continuity_text=build_continuity_line(continuity),
         )
-        raw = await self._call_llm(prompt, self.config.llm.temperature)
+        raw = await self._call_llm_with_retry(prompt, self.config.llm.temperature, stage="日记成文")
         stripped = strip_diary_output(raw)
+        # 结构化 META 永远不进正文（split_meta 会先切掉，即使解析失败也不泄漏）
+        body, meta = split_meta(stripped)
         # 发布前的语义闸：拒答 / 空输出 / 残句一律判失败，本日不存档也不发布。
         # 日记成品会公开出现在 QQ 空间，绝不能把「抱歉，作为一个人工智能…」发出去。
-        problem = diary_output_problem(stripped)
+        problem = diary_output_problem(body)
         if problem:
             self.ctx.logger.error(
                 "日记成文不可用（%s），本日不存档、不发布；模型原文前 80 字: %s",
                 problem,
-                stripped[:80] or "（空）",
+                body[:80] or "（空）",
             )
             return False, f"模型没写出可用的日记（{problem}），本日不生成"
-        content = ensure_date_line(stripped, date_display(date_str))
+        content = ensure_date_line(body, date_display(date_str))
+        # 引用体检（非阻断，只留痕）：选材成文时才查——降级用时间线末尾时
+        # 模型可以引用任意聊天原话，没有可比对的素材列表。
+        if used_events:
+            risk = quote_attribution_risk(content, [e.get("quote", "") for e in used_events])
+            if risk:
+                self.ctx.logger.warning(
+                    "引用体检告警：%s；素材原话=%s",
+                    risk,
+                    [e.get("quote", "") for e in used_events],
+                )
         self.ctx.logger.info("日记成文: %d 字（目标 %d）", len(content), self.config.diary.word_target)
 
-        self._save_diary(date_str, content, stats)
+        material_mode = "events" if used_events else "timeline_tail"
+        self._save_diary(
+            date_str, content, stats,
+            events=used_events, material_mode=material_mode, meta=meta,
+        )
+        # 累积跨天连续性（纯累积 + 保序去重，不再额外调 LLM）
+        if used_events or meta:
+            try:
+                self._save_continuity(update_continuity(continuity, used_events, meta))
+            except Exception as exc:  # noqa: BLE001 - 连续性失败不影响成品
+                self.ctx.logger.warning("连续性状态更新失败（不影响本次日记）: %s", exc)
         return True, content
 
     async def _resolve_bot_qq(self) -> str:
@@ -980,22 +1393,66 @@ class BetterDiaryPlugin(MaiBotPlugin):
         except (json.JSONDecodeError, OSError):
             return {}  # 坏即空
 
-    def _save_diary(self, date_str: str, content: str, stats: dict[str, int]) -> None:
+    def _save_diary(
+        self,
+        date_str: str,
+        content: str,
+        stats: dict[str, int],
+        events: list[dict[str, Any]] | None = None,
+        material_mode: str = "",
+        meta: dict[str, Any] | None = None,
+    ) -> None:
         path = self._store_path()
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             data = self._load_diaries()
+            # 证据链：把「这篇日记依据了哪些选材事件」一起落盘。
+            # event_id 由内容哈希派生，重生成后不变——去重、纠错、引用才有稳定锚点。
+            provenance = [
+                {**e, "event_id": event_id(date_str, e)}
+                for e in (events or [])
+                if isinstance(e, dict) and str(e.get("what") or "").strip()
+            ]
             data[date_str] = {
                 "content": content,
                 "word_count": len(content),
                 "stats": stats,
                 "generated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "events": provenance,
+                "material_mode": material_mode or ("events" if provenance else "timeline_tail"),
+                "meta": dict(meta or {}),
             }
             tmp = path.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
             tmp.replace(path)  # 原子替换
         except OSError as exc:
             self.ctx.logger.error("日记存档失败: %s", exc)
+
+    # ------------------------------------------------------------ 跨天连续性
+
+    def _continuity_path(self) -> Path:
+        return self._data_dir() / "continuity.json"
+
+    def _load_continuity(self) -> dict[str, Any]:
+        """读跨天连续性状态。坏即空（连续性缺失只影响「延续感」，不影响成品）。"""
+        path = self._continuity_path()
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _save_continuity(self, state: dict[str, Any]) -> None:
+        path = self._continuity_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(path)  # 原子替换
+        except OSError as exc:
+            self.ctx.logger.error("连续性状态保存失败: %s", exc)
 
     # ------------------------------------------------------------ 发送
 

@@ -40,7 +40,7 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 
 _PKG = "better_diary"  # 合法标识符；目录名 better-diary 含 '-'，不能直接当包名用
-_FLAT_ALIASES = ("bd_prompts", "bd_qzone", "bd_cookie")
+_FLAT_ALIASES = ("bd_prompts", "bd_qzone", "bd_cookie", "bd_search")
 
 
 def _purge(*bases: str) -> None:
@@ -393,6 +393,15 @@ print("NOHTTPX-LOAD-OK")
     check("config_version 默认值", cfg.plugin.config_version == "1.0.0")
     check("word_target 默认 250", cfg.diary.word_target == 250)
     check("schedule.time 默认 23:30", cfg.schedule.time == "23:30")
+    check("不丢天默认开启", cfg.schedule.catch_up_enabled is True)
+    check("补写上限默认 3 天", cfg.schedule.catch_up_days == 3)
+    check("兜底时刻默认 04:10", cfg.schedule.fallback_time == "04:10")
+    check("静默阈值默认关闭（0=旧行为）", cfg.schedule.wait_silent_minutes == 0)
+    check("静默重试间隔默认 30 分钟", cfg.schedule.retry_interval_minutes == 30)
+    check("静默等待上限默认 3 小时", cfg.schedule.max_wait_hours == 3)
+    check("成文超时重试默认 1 次", cfg.llm.write_retry == 1)
+    check("重试退避默认 20 秒", cfg.llm.retry_backoff_seconds == 20)
+    check("补跑总预算默认不限", cfg.schedule.catch_up_budget_minutes == 0)
     check("admin_ids 默认空", cfg.security.admin_ids == [])
     check("target_chats 默认空 list", cfg.diary.target_chats == [])
     check("llm.task_name 默认 utils", cfg.llm.task_name == "utils")
@@ -403,7 +412,7 @@ print("NOHTTPX-LOAD-OK")
         info = getattr(plugin_mod.BetterDiaryPlugin, attr).__dict__.get("__maibot_component_info__") if isinstance(getattr(plugin_mod.BetterDiaryPlugin, attr, None), (classmethod, staticmethod)) else getattr(getattr(plugin_mod.BetterDiaryPlugin, attr, None), "__maibot_component_info__", None)
         if info is not None and getattr(info, "component_type", getattr(info, "type", "")) in ("command",) or (info is not None and hasattr(info, "command_pattern")):
             commands[info.name] = info
-    check("共 3 个命令组件", len(commands) == 3, f"实际 {list(commands)}")
+    check("共 6 个命令组件", len(commands) == 6, f"实际 {list(commands)}")
     import re as _re
 
     p_diary = commands.get("diary")
@@ -438,6 +447,32 @@ print("NOHTTPX-LOAD-OK")
     check("漏日期行自动补", text.startswith("2026年9月26日 星期六"))
     text2 = bd.ensure_date_line("2026年9月26日 星期六，晴。\n今天很累。", "2026年9月26日 星期六")
     check("已有日期行不重复补", text2.count("2026年9月26日") == 1)
+
+    print("\n[3b] 成文 prompt 契约（引号归属）")
+    wp = bd.build_write_prompt(
+        date_str="2026年9月27日 星期日",
+        events_text="- 甲：提了《无名策》（原话：「来首无名策岂不美哉」）",
+        name="鸣澜", persona="是只爱聊天的 bot",
+    )
+    # 元凶：prompt 曾用「」当占位符（写「<日期>，X。」），教模型把「」当"待填框"
+    check("日期行规则不得用「」做占位符", "「2026年9月27日 星期日，X。」" not in wp, wp.splitlines()[6:8])
+    check("日期行规则仍写明了格式", "2026年9月27日 星期日，X。" in wp)
+    check("规则要求「」内只放别人原话", "只能放" in wp and "原话" in wp)
+    check("规则要求自己的话在引号外", "引号" in wp and "外面" in wp)
+    check("给出了错误/正确写法对照", "错误写法" in wp and "正确写法" in wp)
+    check("错误写法示例点出混写问题", "安排上了，好听" in wp)
+
+    # 引用体检（非阻断）
+    q_ok = "他说「来首无名策岂不美哉」，我回了句安排上了，好听。"
+    q_bad = "回了句「来首无名策岂不美哉 安排上了，好听」。"
+    check("原样引用了素材原话 → 无告警",
+          bd.quote_attribution_risk(q_ok, ["来首无名策岂不美哉"]) == "")
+    check("引号里没出现任何素材原话 → 告警",
+          bd.quote_attribution_risk(q_bad, ["奇妙的另一句原话"]) != "")
+    check("没有「」 → 不告警",
+          bd.quote_attribution_risk("今天啥也没说。", ["原话A"]) == "")
+    check("素材无原话可比对 → 不告警",
+          bd.quote_attribution_risk("他说「随便一句」。", []) == "")
 
     print("\n[4] 端到端生成（FakeCtx）")
     with tempfile.TemporaryDirectory() as td:
@@ -792,6 +827,316 @@ print("NOHTTPX-LOAD-OK")
     print("\n[10] 插件目录无残留")
     residue = PLUGIN_DIR / "data"
     check("插件目录无 data/ 残留", not residue.exists())
+
+    print("\n[11] 不丢天：补跑缺档（只存档、不发布）")
+    with tempfile.TemporaryDirectory() as td_catch:
+        catch_dir = Path(td_catch)
+        today = _dt.date.today().strftime("%Y-%m-%d")
+        yesterday = (_dt.date.today() - _dt.timedelta(days=1)).strftime("%Y-%m-%d")
+        pc = plugin_mod.create_plugin()
+        try:
+            pc.ctx = ctx
+        except AttributeError:
+            pc._ctx = ctx
+        pc.set_plugin_config({
+            "plugin": {"enabled": True, "config_version": "1.0.0"},
+            "diary": {"min_messages": 2},
+            "schedule": {"enabled": False, "catch_up_enabled": True, "catch_up_days": 3},
+        })
+        pc._data_dir = lambda: catch_dir  # type: ignore[assignment]
+        targets = pc._catch_up_targets()
+        check("补跑目标由早到晚、不含今天",
+              len(targets) == 3 and targets[-1] == yesterday and today not in targets, str(targets))
+        # 预置「昨天已有日记」→ 幂等：只补「前天」
+        catch_dir.mkdir(parents=True, exist_ok=True)
+        (catch_dir / "diaries.json").write_text(
+            json.dumps({yesterday: {"content": "昨天已有。", "word_count": 5}},
+                       ensure_ascii=False), encoding="utf-8")
+        results = asyncio.run(pc._catch_up_missing())
+        filled = [d for d, ok in results if ok]
+        check("已有日记的日期不重复补写", yesterday not in [d for d, _ in results], str(results))
+        check("缺档日期被补写", any(d == targets[0] and ok for d, ok in results), str(results))
+        archive = json.loads((catch_dir / "diaries.json").read_text(encoding="utf-8"))
+        check("补写确实落盘", all(d in archive for d in filled), str(sorted(archive)))
+        check("补写产物有证据链字段",
+              all("events" in archive[d] and "material_mode" in archive[d] for d in filled),
+              str({d: list(archive[d]) for d in filled}))
+
+    print("\n[12] 未来日期拦截 + 非当天不发布")
+    with tempfile.TemporaryDirectory() as td_future:
+        fut_dir = Path(td_future)
+        pf = plugin_mod.create_plugin()
+        try:
+            pf.ctx = ctx
+        except AttributeError:
+            pf._ctx = ctx
+        pf.set_plugin_config({
+            "plugin": {"enabled": True, "config_version": "1.0.0"},
+            "diary": {"min_messages": 2},
+            "schedule": {"enabled": False},
+            "security": {"admin_ids": []},
+        })
+        pf._data_dir = lambda: fut_dir  # type: ignore[assignment]
+        future = (_dt.date.today() + _dt.timedelta(days=2)).strftime("%Y-%m-%d")
+        sent_before = len(ctx.sent)
+        asyncio.run(pf.cmd_diary(matched_groups={"date": future}, stream_id="s1", user_id="1"))
+        texts = [t for t, _ in ctx.sent[sent_before:]]
+        check("未来日期被拦截（不落到「消息太少」分支）",
+              any("还没到" in t for t in texts), str(texts))
+        past = (_dt.date.today() - _dt.timedelta(days=1)).strftime("%Y-%m-%d")
+        sent_before = len(ctx.sent)
+        asyncio.run(pf.cmd_diary(matched_groups={"date": past}, stream_id="s1", user_id="1"))
+        texts = [t for t, _ in ctx.sent[sent_before:]]
+        check("非当天的日记不发布（明确说明只存档）",
+              any("不发布到QQ空间" in t for t in texts), str(texts))
+
+    print("\n[13] 证据链 + 跨天连续性")
+    check("event_id 幂等（重生成不变）",
+          bd.event_id("2026-09-27", {"who": "a", "what": "b", "quote": "c"})
+          == bd.event_id("2026-09-27", {"who": "a", "what": "b", "quote": "c"}))
+    body, meta = bd.split_meta("正文第一行。\n今天没事。\n\n===META===\n{\"topics\":[\"歌\"],\"people\":[\"甲\"],\"projects\":[\"补词\"],\"unresolved\":[\"叫啥\"]}")
+    check("META 与正文正确分离", "META" not in body and "===" not in body, repr(body))
+    check("META 键齐全", meta.get("topics") == ["歌"] and meta.get("projects") == ["补词"], str(meta))
+    bad_body, bad_meta = bd.split_meta("正文\n===META===\n不是JSON")
+    check("META 解析失败也不泄漏进正文", "META" not in bad_body and bad_meta == {}, repr(bad_body))
+    cont = bd.update_continuity({}, [{"what": "聊了歌"}], meta)
+    check("连续性五字段齐全",
+          all(k in cont for k in ("previous_summary", "important_events", "ongoing_projects",
+                                  "ongoing_topics", "unresolved_items")), str(cont))
+    cont2 = bd.update_continuity(cont, [{"what": "又聊了夜色"}], {"topics": ["夜色"]})
+    check("连续性保序累积（新的在前）",
+          cont2["ongoing_topics"][0] == "夜色" and "歌" in cont2["ongoing_topics"], str(cont2["ongoing_topics"]))
+    check("连续性为空时不注入", bd.build_continuity_line({}) == "")
+    check("连续性注入含线索", "上一次写到" in bd.build_continuity_line(cont))
+    check("prompt 含事实纪律", "不得制造" in bd.build_write_prompt(
+        date_str="2026年9月27日 星期日", events_text="- 甲：事", name="鸣澜", persona="p"))
+    check("补写时 prompt 含时间锚声明", "以 2026年9月26日 星期六 为基准" in bd.build_write_prompt(
+        date_str="2026年9月26日 星期六", events_text="- 甲：事", name="鸣澜", persona="p",
+        temporal_anchor="2026年9月26日 星期六"))
+    check("当天生成不含时间锚声明", "为基准" not in bd.build_write_prompt(
+        date_str="2026年9月27日 星期日", events_text="- 甲：事", name="鸣澜", persona="p"))
+
+    print("\n[14] 本地零 LLM 检索（/问日记 /那年今日）")
+    bds = sys.modules["bd_search"]
+    fake_archive = {
+        "2026-09-20": {
+            "content": "聊到萤火虫，糊糊的，像做梦。",
+            "events": [{"who": "Acer", "what": "拍了萤火虫照片", "quote": "像做梦一样", "score": 3,
+                        "event_id": "ev_x"}],
+            "meta": {"topics": ["萤火虫"], "people": ["Acer"], "projects": [], "unresolved": []},
+        },
+        "2026-09-26": {
+            "content": "聊到一首歌，前奏一响就跪了。",
+            "events": [{"who": "Тоша", "what": "丢来一首洛天依", "quote": "死在春天里", "score": 5,
+                        "event_id": "ev_y"}],
+            "meta": {"topics": ["歌"], "people": ["Тоша"], "projects": [], "unresolved": ["歌名"]},
+        },
+        "2025-09-26": {
+            "content": "去年今天的事。",
+            "events": [{"who": "旧岁逢春", "what": "说了晚上好", "quote": "", "score": 2,
+                        "event_id": "ev_z"}],
+            "meta": {"topics": [], "people": ["旧岁逢春"], "projects": [], "unresolved": []},
+        },
+    }
+    hits = bds.search_diaries(fake_archive, "萤火虫")
+    check("关键词命中且摘要取自命中事件",
+          [h["date"] for h in hits] == ["2026-09-20"] and "萤火虫" in hits[0]["summary"], str(hits))
+    hits2 = bds.search_diaries(fake_archive, "歌 洛天依")
+    check("多关键词 AND", [h["date"] for h in hits2] == ["2026-09-26"], str(hits2))
+    check("无命中返回空", bds.search_diaries(fake_archive, "不存在的词") == [])
+    check("空查询返回空", bds.search_diaries(fake_archive, "   ") == [])
+    check("全角空格也能分词", len(bds.search_diaries(fake_archive, "歌　洛天依")) == 1)
+    check("结果按日期倒序且有上限",
+          [h["date"] for h in bds.search_diaries(fake_archive, "洛天依", limit=1)] == ["2026-09-26"])
+    today = _dt.date(2026, 9, 26)
+    otd = bds.on_this_day(fake_archive, today)
+    check("那年今日只看年份更早的同月同日",
+          [h["date"] for h in otd] == ["2025-09-26"], str(otd))
+    check("同年的今天不算「那年」",
+          bds.on_this_day(fake_archive, _dt.date(2025, 9, 26)) == [])
+    check("空提示语生效",
+          bds.format_hits("t", [], "没有") == "没有"
+          and "（1 天）" in bds.format_hits("t", hits, "没有"))
+    # 命令级：/问日记 走 FakeCtx
+    with tempfile.TemporaryDirectory() as td_ask:
+        pa = plugin_mod.create_plugin()
+        try:
+            pa.ctx = ctx
+        except AttributeError:
+            pa._ctx = ctx
+        pa.set_plugin_config({"plugin": {"enabled": True, "config_version": "1.0.0"},
+                              "schedule": {"enabled": False}})
+        pa._data_dir = lambda: Path(td_ask)  # type: ignore[assignment]
+        (Path(td_ask) / "diaries.json").write_text(
+            json.dumps(fake_archive, ensure_ascii=False), encoding="utf-8")
+        sent_before = len(ctx.sent)
+        asyncio.run(pa.cmd_diary_ask(matched_groups={"query": "萤火虫"}, stream_id="s1"))
+        ask_text = "\n".join(t for t, _ in ctx.sent[sent_before:])
+        check("/问日记 命中并回显日期", "2026-09-20" in ask_text and "萤火虫" in ask_text, ask_text)
+        sent_before = len(ctx.sent)
+        asyncio.run(pa.cmd_diary_ask(matched_groups={}, stream_id="s1"))
+        hint = "\n".join(t for t, _ in ctx.sent[sent_before:])
+        check("空查询给用法提示", "问什么" in hint, hint)
+        sent_before = len(ctx.sent)
+        asyncio.run(pa.cmd_diary_on_this_day(stream_id="s1"))
+        otd_text = "\n".join(t for t, _ in ctx.sent[sent_before:])
+        real_today = _dt.date.today()
+        check("/那年今日 走真实系统日期（今天无往年记录时给空提示）",
+              f"往年 {real_today.month} 月 {real_today.day} 日" in otd_text, otd_text)
+
+    print("\n[15] 静默阈值（等人停下再写）")
+    with tempfile.TemporaryDirectory() as td_quiet:
+        pq = plugin_mod.create_plugin()
+        try:
+            pq.ctx = ctx
+        except AttributeError:
+            pq._ctx = ctx
+        pq._data_dir = lambda: Path(td_quiet)  # type: ignore[assignment]
+
+        runs: list[int] = []
+
+        async def record_run():
+            runs.append(1)
+
+        pq._scheduled_run = record_run  # type: ignore[assignment]
+
+        # 阈值为 0：完全旧行为，连消息查询都不发起
+        pq.set_plugin_config({"plugin": {"enabled": True, "config_version": "1.0.0"},
+                              "schedule": {"enabled": False, "wait_silent_minutes": 0}})
+
+        async def must_not_query(minutes):
+            raise AssertionError("阈值为 0 时不该发起静默检查")
+
+        pq._chat_is_quiet = must_not_query  # type: ignore[assignment]
+        asyncio.run(pq._run_main_with_silence_wait())
+        check("阈值 0 = 到点直接写（不发查询）", runs == [1], str(runs))
+
+        # 已静默：立刻写
+        pq.set_plugin_config({"plugin": {"enabled": True, "config_version": "1.0.0"},
+                              "schedule": {"enabled": False, "wait_silent_minutes": 30}})
+
+        async def quiet(minutes):
+            return True
+
+        pq._chat_is_quiet = quiet  # type: ignore[assignment]
+        runs.clear()
+        asyncio.run(pq._run_main_with_silence_wait())
+        check("已静默则立即生成", runs == [1], str(runs))
+
+        # 一直不静默 + 上限 0：不丢天优先，照写
+        pq.set_plugin_config({"plugin": {"enabled": True, "config_version": "1.0.0"},
+                              "schedule": {"enabled": False, "wait_silent_minutes": 30,
+                                           "max_wait_hours": 0}})
+
+        async def busy(minutes):
+            return False
+
+        pq._chat_is_quiet = busy  # type: ignore[assignment]
+        runs.clear()
+        asyncio.run(pq._run_main_with_silence_wait())
+        check("等满上限照常生成（不丢天优先）", runs == [1], str(runs))
+
+        # 静默检查失败按「已静默」处理，绝不挡住当天日记（用独立实例，避免上面
+        # 把 _chat_is_quiet 换成假函数后串味）
+        async def boom(start_ts, end_ts, chat_id):
+            raise RuntimeError("查询炸了")
+
+        pq2 = plugin_mod.create_plugin()
+        try:
+            pq2.ctx = ctx
+        except AttributeError:
+            pq2._ctx = ctx
+        pq2.set_plugin_config({"plugin": {"enabled": True, "config_version": "1.0.0"},
+                               "schedule": {"enabled": False}})
+        pq2._query_messages = boom  # type: ignore[assignment]
+        check("静默检查失败按已静默处理", asyncio.run(pq2._chat_is_quiet(30)) is True)
+
+    print("\n[16] 网络超时韧性（真机 2026-09-28 09:00 补跑实录）")
+    with tempfile.TemporaryDirectory() as td_resil:
+        res_dir = Path(td_resil)
+
+        class _FakeRPCError(Exception):
+            """模拟真机 RPCError（本地类不同源，靠类名+文本判定）。"""
+
+        def _tmo():
+            return _FakeRPCError("[E_TIMEOUT] 请求 cap.call 超时 (180000ms)")
+
+        pr = plugin_mod.create_plugin()
+        try:
+            pr.ctx = ctx
+        except AttributeError:
+            pr._ctx = ctx
+        pr.set_plugin_config({
+            "plugin": {"enabled": True, "config_version": "1.0.0"},
+            "schedule": {"enabled": False},
+            "llm": {"write_retry": 1, "retry_backoff_seconds": 0},
+        })
+        pr._data_dir = lambda: res_dir  # type: ignore[assignment]
+
+        check("超时判定认真机 RPC 文本", pr._is_timeout_error(_tmo()) is True)
+        check("超时判定认 asyncio.TimeoutError",
+              pr._is_timeout_error(asyncio.TimeoutError()) is True)
+        check("超时判定不误伤普通错误",
+              pr._is_timeout_error(RuntimeError("模型没写出可用的日记")) is False)
+
+        # 成文首超时、重试成功
+        tmo_calls: list[int] = []
+
+        async def flaky(prompt, temperature):
+            tmo_calls.append(1)
+            if len(tmo_calls) == 1:
+                raise _tmo()
+            return "正文"
+
+        pr._call_llm = flaky  # type: ignore[assignment]
+        got = asyncio.run(pr._call_llm_with_retry("p", 0.8, stage="日记成文"))
+        check("成文超时后重试成功", got == "正文" and len(tmo_calls) == 2, str(tmo_calls))
+
+        # 非超时不重试
+        pr.set_plugin_config({
+            "plugin": {"enabled": True, "config_version": "1.0.0"},
+            "schedule": {"enabled": False},
+            "llm": {"write_retry": 3, "retry_backoff_seconds": 0},
+        })
+        bad_calls: list[int] = []
+
+        async def broken(prompt, temperature):
+            bad_calls.append(1)
+            raise ValueError("格式不对")
+
+        pr._call_llm = broken  # type: ignore[assignment]
+        try:
+            asyncio.run(pr._call_llm_with_retry("p", 0.8, stage="日记成文"))
+            check("非超时失败不重试", False, "应当抛出异常")
+        except ValueError:
+            check("非超时失败不重试", len(bad_calls) == 1, str(bad_calls))
+
+        # 补跑单天隔离
+        pc2 = plugin_mod.create_plugin()
+        try:
+            pc2.ctx = ctx
+        except AttributeError:
+            pc2._ctx = ctx
+        pc2.set_plugin_config({
+            "plugin": {"enabled": True, "config_version": "1.0.0"},
+            "schedule": {"enabled": False, "catch_up_enabled": True, "catch_up_days": 3},
+        })
+        pc2._data_dir = lambda: res_dir / "iso"  # type: ignore[assignment]
+        targets = pc2._catch_up_targets()
+        seen: list[str] = []
+
+        async def fake_gen(date_str):
+            seen.append(date_str)
+            if date_str == targets[1]:
+                raise _tmo()
+            return True, "正文"
+
+        pc2._generate_for_date = fake_gen  # type: ignore[assignment]
+        res = asyncio.run(pc2._catch_up_missing())
+        check("补跑单天异常不打断整轮", seen == targets, str(seen))
+        check("失败日如实记为失败、后续日照常成功",
+              dict(res).get(targets[1]) is False and dict(res).get(targets[2]) is True,
+              str(res))
 
     print(f"\n===== 冒烟结果: PASS {len(PASS)} / FAIL {len(FAIL)} =====")
     if FAIL:
