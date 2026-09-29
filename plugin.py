@@ -14,6 +14,7 @@ import datetime
 import json
 import logging
 import re
+import tempfile
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -40,7 +41,7 @@ if __package__:  # 包式加载（Runner 真机：插件目录作为包，不在
         strip_diary_output,
         update_continuity,
     )
-    from .bd_cookie import CookieStore
+    from .bd_cookie import CookieStore, redact_secrets
     from .bd_search import format_hits, on_this_day, search_diaries
 else:  # 平铺兜底（脚本直跑 / 旧测试夹具）
     from bd_prompts import (
@@ -60,10 +61,10 @@ else:  # 平铺兜底（脚本直跑 / 旧测试夹具）
         strip_diary_output,
         update_continuity,
     )
-    from bd_cookie import CookieStore
+    from bd_cookie import CookieStore, redact_secrets
     from bd_search import format_hits, on_this_day, search_diaries
 
-logger = logging.getLogger("plugin.org.civetc.better-diary")
+logger = logging.getLogger("plugin.org.orge-8.better-diary")
 
 # 发送单条消息的最大长度（QQ 文本安全线）
 _SEND_LIMIT = 1500
@@ -166,9 +167,16 @@ class LLMSection(PluginConfigBase):
 
 
 class SecuritySection(PluginConfigBase):
-    """安全配置。"""
+    """安全配置。
 
-    admin_ids: list[str] = Field(default_factory=list, description="管理员 QQ 列表，兼容 '123' 与 'qq:123' 写法；留空时全部放行")
+    **fail-closed 默认值**：``admin_ids`` 留空时**不再**放行所有人，
+    只有 ``[security].allow_all_users = true`` 才会放开。日记成品会发布到
+    **公开**的 QQ 空间，默认「谁都能触发」风险过高，因此默认必须由管理员触发。
+    """
+
+    admin_ids: list[str] = Field(default_factory=list, description="管理员 QQ 列表，兼容 '123' 与 'qq:123' 写法。留空 = 不放行任何人（除本机控制台操作者）")
+    allow_all_users: bool = Field(default=False, description="高级选项：是否允许所有人使用命令。默认 false；确需全员可用时显式打开（此时 /日记 可被任何人触发并发布到公开QQ空间）")
+    command_cooldown_seconds: int = Field(default=300, description="同一会话两次 /日记 之间的最小间隔（秒），防止反复触发 LLM 调用与公开发布。0 = 不限制")
 
     _norm_admin_ids = field_validator("admin_ids", mode="before")(_as_str_list)
 
@@ -198,6 +206,10 @@ class BetterDiaryPlugin(MaiBotPlugin):
     _catchup_task = None
     _cookie_store = None
     _cfg_fallback_warned = False
+    # 每个会话最近一次 /日记 的时间戳（秒），用于命令冷却；不落盘
+    _last_gen_ts: dict[str, float] = {}
+    # 「宿主未注入 data_dir」的降级告警只打一次
+    _data_dir_warned = False
 
     # ------------------------------------------------------------ 注册期防御
     #
@@ -233,17 +245,40 @@ class BetterDiaryPlugin(MaiBotPlugin):
     #   而 set_plugin_config:200 那次 pydantic 校验是有 try 的（只 warning），
     #   所以这一层里唯一裸奔的入口是 normalize_plugin_config。
 
+    @staticmethod
+    def _redact(record: Any) -> Any:
+        """对即将写进日志的**单条参数**做凭据脱敏。
+
+        v1.3.4：插件所有日志都从这里出去，因为「异常对象会夹带凭据」这件事
+        是**全类性质**的 —— adapter 会把请求体(含 cookie)写进 error，httpx 的
+        异常会把 request(含 URL 上的 g_tk/uin)带进 str。只在个别分支手动脱敏
+        必然会漏（实测审计就是这样抓到 26 处直插异常的）。这里统一收口：
+        异常对象、外部响应片段、入参文本一律先脱敏再落盘。
+
+        脱敏只吃「键=值」的值部分，键名、状态码、结构都保留，排障信息不丢。
+        """
+        if record is None or isinstance(record, (int, float, bool)):
+            return record
+        if isinstance(record, BaseException):
+            return f"{type(record).__name__}: {redact_secrets(record)}"
+        if isinstance(record, str):
+            return redact_secrets(record)
+        try:
+            return redact_secrets(repr(record))
+        except Exception:  # noqa: BLE001 - repr 本身出错不该拖垮日志
+            return "<unprintable>"
+
     def _log_info(self, msg: str, *args: Any, **kwargs: Any) -> None:
         """best-effort 记录 INFO：日志器自身不可用时静默，绝不丢给宿主。"""
         try:
-            self._get_logger().info(msg, *args, **kwargs)
+            self._get_logger().info(redact_secrets(msg), *(self._redact(a) for a in args), **kwargs)
         except Exception:  # noqa: BLE001 - 日志失败不能反过来拖垮加载
             pass
 
     def _log_error(self, msg: str, *args: Any, **kwargs: Any) -> None:
         """best-effort 记录 ERROR：日志器自身不可用时静默，绝不丢给宿主。"""
         try:
-            self._get_logger().error(msg, *args, **kwargs)
+            self._get_logger().error(redact_secrets(msg), *(self._redact(a) for a in args), **kwargs)
         except Exception:  # noqa: BLE001 - 同上
             pass
 
@@ -255,7 +290,7 @@ class BetterDiaryPlugin(MaiBotPlugin):
         异常再次抛出，反而破坏了兜底。这里沿用 _log_info/_log_error 的安全语义。
         """
         try:
-            self._get_logger().warning(msg, *args, **kwargs)
+            self._get_logger().warning(redact_secrets(msg), *(self._redact(a) for a in args), **kwargs)
         except Exception:  # noqa: BLE001 - 日志失败不能反过来破坏兜底逻辑
             pass
 
@@ -530,12 +565,11 @@ class BetterDiaryPlugin(MaiBotPlugin):
     @Command(
         "diary",
         description="生成指定日期（默认今天）的日记并发布到QQ空间（管理员）",
-        pattern=r"^\s*[/／]\s*(?:日记|diary)(?:\s+(?P<date>\d{4}-\d{1,2}-\d{1,2}))?\s*$",
+        pattern=r"^\s*[/／]\s*(?:日记|diary)(?:\s+(?P<date>\d{4}-\d{1,2}-\d{1,2}))?(?:\s+(?P<force>重写|force))?\s*$",
     )
     async def cmd_diary(self, matched_groups: dict | None = None, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, int]:
         if not self._is_admin(kwargs):
-            self.ctx.logger.info("diary 命令被静默拒绝（非管理员）")
-            return True, "", 2
+            return self._reject_not_admin(kwargs, "diary")
         if not stream_id:
             return True, "缺少聊天流，无法回复", 2
         raw = (matched_groups or {}).get("date") or ""
@@ -554,7 +588,29 @@ class BetterDiaryPlugin(MaiBotPlugin):
             await self.ctx.send.text("正在生成上一篇日记，先等等。", stream_id)
             return True, "", 2
 
+        # 先判「已有成品」（比冷却更前置）：这样冷却还没过时，用户得到的仍是
+        # 「已经有日记了…要重写用 /日记 <日期> 重写」这条**可执行**的指引，
+        # 而不是被冷却挡住、拿不到任何出路（审计 v1.3.4 发现两条提示自相矛盾）。
+        force = bool((matched_groups or {}).get("force"))
+        existing = self._load_diaries().get(date_str, {})
+        if str(existing.get("content") or "").strip() and not force:
+            await self.ctx.send.text(
+                f"{date_display(date_str)} 已经有日记了，想回看用 /日记查看 {date_str}。"
+                f"确实要重写请用 /日记 {date_str} 重写",
+                stream_id,
+            )
+            return True, "", 2
+
+        # 冷却：同一会话内不许反复触发（每次都会重调 LLM，并可能重新发布到公开空间）
+        left = self._cooldown_left(stream_id)
+        if left > 0:
+            self._log_info("diary 命令被冷却拦下（还需 %d 秒）", left)
+            await self.ctx.send.text(f"刚写过一篇，{left} 秒后再试。", stream_id)
+            return True, "", 2
+
         is_today = date_str == today
+        if is_today:
+            self._last_gen_ts[stream_id] = time.time()
         await self.ctx.send.text(
             f"开始{'生成' if is_today else '补写'} {date_display(date_str)} 的日记，大概一两分钟。",
             stream_id,
@@ -568,6 +624,13 @@ class BetterDiaryPlugin(MaiBotPlugin):
         # ★ 只有**当天**的日记才发布：补写/兜底的一律只存档，
         #   否则公开空间会突然冒出一条「昨天」的历史说说。
         if is_today and self.config.qzone.enabled:
+            # 手动重写当天日记时留痕：调度器那边有 published_at 硬去重，
+            # 管理员手写的 `/日记 <日期> 重写` 刻意不受它限制（那是显式意图），
+            # 但要能在日志里看出「公开空间又多了一条」。
+            if force and self._already_published(date_str):
+                self._log_warning(
+                    "%s 之前已发布过QQ空间，本次为手动重写（将再发一条公开说说）", date_str
+                )
             pub_ok, pub_msg = await self._publish_to_qzone(result)
             if pub_ok:
                 await self.ctx.send.text(
@@ -596,11 +659,12 @@ class BetterDiaryPlugin(MaiBotPlugin):
 
     @Command(
         "diary_view",
-        description="查看已保存的日记",
+        description="查看已保存的日记（管理员）",
         pattern=r"^\s*[/／]\s*(?:日记查看|查看日记)\s*(?P<date>\d{4}-\d{1,2}-\d{1,2})?\s*$",
     )
     async def cmd_diary_view(self, matched_groups: dict | None = None, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, int]:
-        del kwargs
+        if not self._is_admin(kwargs):
+            return self._reject_not_admin(kwargs, "diary_view")
         if not stream_id:
             return True, "缺少聊天流，无法回复", 2
         raw = (matched_groups or {}).get("date") or ""
@@ -618,13 +682,15 @@ class BetterDiaryPlugin(MaiBotPlugin):
         pattern=r"^\s*[/／]\s*(?:日记帮助|diary_help)\s*$",
     )
     async def cmd_diary_help(self, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, int]:
-        del kwargs
+        if not self._is_admin(kwargs):
+            return self._reject_not_admin(kwargs, "diary_help")
         if not stream_id:
             return True, "缺少聊天流，无法回复", 2
         await self.ctx.send.text(
-            "better-diary 用法：\n"
-            "/日记 —— 生成今天的日记并发布到QQ空间（管理员）\n"
-            "/日记 2026-09-26 —— 补写指定日期的日记，只存档不发布（管理员）\n"
+            "better-diary 用法（除本条外，各命令均受 [security].admin_ids 限制）：\n"
+            "/日记 —— 生成今天的日记并发布到QQ空间\n"
+            "/日记 2026-09-26 —— 补写指定日期的日记，只存档不发布\n"
+            "/日记 2026-09-26 重写 —— 覆盖重写该日期已有的日记\n"
             "/日记查看 [日期] —— 在聊天里回看已存档的日记\n"
             "/日记来源 [日期] —— 查看某天日记依据了哪些选材事件\n"
             "/问日记 <关键词> —— 搜历史日记（本地检索，不调用模型）\n"
@@ -640,7 +706,8 @@ class BetterDiaryPlugin(MaiBotPlugin):
         pattern=r"^\s*[/／]\s*(?:问日记|diary_ask)(?:\s+(?P<query>.+?))?\s*$",
     )
     async def cmd_diary_ask(self, matched_groups: dict | None = None, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, int]:
-        del kwargs
+        if not self._is_admin(kwargs):
+            return self._reject_not_admin(kwargs, "diary_ask")
         if not stream_id:
             return True, "缺少聊天流，无法回复", 2
         query = str((matched_groups or {}).get("query") or "").strip()
@@ -664,7 +731,9 @@ class BetterDiaryPlugin(MaiBotPlugin):
         pattern=r"^\s*[/／]\s*(?:那年今日|diary_on_this_day)\s*$",
     )
     async def cmd_diary_on_this_day(self, matched_groups: dict | None = None, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, int]:
-        del matched_groups, kwargs
+        del matched_groups
+        if not self._is_admin(kwargs):
+            return self._reject_not_admin(kwargs, "diary_on_this_day")
         if not stream_id:
             return True, "缺少聊天流，无法回复", 2
         today = datetime.date.today()
@@ -685,7 +754,8 @@ class BetterDiaryPlugin(MaiBotPlugin):
         pattern=r"^\s*[/／]\s*(?:日记来源|diary_sources)\s*(?P<date>\d{4}-\d{1,2}-\d{1,2})?\s*$",
     )
     async def cmd_diary_sources(self, matched_groups: dict | None = None, stream_id: str = "", **kwargs: Any) -> tuple[bool, str, int]:
-        del kwargs
+        if not self._is_admin(kwargs):
+            return self._reject_not_admin(kwargs, "diary_sources")
         if not stream_id:
             return True, "缺少聊天流，无法回复", 2
         raw = (matched_groups or {}).get("date") or ""
@@ -723,13 +793,47 @@ class BetterDiaryPlugin(MaiBotPlugin):
 
     # ------------------------------------------------------------ 权限
 
+    @staticmethod
+    def _is_local_operator_flag(kwargs: dict) -> bool:
+        """严格判定「本机控制台操作者」这个旁路。
+
+        v1.3.4：不用裸真值判断 —— ``bool("false")`` / ``bool("0")`` 都是 True，
+        一旦宿主把该字段序列化成字符串，旁路就会被意外放开。这里只认
+        「真布尔 True」与少数明确的肯定写法，其余（含缺省、None、``"false"``）
+        一律视为否。
+
+        **真机确认项**：该 kwarg 由宿主把命令事件送进插件时注入（本机 SDK 2.8.2
+        里没有这个标识，无法离线验证它不可能来自聊天消息）。插件侧能保证的是：
+        ``matched_groups``（用户可控的命令参数）从不并入 kwargs，正则命名组
+        只有 date/force/query，所以消息正文无法伪造出这个键。
+        """
+        value = kwargs.get("is_local_operator")
+        if value is True:
+            return True
+        if isinstance(value, str):
+            return value.strip().lower() in ("true", "1", "yes", "on")
+        return False
+
     def _is_admin(self, kwargs: dict) -> bool:
-        """自管 admin_ids：留空 fail-open；拒绝不发言只留日志。"""
-        if bool(kwargs.get("is_local_operator")):
+        """自管权限：**fail-closed**；拒绝不发言只留日志。
+
+        判定顺序（v1.3.4 起，与 v1.3.3 的 fail-open 相反）：
+        1. 本机控制台操作者（``is_local_operator``，由宿主 bot_console 注入）→ 放行；
+        2. ``[security].allow_all_users = true`` → 放行（显式选择全员可用）；
+        3. 命中 ``[security].admin_ids`` → 放行；
+        4. 其余一律拒绝。
+
+        第 4 条是 v1.3.4 的关键改动：``admin_ids`` 留空**不再**等于全员放行。
+        旧行为会让任何群成员都能让 bot 把当天的聊天内容（含私聊素材）写成日记
+        发布到**公开**的 QQ 空间，也会让只读命令把跨会话内容拉进任意群。
+        """
+        if self._is_local_operator_flag(kwargs):
+            return True
+        if bool(getattr(self.config.security, "allow_all_users", False)):
             return True
         admins = {str(a).split(":")[-1].strip().lower() for a in (self.config.security.admin_ids or [])}
         if not admins:
-            return True
+            return False
         user_id = str(kwargs.get("user_id") or "")
         if not user_id:
             msg = kwargs.get("message") or {}
@@ -737,6 +841,29 @@ class BetterDiaryPlugin(MaiBotPlugin):
             user_info = info.get("user_info") or {} if isinstance(info, dict) else {}
             user_id = str(user_info.get("user_id", "") or "")
         return bool(user_id) and user_id.lower() in admins
+
+    def _reject_not_admin(self, kwargs: dict, command: str) -> tuple[bool, str, int]:
+        """非管理员：静默拒绝（不回复内容，只留一行日志）。"""
+        if not self._is_local_operator_flag(kwargs) and not (
+            self.config.security.admin_ids or self.config.security.allow_all_users
+        ):
+            self._log_warning(
+                "%s 被拒绝：未配置 [security].admin_ids 且 allow_all_users=false（fail-closed）。"
+                "需要放行请填 admin_ids，或显式打开 allow_all_users",
+                command,
+            )
+        else:
+            self._log_info("%s 命令被静默拒绝（非管理员）", command)
+        return True, "", 2
+
+    def _cooldown_left(self, stream_id: str) -> int:
+        """返回剩余冷却秒数（0 = 可执行）。仅用于限制重复触发。"""
+        cooldown = int(getattr(self.config.security, "command_cooldown_seconds", 0) or 0)
+        if cooldown <= 0 or not stream_id:
+            return 0
+        last = float((self._last_gen_ts or {}).get(stream_id, 0.0))
+        left = cooldown - (time.time() - last)
+        return int(left) + 1 if left > 0 else 0
 
     # ------------------------------------------------------------ 定时调度
 
@@ -948,6 +1075,20 @@ class BetterDiaryPlugin(MaiBotPlugin):
             self.ctx.logger.warning("定时日记跳过：已有生成任务在进行（次日兜底会补写）")
             return
         date_str = self._today_str()
+        # 当天已有成品就什么都不做：
+        #  - 已发布过 → 重启 / 改时间 / 同一天第二次触发都会重发一条一样的公开说说；
+        #  - 发布未启用 → 再写一遍只是白烧一次 LLM（内容完全相同），没有任何收益。
+        # 两种情况都靠归档里的 content 判定；确需重写走管理员手写的
+        # `/日记 <日期> 重写`，那条路径刻意不受此限制。
+        today_entry = self._load_diaries().get(date_str)
+        has_content = bool(str((today_entry or {}).get("content") or "").strip()) if isinstance(today_entry, dict) else False
+        if has_content and (self._already_published(date_str) or not self.config.qzone.enabled):
+            self.ctx.logger.info(
+                "定时日记跳过：%s 已有成品（%s）",
+                date_str,
+                "已发布过QQ空间" if self._already_published(date_str) else "空间发布未启用，重复成文无收益",
+            )
+            return
         ok, result = await self._generate_for_date(date_str)
         if not ok:
             self.ctx.logger.warning("定时日记生成失败 %s: %s", date_str, result)
@@ -1024,7 +1165,13 @@ class BetterDiaryPlugin(MaiBotPlugin):
         else:  # 平铺兜底（脚本直跑）
             from bd_qzone import CookieExpiredError, PublishUnavailableError, QzonePublisher
 
-        cookies = await self._resolve_cookies()
+        # 取 cookie 也在 try 里：`_resolve_cookies` 会走 adapter API / NapCat HTTP，
+        # 这两条路的外部异常同样可能夹带 cookie 串（实测审计抓到过穿透到宿主 traceback）。
+        try:
+            cookies = await self._resolve_cookies()
+        except Exception as exc:
+            self._log_error("取 cookie 异常: %s", exc)
+            return False, f"取 cookie 异常（{type(exc).__name__}）: {redact_secrets(exc)}"
         if not cookies:
             return False, (
                 "拿不到QQ空间cookie：adapter 与 NapCat HTTP 都没取到且无手动兜底。"
@@ -1033,25 +1180,55 @@ class BetterDiaryPlugin(MaiBotPlugin):
 
         publisher = QzonePublisher(cookies)
         try:
-            return await publisher.publish_text(content, timeout=max(5, self.config.qzone.timeout_seconds))
+            ok, msg = await publisher.publish_text(content, timeout=max(5, self.config.qzone.timeout_seconds))
         except PublishUnavailableError as exc:
             return False, f"{exc}（无需 httpx 时可把 [qzone].enabled 关掉，日记仍会存档）"
         except CookieExpiredError:
-            self.ctx.logger.warning("QQ空间登录态失效，强制重取 cookie 重试一次")
-            fresh = await self._resolve_cookies(force_refresh=True)
+            self._log_warning("QQ空间登录态失效，强制重取 cookie 重试一次")
+            try:
+                fresh = await self._resolve_cookies(force_refresh=True)
+            except Exception as exc:
+                self._log_error("重取 cookie 异常: %s", exc)
+                return False, f"重取 cookie 异常（{type(exc).__name__}）: {redact_secrets(exc)}"
             if not fresh:
                 return False, "QQ空间登录态失效，且自动重取 cookie 失败（检查 NapCat 是否在线、HTTP 服务器是否开启）"
             if fresh == cookies:
                 return False, "QQ空间登录态失效，重取到的 cookie 未变化（bot 登录态可能真的过期了）"
             publisher = QzonePublisher(fresh)
             try:
-                return await publisher.publish_text(content, timeout=max(5, self.config.qzone.timeout_seconds))
+                ok, msg = await publisher.publish_text(content, timeout=max(5, self.config.qzone.timeout_seconds))
             except CookieExpiredError:
                 return False, "QQ空间登录态失效（重取后仍失效），请检查 bot 登录状态"
             except Exception as exc:
-                return False, f"发布异常（{type(exc).__name__}）: {exc}"
+                # 异常文本可能夹带请求 URL / cookie（httpx 的异常会把 request 带进 str）→ 统一脱敏
+                return False, f"发布异常（{type(exc).__name__}）: {redact_secrets(exc)}"
         except Exception as exc:
-            return False, f"发布异常（{type(exc).__name__}）: {exc}"
+            return False, f"发布异常（{type(exc).__name__}）: {redact_secrets(exc)}"
+        if ok:
+            self._mark_published(self._today_str())
+        return ok, msg
+
+    # ------------------------------------------------------------ 发布去重
+
+    def _already_published(self, date_str: str) -> bool:
+        """该日期是否已成功发过空间（看归档里的 ``published_at``）。"""
+        entry = self._load_diaries().get(date_str)
+        return bool(isinstance(entry, dict) and str(entry.get("published_at") or "").strip())
+
+    def _mark_published(self, date_str: str) -> None:
+        """记下「这个日期已经发过空间」。只改这一个字段，不动正文与证据链。"""
+        path = self._store_path()
+        try:
+            data = self._load_diaries()
+            entry = data.get(date_str)
+            if not isinstance(entry, dict) or not str(entry.get("content") or "").strip():
+                return
+            entry["published_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(path)
+        except OSError as exc:
+            self.ctx.logger.warning("记录发布状态失败（不影响本次发布）: %s", exc)
 
     async def _resolve_stream_id(self, target: str) -> str:
         """'group:123' / 'private:456' / 裸 stream_id -> 聊天流 ID。"""
@@ -1321,10 +1498,13 @@ class BetterDiaryPlugin(MaiBotPlugin):
         # 日记成品会公开出现在 QQ 空间，绝不能把「抱歉，作为一个人工智能…」发出去。
         problem = diary_output_problem(body)
         if problem:
+            # 只为排查打**长度与前 80 字**：拒答/截断类问题看开头就够，
+            # 不宜把整段模型输出灌进日志文件（日志常被作者请用户回传排障）。
             self.ctx.logger.error(
-                "日记成文不可用（%s），本日不存档、不发布；模型原文前 80 字: %s",
+                "日记成文不可用（%s），本日不存档、不发布；模型原文 %d 字，开头: %s",
                 problem,
-                body[:80] or "（空）",
+                len(body),
+                redact_secrets(body[:80]) or "（空）",
             )
             return False, f"模型没写出可用的日记（{problem}），本日不生成"
         content = ensure_date_line(body, date_display(date_str))
@@ -1342,10 +1522,13 @@ class BetterDiaryPlugin(MaiBotPlugin):
         if used_events:
             risk = quote_attribution_risk(content, [e.get("quote", "") for e in used_events])
             if risk:
+                # 只记「有几条、哪些事件」——聊天的逐字原话不再写进日志文件。
+                # 需要看原文用 /日记来源 <日期>（管理员命令，正文与证据链都在存档里）。
                 self.ctx.logger.warning(
-                    "引用体检告警：%s；素材原话=%s",
+                    "引用体检告警：%s；本日素材事件 %d 条（%s），原话见 /日记来源",
                     risk,
-                    [e.get("quote", "") for e in used_events],
+                    len(used_events),
+                    ", ".join(str(e.get("event_id") or "?") for e in used_events),
                 )
         _target = max(1, self.config.diary.word_target)
         _tol = max(0, self.config.diary.word_tolerance)
@@ -1390,11 +1573,23 @@ class BetterDiaryPlugin(MaiBotPlugin):
     # ------------------------------------------------------------ 存档
 
     def _data_dir(self) -> Path:
+        """可变状态的落盘目录。
+
+        **绝不写插件源码目录**（v1.3.4 修正）：插件目录可能只读，且整目录更新/
+        重装会把它整个替换掉，写在那里等于丢数据。宿主没注入 ``ctx.paths`` 时
+        退到系统临时目录，并打一条 WARNING 让这条降级路径在日志里看得见。
+        """
         paths = getattr(self.ctx, "paths", None)
         data_dir = getattr(paths, "data_dir", None) if paths is not None else None
-        if not data_dir:
-            data_dir = Path(__file__).resolve().parent / "data"  # 容错降级
-        return Path(data_dir)
+        if data_dir:
+            return Path(data_dir)
+        if not self._data_dir_warned:
+            self._data_dir_warned = True
+            self._log_warning(
+                "宿主未注入 ctx.paths.data_dir，日记存档退到系统临时目录"
+                "（重启可能丢失，且不会被清理策略保护）——请检查宿主版本"
+            )
+        return Path(tempfile.gettempdir()) / "better-diary"
 
     def _store_path(self) -> Path:
         return self._data_dir() / "diaries.json"
@@ -1429,6 +1624,9 @@ class BetterDiaryPlugin(MaiBotPlugin):
                 for e in (events or [])
                 if isinstance(e, dict) and str(e.get("what") or "").strip()
             ]
+            # 保留「该日期已经发过空间」的标记（与正文内容无关，只跟日期走）。
+            # 定时任务靠它避免重启/第二次触发时把同一篇日记重复发到公开空间。
+            prev = data.get(date_str) if isinstance(data.get(date_str), dict) else {}
             data[date_str] = {
                 "content": content,
                 "word_count": len(content),
@@ -1437,6 +1635,7 @@ class BetterDiaryPlugin(MaiBotPlugin):
                 "events": provenance,
                 "material_mode": material_mode or ("events" if provenance else "timeline_tail"),
                 "meta": dict(meta or {}),
+                "published_at": str(prev.get("published_at") or ""),
             }
             tmp = path.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")

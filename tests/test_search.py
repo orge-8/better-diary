@@ -5,15 +5,25 @@ from __future__ import annotations
 import asyncio
 import datetime
 import importlib
+import os
 import sys
 from pathlib import Path
 
 import pytest
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
-DEVKIT_DIR = Path(r"C:\Users\38160\Desktop\tools\maibot-devkit")
-if str(DEVKIT_DIR) not in sys.path:
-    sys.path.insert(0, str(DEVKIT_DIR))
+# devkit（fakehost）只在开发机跑测试时需要；优先环境变量，其次探测同级目录。
+_DEVKIT_CANDIDATES = [
+    os.environ.get("MAIBOT_DEVKIT_DIR", ""),
+    str(PLUGIN_DIR.parent / "tools" / "maibot-devkit"),
+    str(PLUGIN_DIR / "maibot-devkit"),
+    r"C:\Users\38160\Desktop\tools\maibot-devkit",
+]
+for _cand in _DEVKIT_CANDIDATES:
+    if _cand and (Path(_cand) / "fakehost.py").is_file():
+        if _cand not in sys.path:
+            sys.path.insert(0, _cand)
+        break
 
 from fakehost import FakeHost, build_context, load_plugin_module  # noqa: E402
 
@@ -104,18 +114,21 @@ def test_format_hits_empty_and_non_empty():
 def test_ask_command_hits_and_hints(tmp_path):
     plugin = MOD.create_plugin()
     host = FakeHost()
-    ctx = build_context("org.civetc.better-diary", rpc_call=host.rpc_call)
+    ctx = build_context("org.orge-8.better-diary", rpc_call=host.rpc_call)
     plugin._set_context(ctx)
     plugin.set_plugin_config({"plugin": {"enabled": True, "config_version": "1.0.0"},
-                              "schedule": {"enabled": False}})
+                              "schedule": {"enabled": False},
+                              "security": {"admin_ids": ["123456789"]}})
     plugin._data_dir = lambda: tmp_path  # type: ignore[assignment]
     (tmp_path / "diaries.json").write_text(
         __import__("json").dumps(ARCHIVE, ensure_ascii=False), encoding="utf-8")
 
-    asyncio.run(plugin.cmd_diary_ask(matched_groups={"query": "萤火虫"}, stream_id="s1"))
+    # v1.3.4 起只读命令也受权限闸保护，测试里用管理员身份触发
+    admin = {"user_id": "123456789"}
+    asyncio.run(plugin.cmd_diary_ask(matched_groups={"query": "萤火虫"}, stream_id="s1", **admin))
     joined = "\n".join(host.sent_texts)
     assert "2026-09-20" in joined and "萤火虫" in joined
 
     before = len(host.sent_texts)
-    asyncio.run(plugin.cmd_diary_ask(matched_groups={}, stream_id="s1"))
+    asyncio.run(plugin.cmd_diary_ask(matched_groups={}, stream_id="s1", **admin))
     assert "问什么" in host.sent_texts[before]

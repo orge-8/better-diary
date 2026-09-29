@@ -38,7 +38,7 @@ ADAPTER_DOMAIN = "user.qzone.qq.com"
 # 真机踩坑：adapter 抛异常时会把请求的 cookie 串写进异常消息，直接
 # `f"...: {e}"` 会把 p_skey 明文打进日志文件。
 _SECRET_KV_RE = re.compile(
-    r"((?:p_skey|skey|uin|sid|qzonetoken|pt[a-z_]*|token|password|passwd|cookie)"
+    r"((?:p_skey|skey|g_tk|gtk|uin|sid|qzonetoken|pt[a-z_]*|token|password|passwd|cookie)"
     r"\s*[=:]\s*)([^\s;,&\"'）)]+)",
     re.IGNORECASE,
 )

@@ -5,7 +5,7 @@
 2. 组件注册：3 个 Command、数量与 handler_name 断言、pattern 正则行为
 3. 纯模块：build_timeline / chunk_text / parse_events / strip_diary_output / ensure_date_line
 4. 端到端：FakeCtx（假消息 + 假 LLM）跑完 _generate_for_date 全流程，验证存档写入临时目录
-5. 无权限静默拒绝 + fail-open
+5. 权限：fail-closed（v1.3.4）+ 静默拒绝 + 命令冷却
 6. 测试结束后插件目录无 data/ 残留
 
 运行：python tests/smoke_test.py
@@ -17,6 +17,7 @@ import json
 import logging
 import sys
 import tempfile
+import time as _time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -555,7 +556,7 @@ print("NOHTTPX-LOAD-OK")
             "2026年9月26日 星期六，多云。\n晚上听阿讲事，我一时无法理解他为什么那么想。") == "")
         check("空串判定为不可发布", bd.diary_output_problem("") == "输出为空")
 
-        print("\n[6] 权限：fail-open 与静默拒绝")
+        print("\n[6] 权限：fail-closed 与静默拒绝（v1.3.4 起默认不放行所有人）")
         plugin3 = plugin_mod.create_plugin()
         try:
             plugin3.ctx = ctx
@@ -569,18 +570,39 @@ print("NOHTTPX-LOAD-OK")
         )
         allowed = plugin3._is_admin({"user_id": "888"})
         denied = plugin3._is_admin({"user_id": "999"})
-        failopen = plugin3._is_admin({})
+        no_user = plugin3._is_admin({})
+        check("admin 命中放行", allowed)
+        check("非 admin 拒绝", not denied)
+        check("admin_ids 非空但缺 user_id 不放行", not no_user)
+        check("本机操作者（is_local_operator）放行", plugin3._is_admin({"is_local_operator": True}))
+
         plugin4 = plugin_mod.create_plugin()
         try:
             plugin4.ctx = ctx
         except AttributeError:
             plugin4._ctx = ctx
         plugin4.set_plugin_config({"plugin": {"enabled": True, "config_version": "1.0.0"}, "security": {"admin_ids": []}})
-        empty_open = plugin4._is_admin({"user_id": "999"})
-        check("admin 命中放行", allowed)
-        check("非 admin 拒绝", not denied)
-        check("admin_ids 缺失 user_id 不放行", not failopen)
-        check("admin_ids 空 fail-open", empty_open)
+        check("admin_ids 空 => 默认拒绝（fail-closed，v1.3.4 行为反转）",
+              not plugin4._is_admin({"user_id": "999"}) and not plugin4._is_admin({}))
+
+        plugin5 = plugin_mod.create_plugin()
+        try:
+            plugin5.ctx = ctx
+        except AttributeError:
+            plugin5._ctx = ctx
+        plugin5.set_plugin_config({"plugin": {"enabled": True, "config_version": "1.0.0"},
+                                   "security": {"allow_all_users": True}})
+        check("allow_all_users=true 才放行所有人", plugin5._is_admin({"user_id": "999"}))
+
+        # 只读命令同样受保护：/问日记 与 /那年今日 会把跨会话内容（含私聊素材）拉进本群
+        for _p in (plugin3, plugin4):
+            _sent0 = len(ctx.sent)
+            _r = asyncio.run(_p.cmd_diary_ask(matched_groups={"query": "x"}, stream_id="s_perm"))
+            if len(ctx.sent) != _sent0 or _r[0] is not True:
+                check("只读命令 /问日记 受同一权限守卫", False, f"{len(ctx.sent) - _sent0} 条发言")
+                break
+        else:
+            check("只读命令 /问日记 受同一权限守卫", True)
 
         plugin3.set_plugin_config(
             {
@@ -591,6 +613,25 @@ print("NOHTTPX-LOAD-OK")
         sent_before = len(ctx.sent)
         result = asyncio.run(plugin3.cmd_diary(matched_groups={}, stream_id="s1", user_id="999"))
         check("非管理员命令静默（不发言）", len(ctx.sent) == sent_before and result[0] is True)
+
+        # 冷却：同一会话连续触发要被拦下（每次都会重调 LLM 并可能重新公开发布）
+        cooldown_plugin = plugin_mod.create_plugin()
+        try:
+            cooldown_plugin.ctx = ctx
+        except AttributeError:
+            cooldown_plugin._ctx = ctx
+        cooldown_plugin.set_plugin_config({
+            "plugin": {"enabled": True, "config_version": "1.0.0"},
+            "security": {"admin_ids": ["888"], "command_cooldown_seconds": 300},
+        })
+        cooldown_plugin._last_gen_ts["s_cool"] = _time.time()
+        check("冷却期内拒绝", cooldown_plugin._cooldown_left("s_cool") > 0)
+        check("其它会话不受影响", cooldown_plugin._cooldown_left("s_other") == 0)
+        cooldown_plugin.set_plugin_config({
+            "plugin": {"enabled": True, "config_version": "1.0.0"},
+            "security": {"admin_ids": ["888"], "command_cooldown_seconds": 0},
+        })
+        check("冷却配 0 时关闭", cooldown_plugin._cooldown_left("s_cool") == 0)
 
     print("\n[7] QQ空间发布模块")
     bdq = sys.modules["bd_qzone"]
@@ -725,6 +766,100 @@ print("NOHTTPX-LOAD-OK")
     _joined = "\n".join(_captured)
     check("adapter 异常日志不泄漏 p_skey", "LEAK_SK" not in _joined, _joined)
     check("adapter 异常日志有内容（未静默）", bool(_captured), "应至少有一条 warning")
+
+    _gtk_red = bdc_mod.redact_secrets("https://user.qzone.qq.com/x?g_tk=1234567&uin=o0123456")
+    check("脱敏覆盖 g_tk（v1.3.4 补）",
+          "g_tk=<redacted>" in _gtk_red and "1234567" not in _gtk_red, _gtk_red)
+
+    print("\n[7d] 发布去重（同一天不重复发公开说说）")
+    with tempfile.TemporaryDirectory() as td_pub:
+        pd = plugin_mod.create_plugin()
+        try:
+            pd.ctx = ctx
+        except AttributeError:
+            pd._ctx = ctx
+        pd.set_plugin_config({
+            "plugin": {"enabled": True, "config_version": "1.0.0"},
+            "schedule": {"enabled": False},
+            "security": {"admin_ids": ["888"]},
+        })
+        pd._data_dir = lambda: Path(td_pub)  # type: ignore[assignment]
+        _today = pd._today_str()
+        (Path(td_pub) / "diaries.json").write_text(
+            json.dumps({_today: {"content": "今天的日记正文", "events": [], "meta": {}}},
+                       ensure_ascii=False),
+            encoding="utf-8")
+        check("未标记前视为未发布", pd._already_published(_today) is False)
+        pd._mark_published(_today)
+        check("标记后视为已发布", pd._already_published(_today) is True)
+        _entry = pd._load_diaries()[_today]
+        check("标记不破坏正文", _entry.get("content") == "今天的日记正文")
+        check("其它日期不受影响", pd._already_published("2000-01-01") is False)
+
+        # 定时任务遇到已发布的日期必须整个跳过（不重调 LLM、不重发说说）
+        _calls = {"gen": 0}
+
+        async def _fake_gen(date_str):
+            _calls["gen"] += 1
+            return True, "新正文"
+
+        pd._generate_for_date = _fake_gen  # type: ignore[assignment]
+        asyncio.run(pd._scheduled_run())
+        check("定时任务跳过已发布日期", _calls["gen"] == 0, str(_calls))
+
+        # 未发布过的日期照常生成
+        pd._data_dir = lambda: Path(td_pub) / "empty"  # type: ignore[assignment]
+        asyncio.run(pd._scheduled_run())
+        check("未发布日期照常生成", _calls["gen"] == 1, str(_calls))
+
+        # 空间发布关闭时也要去重：当天已有成品就跳过，避免每次触发都白烧一次 LLM
+        # （对抗性复验发现旧条件 `qzone.enabled and _already_published(...)` 会短路）
+        pd._data_dir = lambda: Path(td_pub) / "noqzone"  # type: ignore[assignment]
+        _nq = Path(td_pub) / "noqzone"
+        _nq.mkdir(parents=True, exist_ok=True)
+        (_nq / "diaries.json").write_text(
+            json.dumps({pd._today_str(): {"content": "已有正文"}}, ensure_ascii=False),
+            encoding="utf-8")
+        pd.set_plugin_config({
+            "plugin": {"enabled": True, "config_version": "1.0.0"},
+            "schedule": {"enabled": False},
+            "qzone": {"enabled": False},
+            "security": {"admin_ids": ["888"]},
+        })
+        _calls["gen"] = 0
+        asyncio.run(pd._scheduled_run())
+        check("发布关闭时当天已有成品也跳过（不白烧 LLM）", _calls["gen"] == 0, str(_calls))
+
+    print("\n[7e] 冷却与去重的判定顺序（文档可执行性）")
+    with tempfile.TemporaryDirectory() as td_ord:
+        po = plugin_mod.create_plugin()
+        try:
+            po.ctx = ctx
+        except AttributeError:
+            po._ctx = ctx
+        po.set_plugin_config({
+            "plugin": {"enabled": True, "config_version": "1.0.0"},
+            "schedule": {"enabled": False},
+            "security": {"admin_ids": ["888"], "command_cooldown_seconds": 300},
+        })
+        po._data_dir = lambda: Path(td_ord)  # type: ignore[assignment]
+        _today_o = po._today_str()
+        (Path(td_ord) / "diaries.json").write_text(
+            json.dumps({_today_o: {"content": "已有正文"}}, ensure_ascii=False), encoding="utf-8")
+        po._last_gen_ts["s_ord"] = _time.time()  # 故意让冷却生效
+        _gen_calls = {"n": 0}
+
+        async def _fake_gen2(date_str):
+            _gen_calls["n"] += 1
+            return True, "不该被调用"
+
+        po._generate_for_date = _fake_gen2  # type: ignore[assignment]
+        _sent0 = len(ctx.sent)
+        asyncio.run(po.cmd_diary(matched_groups={}, stream_id="s_ord", user_id="888"))
+        _texts = [t for t, _ in ctx.sent[_sent0:]]
+        check("冷却期内优先给「已有日记/要重写」的可执行提示",
+              any("重写" in t for t in _texts), str(_texts))
+        check("有成品 + 冷却中不触发新一轮生成", _gen_calls["n"] == 0, str(_gen_calls))
 
     print("\n[8] Cookie 自动获取模块（三级来源）")
     bdc = sys.modules["bd_cookie"]
@@ -884,13 +1019,15 @@ print("NOHTTPX-LOAD-OK")
         pf._data_dir = lambda: fut_dir  # type: ignore[assignment]
         future = (_dt.date.today() + _dt.timedelta(days=2)).strftime("%Y-%m-%d")
         sent_before = len(ctx.sent)
-        asyncio.run(pf.cmd_diary(matched_groups={"date": future}, stream_id="s1", user_id="1"))
+        asyncio.run(pf.cmd_diary(matched_groups={"date": future}, stream_id="s1", user_id="1",
+                                 is_local_operator=True))
         texts = [t for t, _ in ctx.sent[sent_before:]]
         check("未来日期被拦截（不落到「消息太少」分支）",
               any("还没到" in t for t in texts), str(texts))
         past = (_dt.date.today() - _dt.timedelta(days=1)).strftime("%Y-%m-%d")
         sent_before = len(ctx.sent)
-        asyncio.run(pf.cmd_diary(matched_groups={"date": past}, stream_id="s1", user_id="1"))
+        asyncio.run(pf.cmd_diary(matched_groups={"date": past}, stream_id="s1", user_id="1",
+                                 is_local_operator=True))
         texts = [t for t, _ in ctx.sent[sent_before:]]
         check("非当天的日记不发布（明确说明只存档）",
               any("不发布到QQ空间" in t for t in texts), str(texts))
@@ -975,15 +1112,16 @@ print("NOHTTPX-LOAD-OK")
         (Path(td_ask) / "diaries.json").write_text(
             json.dumps(fake_archive, ensure_ascii=False), encoding="utf-8")
         sent_before = len(ctx.sent)
-        asyncio.run(pa.cmd_diary_ask(matched_groups={"query": "萤火虫"}, stream_id="s1"))
+        asyncio.run(pa.cmd_diary_ask(matched_groups={"query": "萤火虫"}, stream_id="s1",
+                                     is_local_operator=True))
         ask_text = "\n".join(t for t, _ in ctx.sent[sent_before:])
         check("/问日记 命中并回显日期", "2026-09-20" in ask_text and "萤火虫" in ask_text, ask_text)
         sent_before = len(ctx.sent)
-        asyncio.run(pa.cmd_diary_ask(matched_groups={}, stream_id="s1"))
+        asyncio.run(pa.cmd_diary_ask(matched_groups={}, stream_id="s1", is_local_operator=True))
         hint = "\n".join(t for t, _ in ctx.sent[sent_before:])
         check("空查询给用法提示", "问什么" in hint, hint)
         sent_before = len(ctx.sent)
-        asyncio.run(pa.cmd_diary_on_this_day(stream_id="s1"))
+        asyncio.run(pa.cmd_diary_on_this_day(stream_id="s1", is_local_operator=True))
         otd_text = "\n".join(t for t, _ in ctx.sent[sent_before:])
         real_today = _dt.date.today()
         check("/那年今日 走真实系统日期（今天无往年记录时给空提示）",

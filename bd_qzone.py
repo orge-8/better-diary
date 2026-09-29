@@ -109,8 +109,11 @@ class QzonePublisher:
         # ② cookie 以**显式域限定**写入 client jar，而不是按请求传 `cookies=`
         #    （后者已被 httpx 标记弃用）。域限定意味着即便日后有人把跳转打开，
         #    跳转目标域也拿不到 cookie（已用 MockTransport 实测确认）。
+        # ③ `trust_env=False` —— 与 bd_cookie 一致：本请求带登录态，不走系统代理，
+        #    避免 HTTP_PROXY/HTTPS_PROXY 上的中间人代理看到 cookie。
         async with httpx.AsyncClient(
-            follow_redirects=False, timeout=timeout, transport=self._transport
+            follow_redirects=False, timeout=timeout, trust_env=False,
+            transport=self._transport,
         ) as client:
             for key, value in self.cookies.items():
                 client.cookies.set(
@@ -147,7 +150,9 @@ class QzonePublisher:
             except (TypeError, ValueError):
                 pass
         if code != 0:
-            return False, f"空间返回 code={code}（{res.text[:120]}…）" if len(res.text) > 120 else f"空间返回 code={code}"
+            # 不回显响应体：那是外部返回的任意文本，可能夹带凭据/回显内容，
+            # 而这条消息会进日志、也会发到聊天里。只报错误码。
+            return False, f"空间返回 code={code}"
 
         try:
             data = res.json()

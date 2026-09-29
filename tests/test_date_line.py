@@ -10,15 +10,25 @@
 from __future__ import annotations
 
 import importlib
+import os
 import sys
 from pathlib import Path
 
 import pytest
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
-DEVKIT_DIR = Path(r"C:\Users\38160\Desktop\tools\maibot-devkit")
-if str(DEVKIT_DIR) not in sys.path:
-    sys.path.insert(0, str(DEVKIT_DIR))
+# devkit（fakehost）只在开发机跑测试时需要；优先环境变量，其次探测同级目录。
+_DEVKIT_CANDIDATES = [
+    os.environ.get("MAIBOT_DEVKIT_DIR", ""),
+    str(PLUGIN_DIR.parent / "tools" / "maibot-devkit"),
+    str(PLUGIN_DIR / "maibot-devkit"),
+    r"C:\Users\38160\Desktop\tools\maibot-devkit",
+]
+for _cand in _DEVKIT_CANDIDATES:
+    if _cand and (Path(_cand) / "fakehost.py").is_file():
+        if _cand not in sys.path:
+            sys.path.insert(0, _cand)
+        break
 
 from fakehost import load_plugin_module  # noqa: E402
 

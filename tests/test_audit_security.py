@@ -1,8 +1,9 @@
-"""上线前全检 · 安全与健壮性回归用例（v1.2.6）。
+"""上线前全检 · 安全与健壮性回归用例。
 
 每条用例对应一次审计结论，均**可复现**：
 - 成文语义闸（拒答 / 空输出 / 残句 → 不生成、不发布）
 - 素材不足 / 空内容的发布前短路
+- 权限 fail-closed（v1.3.4）+ 只读命令同闸 + 命令冷却
 - cookie / 凭据不进日志
 - 外发请求不跟随跳转（凭据外泄的结构性防线）
 - 时间线对不可信昵称的净化
@@ -16,15 +17,27 @@ from __future__ import annotations
 import asyncio
 import datetime
 import importlib
+import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
-DEVKIT_DIR = Path(r"C:\Users\38160\Desktop\tools\maibot-devkit")
-if str(DEVKIT_DIR) not in sys.path:
-    sys.path.insert(0, str(DEVKIT_DIR))
+# devkit（提供 fakehost）不是插件的运行依赖，只在开发机上跑测试时用。
+# 优先环境变量，其次探测同级目录，最后回退到开发机默认位置 —— 换机器/审阅者也能跑。
+_DEVKIT_CANDIDATES = [
+    os.environ.get("MAIBOT_DEVKIT_DIR", ""),
+    str(PLUGIN_DIR.parent / "tools" / "maibot-devkit"),
+    str(PLUGIN_DIR / "maibot-devkit"),
+    r"C:\Users\38160\Desktop\tools\maibot-devkit",
+]
+for _cand in _DEVKIT_CANDIDATES:
+    if _cand and (Path(_cand) / "fakehost.py").is_file():
+        if _cand not in sys.path:
+            sys.path.insert(0, _cand)
+        break
 
 from fakehost import (  # noqa: E402
     FakeHost,
@@ -72,7 +85,7 @@ def build_plugin(llm_reply: str, msgs):
     host = FakeHost(
         returns={"message.get_by_time": msgs, "message.get_by_time_in_chat": msgs}
     )
-    ctx = build_context("org.civetc.better-diary", rpc_call=host.rpc_call)
+    ctx = build_context("org.orge-8.better-diary", rpc_call=host.rpc_call)
     plugin._set_context(ctx)
     plugin.set_plugin_config(get_default_config(MOD.BetterDiaryConfig))
 
@@ -439,18 +452,25 @@ def test_as_str_list_normalization():
 
 
 def test_admin_auth_matrix():
-    """自管 admin_ids：留空 fail-open；支持 qq: 前缀与 message 信封取值。"""
+    """自管权限：**fail-closed**（v1.3.4 起 admin_ids 留空不再放行所有人）。
+
+    旧行为（fail-open）让任何群成员都能触发 /日记，把当天聊天（含私聊素材）
+    写成日记发布到公开 QQ 空间；这条用例现在锁死新行为。
+    """
     plugin = MOD.create_plugin()
-    ctx = build_context("org.civetc.better-diary", rpc_call=FakeHost().rpc_call)
+    ctx = build_context("org.orge-8.better-diary", rpc_call=FakeHost().rpc_call)
     plugin._set_context(ctx)
 
-    def check(admin_ids, kwargs):
+    def check(admin_ids, kwargs, allow_all=False):
         cfg = get_default_config(MOD.BetterDiaryConfig)
         cfg["security"]["admin_ids"] = admin_ids
+        cfg["security"]["allow_all_users"] = allow_all
         plugin.set_plugin_config(cfg)
         return plugin._is_admin(kwargs)
 
-    assert check([], {"user_id": "999"}) is True  # fail-open
+    assert check([], {"user_id": "999"}) is False  # fail-closed（v1.3.4 反转）
+    assert check([], {}) is False
+    assert check([], {"user_id": "999"}, allow_all=True) is True  # 显式开关才全员放行
     assert check(["123456789"], {"user_id": "123456789"}) is True
     assert check(["qq:123456789"], {"user_id": "123456789"}) is True
     assert check(["123456789"], {"user_id": "999"}) is False
@@ -462,11 +482,131 @@ def test_admin_auth_matrix():
     assert check(["123456789"], {}) is False
 
 
+def test_local_operator_flag_is_strict():
+    """`is_local_operator` 旁路必须严格判定：字符串 "false"/"0" 不得放行。
+
+    对抗性复验发现旧写法 `bool(kwargs.get(...))` 会把 `"false"`、`"0"`、`1`
+    都当成放行 —— 宿主一旦把该字段序列化成字符串，旁路就被意外打开。
+    """
+    plugin = MOD.create_plugin()
+    ctx = build_context("org.orge-8.better-diary", rpc_call=FakeHost().rpc_call)
+    plugin._set_context(ctx)
+    cfg = get_default_config(MOD.BetterDiaryConfig)
+    cfg["security"]["admin_ids"] = []  # 除旁路外一切拒绝
+    plugin.set_plugin_config(cfg)
+
+    assert plugin._is_admin({"is_local_operator": True}) is True
+    assert plugin._is_admin({"is_local_operator": "true"}) is True
+    assert plugin._is_admin({"is_local_operator": "TRUE"}) is True
+    assert plugin._is_admin({"is_local_operator": "1"}) is True
+    # 这些**不得**放行（旧实现的漏洞面）
+    for falsy in ("false", "False", "0", "", "no", 0, 0.0, None, [], {}):
+        assert plugin._is_admin({"is_local_operator": falsy}) is False, f"{falsy!r} 不该放行"
+
+
+def test_resolve_cookies_exception_is_contained(monkeypatch):
+    """取 cookie 抛异常时必须被兜住且脱敏，不得穿透到宿主 traceback。
+
+    对抗性复验实测：`_resolve_cookies` 走 adapter / NapCat HTTP，
+    其异常消息可能内嵌 cookie 串；旧实现里这两处调用在 try 之外，
+    异常会原样穿透 `cmd_diary` / `_scheduled_run`，最终由宿主打印含凭据的 traceback。
+    """
+    plugin = MOD.create_plugin()
+    host = FakeHost()
+    ctx = build_context("org.orge-8.better-diary", rpc_call=host.rpc_call)
+    plugin._set_context(ctx)
+    cfg = get_default_config(MOD.BetterDiaryConfig)
+    cfg["security"]["admin_ids"] = ["123456789"]
+    plugin.set_plugin_config(cfg)
+
+    leak = "adapter error: cookies=uin=o0123456; p_skey=PSKEY_SECRET_VALUE"
+
+    async def boom(force=False):
+        raise RuntimeError(leak)
+
+    plugin._resolve_cookies = boom  # type: ignore[assignment]
+    ok, msg = asyncio.run(plugin._publish_to_qzone("正文"))
+    assert ok is False
+    assert "PSKEY_SECRET_VALUE" not in msg, msg          # 回给聊天的文本已脱敏
+    assert "RuntimeError" in msg, msg                    # 但异常类型保留（可排障）
+    assert "<redacted>" in msg, msg
+
+    # 第二个入口：首次取成功，登录态失效后**重取**时才抛异常
+    async def ok_then_boom(force=False):
+        if force:
+            raise RuntimeError(leak)
+        return {"uin": "o0123456", "p_skey": "PSKEY_SECRET_VALUE", "skey": "s"}
+
+    plugin._resolve_cookies = ok_then_boom  # type: ignore[assignment]
+
+    async def expired_publish(self, content, timeout=20.0):
+        raise QZONE.CookieExpiredError("code=-3000")
+
+    monkeypatch.setattr(QZONE.QzonePublisher, "publish_text", expired_publish)
+    ok2, msg2 = asyncio.run(plugin._publish_to_qzone("正文"))
+    assert ok2 is False
+    assert "PSKEY_SECRET_VALUE" not in msg2, msg2
+    assert "重取 cookie 异常" in msg2, msg2
+
+
+def test_cooldown_blocks_repeat_triggers():
+    """命令冷却：同一会话内不许反复触发（每次都会重调 LLM 并可能重新公开发布）。"""
+    plugin = MOD.create_plugin()
+    ctx = build_context("org.orge-8.better-diary", rpc_call=FakeHost().rpc_call)
+    plugin._set_context(ctx)
+    cfg = get_default_config(MOD.BetterDiaryConfig)
+    cfg["security"]["admin_ids"] = ["123456789"]
+    cfg["security"]["command_cooldown_seconds"] = 300
+    plugin.set_plugin_config(cfg)
+
+    plugin._last_gen_ts["s1"] = time.time()
+    assert plugin._cooldown_left("s1") > 0
+    assert plugin._cooldown_left("s2") == 0  # 别的会话不受影响
+
+    cfg["security"]["command_cooldown_seconds"] = 0
+    plugin.set_plugin_config(cfg)
+    assert plugin._cooldown_left("s1") == 0  # 配 0 = 关闭
+
+    # 冷却过期后放行
+    cfg["security"]["command_cooldown_seconds"] = 300
+    plugin.set_plugin_config(cfg)
+    plugin._last_gen_ts["s3"] = time.time() - 400
+    assert plugin._cooldown_left("s3") == 0
+
+
+def test_read_only_commands_are_guarded():
+    """只读命令也必须过权限闸：它们会把跨会话（含私聊）素材与逐字原话拉进本群。"""
+    plugin = MOD.create_plugin()
+    host = FakeHost()
+    ctx = build_context("org.orge-8.better-diary", rpc_call=host.rpc_call)
+    plugin._set_context(ctx)
+    cfg = get_default_config(MOD.BetterDiaryConfig)
+    cfg["security"]["admin_ids"] = []  # fail-closed
+    cfg["security"]["allow_all_users"] = False
+    cfg["schedule"]["enabled"] = False
+    plugin.set_plugin_config(cfg)
+
+    sent_before = len(host.calls_of("send.text"))
+    for coro in (
+        plugin.cmd_diary_view(stream_id="s1"),
+        plugin.cmd_diary_help(stream_id="s1"),
+        plugin.cmd_diary_ask(matched_groups={"query": "x"}, stream_id="s1"),
+        plugin.cmd_diary_on_this_day(stream_id="s1"),
+        plugin.cmd_diary_sources(stream_id="s1"),
+    ):
+        ok, _msg, _code = asyncio.run(coro)
+        assert ok is True  # 静默吞掉，不把命令交回宿主继续处理
+    assert len(host.calls_of("send.text")) == sent_before, "非管理员触发只读命令时不得发言"
+
+    # 本机操作者（bot_console 注入的 is_local_operator）仍可用
+    assert plugin._is_admin({"is_local_operator": True}) is True
+
+
 def test_plugin_lifecycle_clean():
     """生命周期干净：on_load/on_unload 不抛异常，且不发起任何未声明的能力调用。"""
     plugin = MOD.create_plugin()
     host = FakeHost()
-    ctx = build_context("org.civetc.better-diary", rpc_call=host.rpc_call)
+    ctx = build_context("org.orge-8.better-diary", rpc_call=host.rpc_call)
     plugin._set_context(ctx)
     plugin.set_plugin_config(get_default_config(MOD.BetterDiaryConfig))
 
@@ -595,7 +735,7 @@ def _cfg_plugin(tmp_path, *, msgs=None, llm=None, **schedule):
             "message.get_by_time_in_chat": msgs or [],
         }
     )
-    ctx = build_context("org.civetc.better-diary", rpc_call=host.rpc_call)
+    ctx = build_context("org.orge-8.better-diary", rpc_call=host.rpc_call)
     plugin._set_context(ctx)
     cfg = get_default_config(MOD.BetterDiaryConfig)
     cfg["schedule"].update(schedule)
