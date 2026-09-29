@@ -108,7 +108,8 @@ class PluginSection(PluginConfigBase):
 class DiarySection(PluginConfigBase):
     """日记生成配置。"""
 
-    word_target: int = Field(default=250, description="日记目标字数（正文）")
+    word_target: int = Field(default=350, description="日记目标字数（正文）。只是最舒服的长度，不是硬指标")
+    word_tolerance: int = Field(default=150, description="目标字数的上下浮动。区间放宽一点，模型写长了不必回头删")
     max_events: int = Field(default=3, description="日记最多写几件事")
     min_messages: int = Field(default=20, description="当天消息少于此数不生成日记")
     chunk_chars: int = Field(default=6000, description="时间线分块字符数")
@@ -1307,6 +1308,7 @@ class BetterDiaryPlugin(MaiBotPlugin):
             style_extra=self.config.diary.style_extra,
             word_target=max(80, self.config.diary.word_target),
             max_events=max(1, self.config.diary.max_events),
+            word_tolerance=max(0, self.config.diary.word_tolerance),
             # 补写过去的日期必须声明相对时间的基准，否则模型会按「真正的今天」解读素材里的「昨天」
             temporal_anchor="" if is_today else date_display(date_str),
             continuity_text=build_continuity_line(continuity),
@@ -1326,6 +1328,15 @@ class BetterDiaryPlugin(MaiBotPlugin):
             )
             return False, f"模型没写出可用的日记（{problem}），本日不生成"
         content = ensure_date_line(body, date_display(date_str))
+        # 日期行被补写/规范化时留痕。真机踩坑（2026-09-28）：模型写成
+        # 「2026年9月28日 星期一 雨」（漏逗号）→ 旧判据认不出 → 补出第二行日期、
+        # 还把真实天气冲成默认值。有这条日志，同类形态一眼可见。
+        _raw_first = (body.split("\n", 1)[0] or "").strip()
+        if _raw_first and not content.startswith(_raw_first):
+            self.ctx.logger.info(
+                "日期行已规范化：模型原文 %r → %r",
+                _raw_first[:60], content.split("\n", 1)[0],
+            )
         # 引用体检（非阻断，只留痕）：选材成文时才查——降级用时间线末尾时
         # 模型可以引用任意聊天原话，没有可比对的素材列表。
         if used_events:
@@ -1336,7 +1347,12 @@ class BetterDiaryPlugin(MaiBotPlugin):
                     risk,
                     [e.get("quote", "") for e in used_events],
                 )
-        self.ctx.logger.info("日记成文: %d 字（目标 %d）", len(content), self.config.diary.word_target)
+        _target = max(1, self.config.diary.word_target)
+        _tol = max(0, self.config.diary.word_tolerance)
+        self.ctx.logger.info(
+            "日记成文: %d 字（目标 %d，区间 %d~%d）",
+            len(content), _target, max(1, _target - _tol), _target + _tol,
+        )
 
         material_mode = "events" if used_events else "timeline_tail"
         self._save_diary(

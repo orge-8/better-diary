@@ -414,7 +414,8 @@ def build_write_prompt(
     name: str,
     persona: str,
     style_extra: str = "",
-    word_target: int = 250,
+    word_target: int = 350,
+    word_tolerance: int = 150,
     max_events: int = 3,
     temporal_anchor: str = "",
     continuity_text: str = "",
@@ -422,6 +423,10 @@ def build_write_prompt(
     """阶段二：基于精选素材写日记。
 
     Args:
+        word_target: 目标字数（正文）。**只是"最合适的长度"，不是硬指标**。
+        word_tolerance: 上下浮动。区间宽一点更贴合「想到哪写到哪」的基调 ——
+            真机实测模型常自然写到目标之上（目标 250 时写出 341 字），
+            区间太窄等于每次都在越界，逼着它回头删或硬凑。
         temporal_anchor: 非空表示这是**补写**过去的某一天。此时要显式声明
             素材里「今天/昨天/前天」的相对时间基准，否则模型会以真正的今天来解读。
         continuity_text: 跨天连续性线索（见 :func:`build_continuity_line`），
@@ -429,7 +434,11 @@ def build_write_prompt(
     """
     name_line = f"我的名字是{name}。" if name else ""
     persona_line = persona or "是一个爱聊天的机器人。"
-    style_line = f"\n8. {style_extra}" if style_extra else ""
+    # 编号必须排在规则 8（字数）之后 —— 曾经硬编码成 8，与字数规则撞号
+    style_line = f"\n9. {style_extra}" if style_extra else ""
+    tol = max(0, int(word_tolerance))
+    target = max(1, int(word_target))
+    lo, hi = max(1, target - tol), target + tol
     anchor_block = ""
     if temporal_anchor.strip():
         anchor_block = (
@@ -459,7 +468,8 @@ def build_write_prompt(
    拿不准的地方用"好像""应该是""记不清了"这类不确定语气带过 —— 文风自由不等于客观事实可以补写。
 7. 上面的跨天线索（若有）只能用来引出想法、疑问、期待，或带原日期的回顾；
    它**不能单独证明今天发生了什么**，今天的事必须有「值得记的事」作依据。
-8. 全文 {word_target} 字左右（可上下浮动 80 字）。除第一行外就是日记正文：不要标题、不要 markdown、不要"日记"二字开头、不要任何前后缀或解释。{style_line}
+8. 篇幅：{lo}~{hi} 字，{target} 字上下最舒服。**字数是给你留的余地，不是任务** ——
+   宁可短一点也别硬凑；写完了觉得还差口气，就多补一句感受，别去堆形容词。除第一行外就是日记正文：不要标题、不要 markdown、不要"日记"二字开头、不要任何前后缀或解释。{style_line}
 
 日记正文写完后，另起一段只输出下面这两行（用于归档，**不会被发表**）：
 {META_MARKER}
@@ -482,20 +492,118 @@ def strip_diary_output(text: str) -> str:
     return cleaned
 
 
+_WEEKDAY_CHARS = "一二三四五六日天"
+_WEATHERS = ("晴", "多云", "阴", "雨")
+
+# 完整的「年月日」才算日期行 —— 只有年月不行（「2026年过得真快」不匹配）
+_FULL_DATE_RE = re.compile(r"^\s*[\[【（(「『]*\s*(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日")
+# 短式「9月26日」（年月日三缺一时用它，日/月必须和目标日期一致才认）
+_SHORT_DATE_RE = re.compile(r"^\s*[\[【（(「『]*\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日")
+_WEEKDAY_RE = re.compile(r"^[\s（(【\[]*[星週周]\s*期?\s*[" + _WEEKDAY_CHARS + r"]")
+# 天气只在「后面紧跟标点 / 空白 / 行尾」时才认，免得把「雨太大了」的正文切成天气
+_WEATHER_RE = re.compile(
+    r"^[\s，,、:：]*(" + "|".join(_WEATHERS) + r")(?=[\s，,、。.：:；;～~\-—）)】\]」』]|$)"
+)
+# 日期行收尾要清掉的残留标点
+_DATE_TAIL_RE = re.compile(r"^[\s，,、。.：:；;～~\-—）)】\]」』]+")
+_MD_DECOR_RE = re.compile(r"^[#>*\-\s]+")
+
+DEFAULT_WEATHER = "多云"
+
+
+def _target_ymd(date_str: str) -> tuple[int, int, int] | None:
+    """从「2026年9月28日 星期一」或「2026-09-28」里取出 (年, 月, 日)。"""
+    text = str(date_str or "")
+    m = re.search(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日", text)
+    if m:
+        return int(m.group(1)), int(m.group(2)), int(m.group(3))
+    m = re.match(r"\s*(\d{4})-(\d{1,2})-(\d{1,2})\s*$", text)
+    if m:
+        return int(m.group(1)), int(m.group(2)), int(m.group(3))
+    return None
+
+
+def parse_date_line(line: str, date_str: str) -> tuple[str, str] | None:
+    """判断这一行是不是**目标日期**的日期行。
+
+    是 → 返回 ``(天气, 行内剩余正文)``；不是（或写的是别的日期）→ ``None``。
+
+    判据是**真的把日期解析出来比对**，而不是"含年份且含逗号"这种代理特征。
+    真机踩坑（2026-09-28）：模型写成 ``2026年9月28日 星期一 雨``（逗号漏了），
+    旧判据认不出这是日期行 → 又补一行 ``…，多云。`` →
+    既出现两行日期，又把模型真实观察到的天气冲成了默认值。
+    """
+    ymd = _target_ymd(date_str)
+    if ymd is None:
+        return None
+    rest = _MD_DECOR_RE.sub("", str(line or "").lstrip())
+    m = _FULL_DATE_RE.match(rest)
+    if m:
+        if (int(m.group(1)), int(m.group(2)), int(m.group(3))) != ymd:
+            return None  # 别的日期：不当日期行，交给补行逻辑
+        rest = rest[m.end():]
+    else:
+        m = _SHORT_DATE_RE.match(rest)
+        if not m:
+            return None
+        if (ymd[0], int(m.group(1)), int(m.group(2))) != ymd:
+            return None
+        rest = rest[m.end():]
+
+    m = _WEEKDAY_RE.match(rest)
+    if m:
+        rest = rest[m.end():]
+    weather = ""
+    m = _WEATHER_RE.match(rest)
+    if m:
+        weather = m.group(1)
+        rest = rest[m.end():]
+    # 日期行该结束了：剩下来的若只是标点就丢掉，其余当正文保留（见调用方）
+    return weather, _DATE_TAIL_RE.sub("", rest).strip()
+
+
 def ensure_date_line(content: str, date_str: str) -> str:
-    """保证第一行是日期行；模型漏写时自动补。
+    """保证第一行是日期行，并把它**规范成** ``<日期>，<天气>。``。
+
+    三种输入都能正确处理：
+
+    1. 没写日期行 → 补一行（天气用默认值）。
+    2. 写了但格式不标准（缺逗号 / 缺句号 / 用短式 ``9月28日``）→ 就地规范化，
+       **保留模型自己写的天气**，不覆盖成默认值。
+    3. 写了两行日期行（模型偶发）→ 折叠成一行；被折叠那行里若夹着正文，正文保留。
 
     ⚠️ 空内容会被补成 ``「<日期>，多云。\\n（今天没写出什么来。）」`` 这种**占位文本**，
     它是给「聊天里回看」兜底用的展示文案，**不是可发布的日记**。
     发布前必须先用 :func:`diary_output_problem` 判定，否则占位文本会被当成成品发出去。
     """
     if not content:
-        return f"{date_str}，多云。\n（今天没写出什么来。）"
-    first_line = content.split("\n", 1)[0]
-    year = date_str[:4]
-    if year in first_line and ("，" in first_line or "," in first_line):
-        return content
-    return f"{date_str}，多云。\n{content}"
+        return f"{date_str}，{DEFAULT_WEATHER}。\n（今天没写出什么来。）"
+    lines = content.split("\n")
+    # 跳过可能存在的空行，日期行必须是**第一个非空行**
+    idx = next((i for i, ln in enumerate(lines) if ln.strip()), 0)
+    parsed = parse_date_line(lines[idx], date_str)
+    if parsed is None:
+        # 没有可识别的日期行 → 补一行。若有前导空行，插在**第一个非空行之前**，
+        # 而不是直接 return（曾经写成 `... if idx == 0 else content`，
+        # 结果「空行开头且没写日期行」时整篇缺日期头）。
+        lines.insert(idx, f"{date_str}，{DEFAULT_WEATHER}。")
+        return "\n".join(lines)
+
+    weather, leftover = parsed
+    lines[idx] = f"{date_str}，{weather or DEFAULT_WEATHER}。"
+    if leftover:
+        # 模型把正文第一句挤进了日期行 → 拆出来，别丢内容
+        lines.insert(idx + 1, leftover)
+    # 折叠紧随其后的重复日期行
+    while len(lines) > idx + 1:
+        nxt = parse_date_line(lines[idx + 1], date_str)
+        if nxt is None:
+            break
+        tail = nxt[1]
+        del lines[idx + 1]
+        if tail:
+            lines.insert(idx + 1, tail)
+    return "\n".join(lines)
 
 
 def date_display(date_str: str) -> str:

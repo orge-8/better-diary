@@ -331,9 +331,11 @@ print("NOHTTPX-LOAD-OK")
         _fb._plugin_config_instance = None
         try:
             _fb_cfg = _fb.config
+            # 断言"回退到了默认值"而不是硬编码某个数 —— 默认值调整时这条测试不该跟着改
             check(
                 "配置注入失败时 config 回退默认值而非抛异常",
-                _fb_cfg is not None and _fb_cfg.diary.word_target == 250,
+                _fb_cfg is not None
+                and _fb_cfg.diary.word_target == plugin_mod.BetterDiaryConfig().diary.word_target,
             )
         except Exception as _exc:  # noqa: BLE001
             check("配置注入失败时 config 回退默认值而非抛异常", False, f"{type(_exc).__name__}: {_exc}")
@@ -386,12 +388,15 @@ print("NOHTTPX-LOAD-OK")
     )
     check("兜底后保留用户 admin_ids", _p_keep.config.security.admin_ids == ["999"], str(_p_keep.config.security.admin_ids))
     check("兜底后保留用户 uin", _p_keep.config.qzone.uin == "2472005478", _p_keep.config.qzone.uin)
-    check("兜底逐字段修复（word_target 回到默认 250）", _p_keep.config.diary.word_target == 250, str(_p_keep.config.diary.word_target))
+    check("兜底逐字段修复（word_target 回到默认值）",
+          _p_keep.config.diary.word_target == plugin_mod.BetterDiaryConfig().diary.word_target,
+          str(_p_keep.config.diary.word_target))
 
     print("\n[1] 配置模型")
     cfg = plugin_mod.BetterDiaryConfig()
     check("config_version 默认值", cfg.plugin.config_version == "1.0.0")
-    check("word_target 默认 250", cfg.diary.word_target == 250)
+    check("word_target 默认 350", cfg.diary.word_target == 350)
+    check("word_tolerance 默认 150", cfg.diary.word_tolerance == 150)
     check("schedule.time 默认 23:30", cfg.schedule.time == "23:30")
     check("不丢天默认开启", cfg.schedule.catch_up_enabled is True)
     check("补写上限默认 3 天", cfg.schedule.catch_up_days == 3)
@@ -1137,6 +1142,42 @@ print("NOHTTPX-LOAD-OK")
         check("失败日如实记为失败、后续日照常成功",
               dict(res).get(targets[1]) is False and dict(res).get(targets[2]) is True,
               str(res))
+
+    print("\n[17] 日期行规范化 + 篇幅区间（真机双日期行实录）")
+    _dt_display = bd.date_display("2026-09-28")
+    # 真机原文：模型漏了逗号 → 旧判据认不出，补出第二行日期、还冲掉真实天气
+    _fixed = bd.ensure_date_line(
+        bd.strip_diary_output("2026年9月28日 星期一 雨\n睡前翻聊天记录。"), _dt_display
+    )
+    check("真机形态只留一行日期", _fixed.count("2026年9月28日") == 1, repr(_fixed))
+    check("保留模型写的天气（不被默认值覆盖）",
+          _fixed.split("\n")[0] == "2026年9月28日 星期一，雨。", repr(_fixed))
+    check("正文原样跟在日期行后", _fixed.split("\n")[1] == "睡前翻聊天记录。", repr(_fixed))
+    _dup = bd.ensure_date_line(
+        "2026年9月28日 星期一，多云。\n2026年9月28日 星期一 雨\n睡前翻聊天记录。", _dt_display
+    )
+    check("模型写两行日期时折叠成一行", _dup.count("2026年9月28日") == 1, repr(_dup))
+    _short = bd.ensure_date_line("9月28日 星期一 雨\n睡前翻聊天记录。", _dt_display)
+    check("短式日期行也认并补全", _short.startswith("2026年9月28日 星期一，雨。\n"), repr(_short))
+    _prose = bd.ensure_date_line("2026年过得真快，转眼就秋天了。", _dt_display)
+    check("正文提年份不误判为日期行", _prose.startswith("2026年9月28日 星期一，"), repr(_prose))
+    _other = bd.ensure_date_line("2026年9月27日 星期日，晴。\n睡前翻聊天记录。", _dt_display)
+    check("别的日期不当日期行、也不丢原文",
+          _other.startswith("2026年9月28日 星期一，") and "2026年9月27日 星期日，晴。" in _other,
+          repr(_other))
+    _inline = bd.ensure_date_line("2026年9月28日 星期一，雨。今天群里很热闹。\n后面还有一段。",
+                                  _dt_display)
+    check("日期行里夹的正文被拆出来保留",
+          "今天群里很热闹。" in _inline and "2026年9月28日 星期一，雨。\n" in _inline, repr(_inline))
+    _w = bd.build_write_prompt(date_str=_dt_display, events_text="- 甲：事", name="鸣澜", persona="p")
+    check("默认篇幅区间已放宽到 200~500", "200~500" in _w and "350 字上下" in _w)
+    check("旧的字数文案已移除", "上下浮动 80 字" not in _w)
+    check("放宽上限仍保留反硬凑纪律", "别硬凑" in _w)
+    _w2 = bd.build_write_prompt(date_str=_dt_display, events_text="- 甲：事", name="鸣澜",
+                                persona="p", style_extra="多用叠词")
+    _rule_nums = [ln[:2] for ln in _w2.split("\n") if ln[:1].isdigit() and ln[1:3] == ". "]
+    check("style_extra 编号不与字数规则撞号", _rule_nums.count("8.") == 1 and "9." in _rule_nums,
+          str(_rule_nums))
 
     print(f"\n===== 冒烟结果: PASS {len(PASS)} / FAIL {len(FAIL)} =====")
     if FAIL:
