@@ -49,6 +49,20 @@ def redact_secrets(text: Any) -> str:
     return _SECRET_KV_RE.sub(r"\1<redacted>", str(text or ""))
 
 
+def mask_uin(uin: Any, head: int = 3, tail: int = 2) -> str:
+    """把 QQ 号截成 ``123***89`` 形态，用于日志。
+
+    QQ 号本身不是凭据，``_SECRET_KV_RE`` 也只认 ``uin=值`` 形态，
+    所以裸写出来的 QQ 号会原样进日志文件（而 README 又请用户回传日志排障）。
+    「凭据收口」既然做了，就顺手把账号标识也收一下：保留头尾足够对账，
+    中间打码，排障时仍能分辨「是不是同一个号」。
+    """
+    digits = "".join(ch for ch in str(uin or "") if ch.isdigit())
+    if len(digits) <= head + tail:
+        return "***" if digits else ""
+    return f"{digits[:head]}{'*' * (len(digits) - head - tail)}{digits[-tail:]}"
+
+
 def parse_cookie_string(cookie_str: str) -> dict:
     """将 'k=v; k2=v2' 形式的 cookie 字符串解析为字典。"""
     cookies = {}
@@ -219,7 +233,7 @@ class CookieStore:
         self._cookies = parsed
         self._last_refresh_time = time.time()
         self._save_to_disk(parsed)
-        self._logger.info(f"获取 cookie 成功（uin={parsed['uin'].lstrip('o0')}）")
+        self._logger.info(f"获取 cookie 成功（uin={mask_uin(parsed['uin'])}）")
         return parsed
 
     async def _fetch_fresh(self) -> dict | None:

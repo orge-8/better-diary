@@ -17,9 +17,11 @@ from __future__ import annotations
 import asyncio
 import datetime
 import importlib
+import json
 import os
 import sys
 import time
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -87,7 +89,12 @@ def build_plugin(llm_reply: str, msgs):
     )
     ctx = build_context("org.orge-8.better-diary", rpc_call=host.rpc_call)
     plugin._set_context(ctx)
-    plugin.set_plugin_config(get_default_config(MOD.BetterDiaryConfig))
+    cfg = get_default_config(MOD.BetterDiaryConfig)
+    # v1.3.5 起 filter_mode 默认为 whitelist（且白名单为空就不抓任何消息）。
+    # 本文件测的是「成文之后」的链路，所以显式选 all 让消息流进来 ——
+    # 默认值本身的行为由 test_filter_mode_defaults_to_whitelist 单独锁。
+    cfg["diary"]["filter_mode"] = "all"
+    plugin.set_plugin_config(cfg)
 
     async def fake_llm(prompt: str, temperature: float) -> str:
         if "只输出 JSON 数组" in prompt:  # 阶段一：选材
@@ -549,6 +556,344 @@ def test_resolve_cookies_exception_is_contained(monkeypatch):
     assert "重取 cookie 异常" in msg2, msg2
 
 
+def test_filter_scope_is_fail_closed_by_default(tmp_path):
+    """取材范围默认 fail-closed（v1.3.5）：默认只取白名单会话，不再默认收全库。
+
+    插件中心的审核意见：权限闸只管「谁能触发」，没管「默认收多少料」。
+    默认 `all` 会把当天所有群 + 所有私聊合并后送进 prompt，成品再发到公开空间。
+    这条用例把新默认钉死，并保证「配置写错」不会静默退化成全量采集。
+    """
+    plugin = MOD.create_plugin()
+    host = FakeHost(returns={"message.get_by_time": make_messages(20),
+                             "message.get_by_time_in_chat": make_messages(20)})
+    ctx = build_context("org.orge-8.better-diary", rpc_call=host.rpc_call)
+    plugin._set_context(ctx)
+    plugin._data_dir = lambda: tmp_path  # type: ignore[assignment]
+
+    # 1) 模型默认值本身
+    default_cfg = MOD.BetterDiaryConfig()
+    assert default_cfg.diary.filter_mode == "whitelist"
+    assert default_cfg.diary.target_chats == []
+
+    # 2) 默认配置下：一条都不抓
+    cfg = get_default_config(MOD.BetterDiaryConfig)
+    cfg["schedule"]["enabled"] = False
+    plugin.set_plugin_config(cfg)
+    assert asyncio.run(plugin._fetch_messages(0.0, 1e12)) == []
+
+    # 3) 提示必须指向配置问题，而不是误导成「今天消息太少」
+    ok, why = asyncio.run(plugin._generate_for_date("2026-09-26"))
+    assert ok is False
+    assert "target_chats" in why and "太少" not in why, why
+
+    # 4) 未登记的能力不会被调用（默认路径根本不发消息查询）
+    assert host.calls_of("message.get_by_time") == [], "默认配置不得调用全库查询"
+
+    # 5) 未知取值回退 whitelist，不得静默变成 all
+    cfg = get_default_config(MOD.BetterDiaryConfig)
+    cfg["diary"]["filter_mode"] = "b1acklist"  # 拼写错误
+    plugin.set_plugin_config(cfg)
+    assert plugin.config.diary.filter_mode == "whitelist"
+    assert asyncio.run(plugin._fetch_messages(0.0, 1e12)) == []
+
+    # 6) 显式 all 才收全库
+    cfg = get_default_config(MOD.BetterDiaryConfig)
+    cfg["diary"]["filter_mode"] = "all"
+    plugin.set_plugin_config(cfg)
+    assert len(asyncio.run(plugin._fetch_messages(0.0, 1e12))) > 0
+
+
+def test_unresolvable_whitelist_target_is_diagnosed(tmp_path):
+    """兼容期保护（v1.3.6）：target_chats 解析不出 stream_id 时必须给出可执行提示。
+
+    真机实录（2026-09-30 07:24）：存量 config 里躺着一个 `group:967779035` ——
+    它在旧版 `filter_mode = "all"` 下写了但**从未生效**（all 模式不看 target_chats）；
+    新版默认 whitelist 后它突然生效却解析不出 stream_id，结果只报
+    「当天消息太少（0 条，需要 20 条）」，完全指不到配置问题上。
+    """
+    plugin = MOD.create_plugin()
+    # 关键：让宿主 API「成功返回但结构里没有 stream_id」—— 这正是真机那次的现象
+    host = FakeHost(returns={
+        "chat.get_stream_by_group_id": {"unexpected_key": "whatever"},
+        "message.get_by_time": make_messages(40),
+        "message.get_by_time_in_chat": make_messages(40),
+    })
+    ctx = build_context("org.orge-8.better-diary", rpc_call=host.rpc_call)
+    plugin._set_context(ctx)
+    plugin._data_dir = lambda: tmp_path  # type: ignore[assignment]
+    cfg = get_default_config(MOD.BetterDiaryConfig)
+    cfg["diary"]["filter_mode"] = "whitelist"
+    cfg["diary"]["target_chats"] = ["group:967779035"]
+    cfg["schedule"]["enabled"] = False
+    plugin.set_plugin_config(cfg)
+
+    assert asyncio.run(plugin._fetch_messages(0.0, 1e12)) == []
+
+    # 原因必须被记录下来，且描述的是「三次尝试都没解析出会话」而不是笼统的失败
+    assert "group:967779035" in plugin._unresolved_targets
+    why = plugin._unresolved_targets["group:967779035"]
+    assert "都没解析出会话" in why, why
+    assert "unexpected_key" in why, why           # 保留了宿主返回的结构（只是键名）
+    assert "不活跃" in why, why                    # 并把最可能的原因说清楚
+
+    diag = plugin._filter_diagnostic(0, 20)
+    assert diag is not None
+    condition, config_bits, reasons = diag
+    assert "解析不出" in condition
+    assert any("967779035" in b for b in config_bits)
+    assert reasons and "都没解析出会话" in reasons[0]
+
+    # 报错文本必须给出两条可执行出路，而不是「消息太少」
+    ok, why_msg = asyncio.run(plugin._generate_for_date("2026-09-26"))
+    assert ok is False
+    assert "967779035" in why_msg, why_msg
+    assert "聊天流 ID" in why_msg, why_msg
+    assert 'filter_mode = "all"' in why_msg, why_msg
+    assert "太少" not in why_msg, why_msg
+
+    # 解析成功时不得误报诊断
+    host2 = FakeHost(returns={
+        "chat.get_stream_by_group_id": {"stream_id": "s_ok"},
+        "message.get_by_time_in_chat": make_messages(40),
+    })
+    plugin._set_context(build_context("org.orge-8.better-diary", rpc_call=host2.rpc_call))
+    plugin.set_plugin_config(cfg)
+    assert len(asyncio.run(plugin._fetch_messages(0.0, 1e12))) > 0
+    assert plugin._unresolved_targets == {}
+    assert plugin._filter_diagnostic(0, 20) is None
+
+
+def test_group_id_fallback_resolution():
+    """主接口返回 None 时按 group_id 自己找（v1.3.7）。
+
+    真机实录：`get_stream_by_group_id('967779035')` 返回 **None**
+    （SDK 会把 RPC 结果的 `stream` 字段取出来，None = 宿主没返回该群的流），
+    导致三天日记全空。降级到 `chat.get_group_streams` / `chat.get_all_streams`
+    按 group_id 自己找一遍就能兜住。
+    """
+    from types import SimpleNamespace
+
+    plugin = MOD.create_plugin()
+    ctx = build_context("org.orge-8.better-diary", rpc_call=FakeHost().rpc_call)
+    plugin._set_context(ctx)
+
+    class _Chat:
+        """主接口返回 None，但群流列表里有这个群。"""
+
+        async def get_stream_by_group_id(self, group_id, platform="qq"):
+            return None
+
+        async def get_group_streams(self, platform="qq"):
+            return {"success": True, "streams": [
+                {"group_id": "111", "stream_id": "s_other"},
+                {"group_id": "967779035", "stream_id": "s_target"},
+            ]}
+
+    plugin.ctx.chat = _Chat()
+    assert asyncio.run(plugin._resolve_stream_id("group:967779035")) == "s_target"
+    assert plugin._unresolved_targets == {}, plugin._unresolved_targets
+
+    # 群流列表也空 → 再退到 get_all_streams
+    class _Chat2:
+        async def get_stream_by_group_id(self, group_id, platform="qq"):
+            return {}
+
+        async def get_group_streams(self, platform="qq"):
+            return []
+
+        async def get_all_streams(self, platform="qq"):
+            return [{"chat": {"group_id": "967779035"}, "stream_id": "s_deep"}]
+
+    plugin.ctx.chat = _Chat2()
+    plugin._unresolved_targets = {}
+    assert asyncio.run(plugin._resolve_stream_id("group:967779035")) == "s_deep"
+
+    # 三条路都没有 → 记原因、不误认（不能把 111 当成 967779035）
+    class _Chat3:
+        async def get_stream_by_group_id(self, group_id, platform="qq"):
+            return None
+
+        async def get_group_streams(self, platform="qq"):
+            return [{"group_id": "111", "stream_id": "s_other"}]
+
+        async def get_all_streams(self, platform="qq"):
+            return []
+
+    plugin.ctx.chat = _Chat3()
+    plugin._unresolved_targets = {}
+    assert asyncio.run(plugin._resolve_stream_id("group:967779035")) == ""
+    assert "group:967779035" in plugin._unresolved_targets
+    assert "不活跃" in plugin._unresolved_targets["group:967779035"]
+
+    # 裸 stream ID 不经过任何解析，永不受影响
+    plugin._unresolved_targets = {}
+    assert asyncio.run(plugin._resolve_stream_id("05b32a9995a72c59940d9cd171544ac4")) \
+        == "05b32a9995a72c59940d9cd171544ac4"
+    assert plugin._unresolved_targets == {}
+
+
+def test_find_stream_id_deep_handles_nested_shape():
+    """兜底解析必须能从「内层 group_id + 外层 stream_id」的形态里取到流 ID。
+
+    本轮实现时踩过的真 bug：`_find_by_value` 命中的是**内层** {group_id: …}，
+    而 stream_id 在外层流对象上，只取命中那一层会拿到空串 ——
+    在真机上就表现为「明明找到了群，却还是解析失败」。
+    """
+    deep = MOD._find_stream_id_deep
+    # 真机最可能的形态：流对象包着 chat
+    assert deep({"stream_id": "s1", "chat": {"group_id": "9"}}) == "s1"
+    assert deep([{"stream_id": "s2", "chat": {"group_id": "9"}}]) == "s2"
+    # 只有内层命中时的形态：从内层往上找不到，回到整表找
+    assert deep({"group_id": "9"}) == ""
+    assert deep([{"group_id": "9", "stream_id": "s3"}]) == "s3"
+    # 键名优先级：stream_id 优先于嵌套的 id
+    assert deep({"id": "wrong", "stream_id": "right"}) == "right"
+    # 深层嵌套也要能找到
+    assert deep({"a": {"b": [{"c": {"session_id": "s4"}}]}}) == "s4"
+    # 空/无 → 空串（不抛）
+    assert deep(None) == ""
+    assert deep({}) == ""
+    assert deep([{}, []]) == ""
+
+
+def test_whitelist_falls_back_without_chat_capabilities(tmp_path):
+    """宿主 chat.* 全不可用时，白名单仍要能取材（v1.3.8，真机实录）。
+
+    真机 2026-09-30 10:18 实录：
+        get_stream_by_group_id→None
+        get_group_streams→异常（RPCError）
+        get_all_streams→异常（RPCError）
+    三条路全断，于是三天日记全空。兜底改为「拉当天全库 + 插件内按会话过滤」——
+    **必须只取目标会话**，不能把别的群/私聊一起带进 prompt。
+    """
+    plugin = MOD.create_plugin()
+    host = FakeHost(returns={"message.get_by_time": make_messages(40)})
+    ctx = build_context("org.orge-8.better-diary", rpc_call=host.rpc_call)
+    plugin._set_context(ctx)
+    plugin._data_dir = lambda: tmp_path  # type: ignore[assignment]
+
+    class _ChatDead:
+        """完全复刻真机：主接口 None，两个列表接口 RPCError。"""
+
+        async def get_stream_by_group_id(self, group_id, platform="qq"):
+            return None
+
+        async def get_stream_by_user_id(self, user_id, platform="qq"):
+            return None
+
+        async def get_group_streams(self, platform="qq"):
+            raise RuntimeError("[E_RPC] RPCError")
+
+        async def get_all_streams(self, platform="qq"):
+            raise RuntimeError("[E_RPC] RPCError")
+
+    plugin.ctx.chat = _ChatDead()
+
+    # 全库当天记录：一个目标群 + 一个无关群 + 一个私聊
+    day_msgs = [
+        {"timestamp": "1759100000", "processed_plain_text": "目标群的话",
+         "message_info": {"group_info": {"group_id": "967779035"},
+                          "user_info": {"user_id": "1", "user_nickname": "A"}}},
+        {"timestamp": "1759100001", "processed_plain_text": "无关群的话",
+         "message_info": {"group_info": {"group_id": "111111"},
+                          "user_info": {"user_id": "2", "user_nickname": "B"}}},
+        {"timestamp": "1759100002", "processed_plain_text": "私聊的话",
+         "message_info": {"user_info": {"user_id": "3", "user_nickname": "C"}}},
+    ]
+
+    async def _all_day(*a, **k):
+        return {"success": True, "messages": day_msgs}
+
+    async def _no_conversation(*a, **k):
+        # 主路径用不了（会话解析不出来，也就没有会话级查询可用）→ 空
+        return {"success": True, "messages": []}
+
+    plugin.ctx.message = SimpleNamespace(
+        get_by_time=_all_day,
+        get_by_time_in_chat=_no_conversation,
+    )
+
+    cfg = get_default_config(MOD.BetterDiaryConfig)
+    cfg["diary"]["filter_mode"] = "whitelist"
+    cfg["diary"]["target_chats"] = ["group:967779035"]
+    cfg["schedule"]["enabled"] = False
+    plugin.set_plugin_config(cfg)
+
+    got = asyncio.run(plugin._fetch_messages(0.0, 1e12))
+    texts = [m.get("processed_plain_text") for m in got]
+    assert texts == ["目标群的话"], texts          # 只取目标群
+    assert "无关群的话" not in texts, texts         # 别的群不能混进来
+    assert "私聊的话" not in texts, texts           # 私聊更不能混进来
+    assert plugin._unresolved_targets == {}, plugin._unresolved_targets
+
+    # 兜底也拉不到该会话时，必须保留可执行提示（而不是静默变空）
+    async def _empty(*a, **k):
+        return {"success": True, "messages": []}
+
+    plugin.ctx.message = SimpleNamespace(
+        get_by_time=_empty, get_by_time_in_chat=lambda *a, **k: _empty())
+    plugin._unresolved_targets = {}
+    assert asyncio.run(plugin._fetch_messages(0.0, 1e12)) == []
+    assert "group:967779035" in plugin._unresolved_targets, plugin._unresolved_targets
+    assert "兜底" in plugin._unresolved_targets["group:967779035"], plugin._unresolved_targets
+    assert plugin._filter_diagnostic(0, 20) is not None
+
+
+def test_fallback_filter_does_not_leak_group_talk_into_private_target():
+    """兜底过滤必须区分「群消息」与「私聊」（v1.3.9 修）。
+
+    群里的话也带 `user_info.user_id`。若只看 user_id，`private:某QQ` 这个目标会把
+    **该用户在群里说的话** 当成他的私聊内容混进日记素材 —— 这是实打实的隐私泄漏
+    （白名单的意义就是"只取我指定的会话"）。
+    """
+    W = MOD._split_targets
+    in_group = {"message_info": {"group_info": {"group_id": "111"},
+                                 "user_info": {"user_id": "o02472005478"}}}
+    private = {"message_info": {"user_info": {"user_id": "2472005478"}}}
+
+    groups, users = W(["private:2472005478"])
+    assert MOD._match_filter_target(in_group, groups, users) is False   # 群里的话不算私聊
+    assert MOD._match_filter_target(private, groups, users) is True
+
+    groups, users = W(["group:111"])
+    assert MOD._match_filter_target(in_group, groups, users) is True
+    assert MOD._match_filter_target(private, groups, users) is False   # 私聊不算群里
+
+    # 群消息绝不能被私聊目标命中（反向也成立）
+    groups, users = W(["group:999"])
+    assert MOD._match_filter_target(in_group, groups, users) is False
+    # 无 message_info / 字段缺失时不崩、不误命中
+    assert MOD._match_filter_target({}, set(), {"1"}) is False
+    assert MOD._match_filter_target({"message_info": None}, {"1"}, set()) is False
+
+
+def test_qq_id_normalization_for_filtering():
+    """QQ 号归一化：群里 user_id 可能是 o0 前缀形态，直接字符串比会漏配/误配。"""
+    assert MOD._digits_only("o02472005478") == "2472005478"
+    assert MOD._digits_only("qq:2472005478") == "2472005478"
+    assert MOD._digits_only(" 2472005478 ") == "2472005478"
+    assert MOD._digits_only(None) == ""
+    # group:o111 也要能对上 group_id=111 的消息
+    groups, users = MOD._split_targets(["group:o111"])
+    assert "111" in groups
+    msg = {"message_info": {"group_info": {"group_id": 111}}}
+    assert MOD._match_filter_target(msg, groups, users) is True
+
+
+def test_describe_shape_never_leaks_values():
+    """诊断用的 _describe_shape 只打结构（类型/键名/长度），绝不打值。
+
+    返回值可能夹带聊天内容或凭据，而排查「解析不出 stream_id」只需要知道有哪些键。
+    """
+    shape = MOD._describe_shape({"unexpected_key": "SECRET_VALUE", "p_skey": "LEAK_ME"})
+    assert "unexpected_key" in shape
+    assert "SECRET_VALUE" not in shape, shape
+    assert "LEAK_ME" not in shape, shape
+    assert MOD._describe_shape(None) == "None"
+    assert "str" in MOD._describe_shape("x" * 40)
+    assert "dict" in MOD._describe_shape({"a": 1})
+
+
 def test_cooldown_blocks_repeat_triggers():
     """命令冷却：同一会话内不许反复触发（每次都会重调 LLM 并可能重新公开发布）。"""
     plugin = MOD.create_plugin()
@@ -741,6 +1086,8 @@ def _cfg_plugin(tmp_path, *, msgs=None, llm=None, **schedule):
     cfg["schedule"].update(schedule)
     if llm:
         cfg["llm"].update(llm)
+    # 同 build_plugin：这些用例关注成文/补跑链路，显式选 all 让消息流过过滤。
+    cfg["diary"]["filter_mode"] = "all"
     plugin.set_plugin_config(cfg)
     plugin._data_dir = lambda: tmp_path  # type: ignore[assignment]
     return plugin
@@ -873,6 +1220,183 @@ def test_write_retry_does_not_retry_non_timeout(tmp_path):
     with pytest.raises(ValueError):
         asyncio.run(plugin._call_llm_with_retry("p", 0.8, stage="日记成文"))
     assert len(calls) == 1
+
+
+def test_transient_host_io_error_is_retryable(tmp_path):
+    """宿主侧瞬时 I/O 故障（WinError 5 等）应当重试（v1.4.0）。
+
+    真机实录（2026-09-30 10:46）：Host 并发写 `llm_error/*.json` 时 rename 被拒 ——
+        [WinError 5] 拒绝访问。: '…\\xxx.json.tmp' -> '…\\xxx.json'
+    LLMService 把这当成生成失败抛出，插件看到
+        `选材分块失败（跳过本块）: LLM 调用失败: [WinError 5] 拒绝访问。…`
+    这类失败与模型无关、且明显瞬时，值得重试；不重试就白废一整块选材。
+    """
+    plugin = _cfg_plugin(tmp_path, llm={"write_retry": 1, "retry_backoff_seconds": 0})
+    calls: list[int] = []
+
+    async def flaky_io(prompt, temperature):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError(
+                "[WinError 5] 拒绝访问。: "
+                "'E:\\mai\\maibot\\logs\\maisaka_prompt\\llm_error\\system\\x.json.tmp' -> "
+                "'E:\\mai\\maibot\\logs\\maisaka_prompt\\llm_error\\system\\x.json'"
+            )
+        return "正文"
+
+    plugin._call_llm = flaky_io  # type: ignore[assignment]
+    assert asyncio.run(plugin._call_llm_with_retry("p", 0.8, stage="日记成文")) == "正文"
+    assert len(calls) == 2, "WinError 5 应触发一次重试"
+
+    # 其它常见瞬时形态
+    for text in ("[Errno 13] Permission denied", "EBUSY: resource busy",
+                 "另一个程序正在使用此文件", "WinError 32"):
+        assert plugin._is_transient_io_error(OSError(text)) is True, text
+    # 不能把语义/格式类误判成瞬时
+    for text in ("JSON 解析失败", "内容不合规", "模型返回为空"):
+        assert plugin._is_transient_io_error(ValueError(text)) is False, text
+        assert plugin._is_retryable_llm_error(ValueError(text)) is False, text
+
+
+def test_extract_retries_when_single_chunk(tmp_path):
+    """单块选材也走重试（v1.4.0）——此前选材阶段完全没有重试。"""
+    plugin = _cfg_plugin(tmp_path, msgs=make_messages(40),
+                         llm={"write_retry": 1, "retry_backoff_seconds": 0,
+                              "extract_temperature": 0.2})
+    plugin.set_plugin_config({**MOD.BetterDiaryConfig().model_dump(),
+                              "diary": {"filter_mode": "all", "chunk_chars": 100000,
+                                        "max_chunks": 8, "min_messages": 1},
+                              "llm": {"write_retry": 1, "retry_backoff_seconds": 0}})
+    calls: list[int] = []
+
+    async def flaky_extract(prompt, temperature):
+        calls.append(1)
+        if len(calls) == 1:
+            raise _timeout_exc()
+        return '[{"who": "甲", "what": "有件事", "quote": "原话", "score": 4}]'
+
+    plugin._call_llm = flaky_extract  # type: ignore[assignment]
+    events = asyncio.run(plugin._extract_events("很短的时间线", "2026-09-26"))
+    assert len(calls) == 2, f"单块选材应重试一次，实际调用 {len(calls)} 次"
+    assert events and events[0]["what"] == "有件事", events
+
+
+def test_corrupt_archive_is_logged_and_recovered_from_backup(tmp_path, caplog):
+    """坏存档不再静默判空（v1.4.1）。
+
+    真机现场：`/日记查看 2026-09-29` 报「没有存档」，而用户手里那份 diaries.json
+    明明有 4 条。旧实现 `except (JSONDecodeError, OSError): return {}` 会把
+    **一份存了多天的日记整体当成空**，且不写任何日志 —— 故障完全隐形。
+    """
+    plugin = MOD.create_plugin()
+    ctx = build_context("org.orge-8.better-diary", rpc_call=FakeHost().rpc_call)
+    plugin._set_context(ctx)
+    plugin._data_dir = lambda: tmp_path  # type: ignore[assignment]
+    store = tmp_path / "diaries.json"
+    good = {"2026-09-29": {"content": "九月二十九的日记", "word_count": 9,
+                           "generated_at": "2026-09-30 06:56:00"}}
+
+    # 1) 主文件坏了 + 有备份 → 必须记 ERROR 并从备份恢复
+    (tmp_path / "diaries.json.bak").write_text(
+        json.dumps(good, ensure_ascii=False), encoding="utf-8")
+    store.write_text('{"2026-09-29": {"content": "被截断的', encoding="utf-8")
+    with caplog.at_level("ERROR"):
+        data = plugin._load_diaries()
+    assert "2026-09-29" in data, f"应能从 .bak 恢复，实际 {data}"
+    assert any("日记存档损坏" in r.getMessage() for r in caplog.records), \
+        [r.getMessage() for r in caplog.records]
+
+    # 2) 坏文件 + 没有备份 → 仍要记 ERROR（不能静默）
+    caplog.clear()
+    (tmp_path / "diaries.json.bak").unlink()
+    with caplog.at_level("ERROR"):
+        assert plugin._load_diaries() == {}
+    assert any("备份也无可用的存档" in r.getMessage() for r in caplog.records), \
+        [r.getMessage() for r in caplog.records]
+
+    # 3) 主文件正常时不得打这些 ERROR
+    caplog.clear()
+    store.write_text(json.dumps(good, ensure_ascii=False), encoding="utf-8")
+    with caplog.at_level("ERROR"):
+        assert plugin._load_diaries() == good
+    assert not [r for r in caplog.records if "存档损坏" in r.getMessage()]
+
+
+def test_save_diary_keeps_backup_before_overwrite(tmp_path):
+    """写盘前先留一份 `.bak` —— 这是"坏文件能恢复"的前提（v1.4.1）。"""
+    plugin = MOD.create_plugin()
+    ctx = build_context("org.orge-8.better-diary", rpc_call=FakeHost().rpc_call)
+    plugin._set_context(ctx)
+    plugin._data_dir = lambda: tmp_path  # type: ignore[assignment]
+    store = tmp_path / "diaries.json"
+
+    # 先放一份"历史存档"
+    first = {"2026-09-29": {"content": "第一天的日记", "word_count": 6}}
+    store.write_text(json.dumps(first, ensure_ascii=False), encoding="utf-8")
+
+    plugin._save_diary("2026-09-30", "第二天的日记", {"total": 1})
+    data = json.loads(store.read_text(encoding="utf-8"))
+    assert set(data) == {"2026-09-29", "2026-09-30"}
+    bak = tmp_path / "diaries.json.bak"
+    assert bak.exists(), "写盘前必须留下备份"
+    assert "2026-09-29" in json.loads(bak.read_text(encoding="utf-8")), \
+        "备份里应含覆盖前的内容"
+
+
+def test_legacy_id_data_dir_is_detected(tmp_path, caplog):
+    """改过插件 ID 时，旧数据目录必须被检出来并告警（v1.4.1）。
+
+    宿主按 {插件ID} 分配 data/plugins/<id>/ —— 本插件 v1.3.4 改了 id，
+    于是换了一个全新的空目录，旧日记全留在旧目录里。
+    """
+    plugins_root = tmp_path / "plugins"
+    mine = plugins_root / "org.orge-8.better-diary"
+    old = plugins_root / "org.civetc.better-diary"
+    mine.mkdir(parents=True)
+    old.mkdir(parents=True)
+    (old / "diaries.json").write_text(
+        json.dumps({"2026-09-29": {"content": "旧目录里的日记", "word_count": 8}},
+                   ensure_ascii=False),
+        encoding="utf-8")
+
+    plugin = MOD.create_plugin()
+    ctx = build_context("org.orge-8.better-diary", rpc_call=FakeHost().rpc_call)
+    plugin._set_context(ctx)
+    plugin._data_dir = lambda: mine  # type: ignore[assignment]
+
+    found = plugin._find_legacy_data_dirs()
+    assert found == ["org.civetc.better-diary"], found
+
+    # 当前目录为空 → 必须 WARNING，且提示要能指导手工迁移
+    with caplog.at_level("WARNING"):
+        plugin._warn_legacy_data_dirs()
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("旧插件 ID" in m and "org.civetc.better-diary" in m for m in msgs), msgs
+    assert any("手工" in m or "拷" in m for m in msgs), msgs
+
+    # 只做元数据判断：不读别人的文件内容
+    import inspect as _inspect
+    src = _inspect.getsource(plugin._find_legacy_data_dirs)
+    assert "st_size" in src and "_read_diary_file" not in src, \
+        "旧 ID 检测不得读取内容（审核口径里读兄弟插件文件属越界）"
+
+    # 空存档的同级目录不该被当成"旧数据目录"
+    empty_sib = plugins_root / "some-other-plugin"
+    empty_sib.mkdir()
+    (empty_sib / "diaries.json").write_text("{}", encoding="utf-8")
+    assert plugin._find_legacy_data_dirs() == ["org.civetc.better-diary"], \
+        plugin._find_legacy_data_dirs()
+
+    # 当前目录已有内容 → 不再刷 WARNING（避免每次启动都吵）
+    caplog.clear()
+    (mine / "diaries.json").write_text(
+        json.dumps({"2026-09-30": {"content": "新目录的日记", "word_count": 8}},
+                   ensure_ascii=False),
+        encoding="utf-8")
+    with caplog.at_level("WARNING"):
+        plugin._warn_legacy_data_dirs()
+    assert not [r for r in caplog.records if "旧插件 ID" in r.getMessage()], \
+        [r.getMessage() for r in caplog.records]
 
 
 def test_write_retry_gives_up_after_configured_attempts(tmp_path):

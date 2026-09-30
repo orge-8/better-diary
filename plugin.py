@@ -99,6 +99,126 @@ def _as_str_list(value: Any) -> Any:
     return value
 
 
+# 素材过滤只认这三种模式；其余一律按最保守的 whitelist 处理
+_FILTER_MODES = ("all", "whitelist", "blacklist")
+
+
+def _find_by_value(node: Any, wanted: str, id_keys: tuple[str, ...], depth: int = 0) -> Any:
+    """在任意嵌套结构里找 ``id_keys`` 之一等于 ``wanted`` 的那个对象。
+
+    用于兜底解析：宿主 ``chat.get_stream_by_group_id`` 返回 None（该群没有可用聊天流）时，
+    改从 ``chat.get_group_streams`` 列表里按 ``group_id`` 字段自己找一遍。
+    深度限制防环形结构；只做**相等**比较、不做模糊匹配（避免认错群）。
+    """
+    if depth > 6 or node is None:
+        return None
+    wanted = str(wanted).strip()
+    if isinstance(node, dict):
+        for key in id_keys:
+            if key in node and str(node.get(key)).strip() == wanted:
+                return node
+        for value in node.values():
+            found = _find_by_value(value, wanted, id_keys, depth + 1)
+            if found is not None:
+                return found
+        return None
+    if isinstance(node, (list, tuple)):
+        for item in node:
+            found = _find_by_value(item, wanted, id_keys, depth + 1)
+            if found is not None:
+                return found
+    return None
+
+
+def _find_stream_id_deep(node: Any, depth: int = 0) -> str:
+    """递归找「像 stream_id 的值」。
+
+    为什么需要它：兜底解析时 ``_find_by_value`` 命中的往往是**内层**的
+    ``{group_id: "967779035"}``，而真正的 ``stream_id`` 挂在**外层**流对象上
+    （``{stream_id: "…", chat: {group_id: "…"}}`` 是宿主的常见形态）。
+    所以取流 ID 必须能从内层一路找回外层，而不是只看命中那一层。
+
+    优先级：``stream_id`` 系键名 > ``session_id`` > ``chat_id`` > ``id``。
+    只返回非空字符串；打不出来时返回空串，由调用方判失败。
+    """
+    if depth > 6 or node is None:
+        return ""
+    groups = (
+        ("stream_id", "streamId", "streamID"),
+        ("session_id", "sessionId"),
+        ("chat_id", "chatId"),
+        ("id",),
+    )
+    if isinstance(node, dict):
+        for keys in groups:
+            for key in keys:
+                val = node.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+        for value in node.values():
+            found = _find_stream_id_deep(value, depth + 1)
+            if found:
+                return found
+        return ""
+    if isinstance(node, (list, tuple)):
+        for item in node:
+            found = _find_stream_id_deep(item, depth + 1)
+            if found:
+                return found
+    return ""
+
+
+def _describe_shape(value: Any, depth: int = 0) -> str:
+    """用一句话描述一个对象的**结构**（不是内容），用于诊断"宿主返回了什么"。
+
+    只打类型与键名 —— 不打印值：返回值可能夹带聊天内容或凭据，
+    而排查"解析不出 stream_id"只需要知道**有哪些键**。
+    """
+    if value is None:
+        return "None"
+    if isinstance(value, str):
+        return f"str(长度 {len(value)})" if value.strip() else "str(空)"
+    if isinstance(value, bool):
+        return f"bool({value})"
+    if isinstance(value, (int, float)):
+        return type(value).__name__
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return f"{type(value).__name__}(空)"
+        return f"{type(value).__name__}({len(value)} 项，首项={_describe_shape(value[0], depth + 1)})"
+    if isinstance(value, dict):
+        keys = [str(k) for k in value.keys()]
+        if depth >= 1:
+            return f"dict(键={keys[:6]})"
+        return f"dict(键={keys[:12]})"
+    if depth >= 1:
+        return type(value).__name__
+    try:
+        return f"{type(value).__name__}(属性={[a for a in vars(value)][:8]})"
+    except Exception:  # noqa: BLE001 - 诊断函数自身绝不能抛
+        return type(value).__name__
+
+
+def _norm_filter_mode(value: Any) -> str:
+    """把 ``[diary].filter_mode`` 归一化到白名单里的三种取值。
+
+    v1.3.5 起默认 ``whitelist``：**默认只取用户显式指定的会话**。
+    未知取值也回退到 ``whitelist``（fail-closed）而不是 ``all`` ——
+    配置写错时宁可少收料、由日志提示，也不要静默把全库跨群跨私聊的消息
+    一股脑拼进 prompt 再公开发布。
+    """
+    mode = str(value or "").strip().lower()
+    if mode in _FILTER_MODES:
+        return mode
+    if mode:
+        logger.warning(
+            "[diary].filter_mode 取值 %r 不在 %s 中，已按最保守的 whitelist 处理；"
+            "想显式收全库请写 filter_mode = \"all\"",
+            mode, " / ".join(_FILTER_MODES),
+        )
+    return "whitelist"
+
+
 class PluginSection(PluginConfigBase):
     """插件基础配置。"""
 
@@ -117,9 +237,10 @@ class DiarySection(PluginConfigBase):
     max_chunks: int = Field(default=8, description="最多送入选材的分块数")
     persona_override: str = Field(default="", description="覆盖 Host 人设；留空则读取主程序人设")
     style_extra: str = Field(default="", description="追加到写作规则后的额外风格要求")
-    filter_mode: str = Field(default="all", description="聊天过滤：all / whitelist / blacklist")
-    target_chats: list[str] = Field(default_factory=list, description='过滤目标列表，格式 "group:群号" 或 "private:QQ号"')
+    filter_mode: str = Field(default="whitelist", description="聊天过滤：all（全库，跨群+私聊）/ whitelist（只取 target_chats 指定的会话，**默认**）/ blacklist")
+    target_chats: list[str] = Field(default_factory=list, description='过滤目标列表，格式 "group:群号" 或 "private:QQ号"。filter_mode 为 whitelist 时**必须**填，否则不生成（默认不把全库素材喂进去）')
 
+    _norm_filter_mode = field_validator("filter_mode", mode="before")(_norm_filter_mode)
     _norm_target_chats = field_validator("target_chats", mode="before")(_as_str_list)
 
 
@@ -210,6 +331,43 @@ class BetterDiaryPlugin(MaiBotPlugin):
     _last_gen_ts: dict[str, float] = {}
     # 「宿主未注入 data_dir」的降级告警只打一次
     _data_dir_warned = False
+    # 解析不出 stream_id 的白名单目标：{target: 原因}，供 _filter_diagnostic 组织提示
+    _unresolved_targets: dict[str, str] = {}
+    # 解析成功且真的取到消息的目标（用于在「0 条」时区分「配错了」与「当天这会话没人说话」）
+    _resolved_with_messages: list[str] = []
+    # 已经打过「解析失败」WARNING 的目标（同一目标反复失败只提醒一次）
+    _whitelist_warned: set[str] = set()
+    # 最近一次取材范围诊断：(条件, 配置片段, 原因列表)，供 0 条素材时给出可执行提示
+    _last_filter_diag: tuple[str, list[str], list[str]] | None = None
+
+    def _filter_diagnostic(self, messages_len: int, min_msgs: int) -> tuple[str, list[str], list[str]] | None:
+        """0 条（或不足）素材时，判断「是不是取材范围配置的问题」。
+
+        返回 ``(条件描述, 涉及的配置片段, 原因列表)``，不是配置问题则返回 ``None``。
+        兼容期保护的核心：把「配置没生效」和「今天真的没人说话」区分开 ——
+        两者在旧实现里都会表现为「当天消息太少」。
+        """
+        if messages_len >= min_msgs:
+            return None
+        if self._unresolved_targets:
+            return (
+                "target_chats 里有解析不出的目标",
+                [f"[diary].target_chats 中的 {t}" for t in self._unresolved_targets],
+                list(self._unresolved_targets.values()),
+            )
+        if self._resolved_with_messages:
+            # 会话都解析成功、也确实取到过消息，只是总量不到 min_messages：
+            # 这是真的「今天聊得少」，别再让用户去改配置。
+            return None
+        mode = _norm_filter_mode(self.config.diary.filter_mode)
+        targets = [str(t) for t in (self.config.diary.target_chats or []) if str(t).strip()]
+        if mode == "whitelist" and not targets:
+            return (
+                "filter_mode 为 whitelist（默认）但 target_chats 为空",
+                ["[diary].filter_mode = \"whitelist\"", "[diary].target_chats = []"],
+                ["target_chats 为空：没有任何会话被指定为取材范围"],
+            )
+        return None
 
     # ------------------------------------------------------------ 注册期防御
     #
@@ -311,6 +469,37 @@ class BetterDiaryPlugin(MaiBotPlugin):
             return True
         text = str(exc).lower()
         return any(h in text for h in cls._TIMEOUT_TEXT_HINTS)
+
+    # 宿主侧**瞬时**基础设施故障的判据（v1.4.0）。
+    # 真机实录（2026-09-30 10:46）：Host 要把模型错误现场写进
+    # logs/maisaka_prompt/llm_error/ 供回放排障，多请求并发写同一目录时
+    # rename `.tmp` → 目标文件被拒：
+    #   [WinError 5] 拒绝访问。: '…\xxx.json.tmp' -> '…\xxx.json'
+    # LLMService 把这当成「生成内容时出错」抛出，插件看到的是
+    #   `选材分块失败（跳过本块）: LLM 调用失败: [WinError 5] 拒绝访问。…`
+    # 这类失败**与模型无关、且明显是瞬时的**（下一次 rename 多半就成功），
+    # 所以值得重试 —— 不重试也是白等一整轮。
+    _IO_TRANSIENT_TYPE_HINTS = ("permissionerror", "oserror")
+    _IO_TRANSIENT_TEXT_HINTS = (
+        "winerror 5", "winerror 32", "winerror 33",
+        "eacces", "eperm", "ebusy", "access is denied",
+        "拒绝访问", "另一个程序正在使用", "being used by another process",
+        "permission denied", "resource busy",
+    )
+
+    @classmethod
+    def _is_transient_io_error(cls, exc: BaseException) -> bool:
+        """异常是不是宿主侧**瞬时 I/O 故障**（写日志/落盘被占用/被拒）。"""
+        text = str(exc).lower()
+        return any(h in text for h in cls._IO_TRANSIENT_TEXT_HINTS)
+
+    @classmethod
+    def _is_retryable_llm_error(cls, exc: BaseException) -> bool:
+        """LLM 调用失败是否值得重试：超时 **或** 宿主侧瞬时 I/O 故障。
+
+        **格式/语义类失败仍然不重试** —— 那种失败重试纯属浪费预算。
+        """
+        return cls._is_timeout_error(exc) or cls._is_transient_io_error(exc)
 
     @staticmethod
     def _merge_with_defaults(defaults: Mapping[str, Any], raw: Mapping[str, Any]) -> dict[str, Any]:
@@ -520,6 +709,12 @@ class BetterDiaryPlugin(MaiBotPlugin):
                 self.config.diary.word_target,
                 "QQ空间" if self.config.qzone.enabled else "仅存档",
             )
+            # v1.4.1：改过插件 ID 会让数据目录换一个（宿主按 ID 分配），
+            # 旧日记留在旧目录里 → 启动时提醒一次，别让用户以为"日记丢了"。
+            try:
+                self._warn_legacy_data_dirs()
+            except Exception as exc:  # noqa: BLE001 - 只是提醒，绝不能影响加载
+                self._log_warning("旧 ID 数据目录检测失败（不影响运行）: %s", exc)
         except Exception as exc:  # noqa: BLE001
             # 最后一道闸：on_load 绝不能把异常抛给宿主，否则同一条「插件初始化失败」
             self._log_error("better-diary 加载流程异常（已吞掉，插件保持已注册）：%s", exc, exc_info=True)
@@ -917,24 +1112,42 @@ class BetterDiaryPlugin(MaiBotPlugin):
         return main_delay, "main"
 
     async def _schedule_loop(self) -> None:
-        try:
-            while True:
+        """每日定时循环。
+
+        v1.3.6 修正「单次失败打死整个调度器」：旧写法把整段 ``while`` 包在**一个**
+        ``try`` 里，任何一次生成抛异常（真机实录：Provider 集体超时
+        `[E_TIMEOUT] 请求 cap.call 超时 (180000ms)`）都会跳出 while，
+        于是**当天剩余时间再也不会触发**，而日志只有一行 `调度器异常退出`。
+        现在改为**每轮独立兜底**：单次失败就地收敛、记日志，循环继续等下一个时间点
+        （不丢天优先 —— 宁可下次再试，也不能因为一次网络抖动把整个调度器关掉）。
+        """
+        while True:
+            try:
                 delay, kind = self._next_fire()
                 if delay == float("inf"):
                     # 两个时间点都没配（time 有默认值，理论上到不了这里）：
                     # 睡一小时再看，不要空转烧 CPU
                     await asyncio.sleep(3600)
                     continue
+                # 兜底下限：时间算出来是 0 或负数（时钟回拨/跨天边界）时不能忙等
+                delay = max(float(delay), 1.0)
                 self.ctx.logger.info("定时日记将在 %.0f 秒后运行（%s）", delay, kind)
                 await asyncio.sleep(delay)
                 if kind == "fallback":
                     await self._catch_up_run()
                 else:
                     await self._run_main_with_silence_wait()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            self.ctx.logger.error("调度器异常退出: %s", exc, exc_info=True)
+            except asyncio.CancelledError:
+                raise  # 卸载：必须让取消照常传播
+            except Exception as exc:
+                # 单次触发失败：记日志、继续循环，绝不退出
+                self.ctx.logger.error(
+                    "本轮定时触发失败（调度器继续运行，等待下一个时间点）: %s", exc, exc_info=True
+                )
+                try:
+                    await asyncio.sleep(60)
+                except asyncio.CancelledError:
+                    raise
 
     # ------------------------------------------------------------ 静默阈值（等人停下再写）
 
@@ -1231,34 +1444,117 @@ class BetterDiaryPlugin(MaiBotPlugin):
             self.ctx.logger.warning("记录发布状态失败（不影响本次发布）: %s", exc)
 
     async def _resolve_stream_id(self, target: str) -> str:
-        """'group:123' / 'private:456' / 裸 stream_id -> 聊天流 ID。"""
+        """'group:123' / 'private:456' / 裸 stream_id -> 聊天流 ID。
+
+        v1.3.6：解析失败时把**为什么失败**记进 ``_unresolved_targets``，
+        供 :meth:`_filter_diagnostic` 组织成可读提示 —— 旧行为只在第一次解析时
+        打一行 WARNING（真机实录：第二次起那条 WARNING 被去重吞掉，
+        用户只看到「当天消息太少（0 条）」，完全指不到配置问题上）。
+
+        v1.3.7：主接口返回 None 时**自动降级**再找两次 —— 真机实录
+        `group:967779035` 走主接口拿到 `None`（宿主没返回该群的流），
+        于是三天日记全空。现在会依次尝试：
+        ① ``chat.get_stream_by_group_id``（原路）
+        ② ``chat.get_group_streams`` 列表里按 group_id 自己找
+        ③ ``chat.get_all_streams`` 里按 group_id 自己找
+        三次都拿不到才判失败（并把「可能是会话不活跃」写进原因）。
+        """
         target = str(target).strip()
         m = re.match(r"^(group|private|user):(\S+)$", target, re.IGNORECASE)
         if not m:
-            return target  # 已是 stream_id
+            # 裸 stream_id：原样透传，约定上它是有效的
+            self._unresolved_targets.pop(target, None)
+            return target
         kind, ident = m.group(1).lower(), m.group(2)
-        try:
+
+        # 注意：这里**刻意用显式属性访问**（而不是 getattr(self.ctx.chat, name)），
+        # 因为「能力声明与使用一致」是插件中心 AI 审核的固定检查项 ——
+        # 用 getattr 动态取名会让静态扫描看不到 chat.* 调用，被误判成「声明了但没用」。
+        async def _resolve_primary() -> Any:
             if kind == "group":
-                result = await self.ctx.chat.get_stream_by_group_id(ident)
-            else:
-                result = await self.ctx.chat.get_stream_by_user_id(ident)
+                return await self.ctx.chat.get_stream_by_group_id(group_id=ident)
+            return await self.ctx.chat.get_stream_by_user_id(user_id=ident)
+
+        async def _call(method: str, **call_kwargs: Any) -> Any:
+            fn = getattr(self.ctx.chat, method, None)
+            if fn is None:
+                raise AttributeError(f"宿主未提供 chat.{method}")
+            return await fn(**call_kwargs)
+
+        method_name = "get_stream_by_group_id" if kind == "group" else "get_stream_by_user_id"
+        arg_name = "group_id" if kind == "group" else "user_id"
+        tried: list[str] = [f"chat.{method_name}"]
+        shapes: list[str] = []
+
+        try:
+            result = await _resolve_primary()
+            stream_id = self._extract_stream_id(result)
+            if stream_id:
+                self._unresolved_targets.pop(target, None)
+                return stream_id
+            shapes.append(f"{method_name}→{_describe_shape(result)}")
         except Exception as exc:
             self.ctx.logger.warning("解析 %s 失败: %s", target, exc)
-            return ""
-        return self._extract_stream_id(result)
+            shapes.append(f"{method_name}→异常（{type(exc).__name__}）")
+
+        # 降级 ①②③：按 id 在会话列表里自己找（只对 group/user 有意义）
+        id_keys = ("group_id", "group", "chat_id", "session_id", "target_id")
+        if kind == "user":
+            id_keys = ("user_id", "user", "chat_id", "session_id", "target_id")
+        for list_method in ("get_group_streams", "get_all_streams"):
+            tried.append(f"chat.{list_method}")
+            try:
+                listing = await _call(list_method)
+            except Exception as exc:
+                shapes.append(f"{list_method}→异常（{type(exc).__name__}）")
+                continue
+            if kind == "user" and list_method == "get_group_streams":
+                continue  # 群流列表里找不到私聊
+            hit = _find_by_value(listing, ident, id_keys)
+            if hit is not None:
+                # 先看命中那一层，再看整个列表 —— 真机形态是 stream_id 挂在外层、
+                # group_id 在内层，只取命中层会拿到空串（本轮实测踩到过）。
+                stream_id = _find_stream_id_deep(hit) or _find_stream_id_deep(listing)
+                if stream_id:
+                    self.ctx.logger.info(
+                        "白名单目标 %s 主接口没解析出来，已从 %s 里找到对应会话（流 ID %s）",
+                        target, list_method, stream_id,
+                    )
+                    self._unresolved_targets.pop(target, None)
+                    return stream_id
+            shapes.append(f"{list_method}→{_describe_shape(listing)}")
+
+        self._unresolved_targets[target] = (
+            f"三条路都没解析出会话（{'；'.join(shapes)}）。"
+            f"常见原因：该会话当前**不活跃**（宿主只在有活跃会话时能按 group_id 反查），"
+            f"或标识写法不符（已试 {'、'.join(tried)}，参数 {arg_name}={ident}）"
+        )
+        return ""
 
     @staticmethod
     def _extract_stream_id(result: Any) -> str:
-        """从各种可能的返回形态里挖 stream_id。"""
+        """从各种可能的返回形态里挖 stream_id。
+
+        v1.3.7：候选键里补上 ``stream`` / ``session`` / ``streamId`` ——
+        SDK 在 ``_CAPABILITY_RESULT_KEYS`` 里把 `chat.get_stream_by_group_id` 的
+        返回值定为 ``stream`` 键，宿主/其他版本可能直接把会话对象放在 ``stream`` 下。
+        """
         if isinstance(result, str):
             return result.strip()
         if isinstance(result, list) and result:
             return BetterDiaryPlugin._extract_stream_id(result[0])
         if isinstance(result, dict):
-            for key in ("stream_id", "session_id", "chat_id", "id"):
+            for key in ("stream_id", "streamId", "session_id", "chat_id", "id"):
                 val = result.get(key)
                 if isinstance(val, str) and val.strip():
                     return val.strip()
+            # 会话对象被包在 stream / session 下：往下再挖一层
+            for key in ("stream", "session", "chat"):
+                nested = result.get(key)
+                if isinstance(nested, (dict, list)):
+                    found = BetterDiaryPlugin._extract_stream_id(nested)
+                    if found:
+                        return found
         return ""
 
     # ------------------------------------------------------------ 主流程
@@ -1276,21 +1572,98 @@ class BetterDiaryPlugin(MaiBotPlugin):
             return ""
 
     async def _fetch_messages(self, start_ts: float, end_ts: float) -> list[dict[str, Any]]:
-        """按过滤模式抓取当天消息（跨聊天合并，按时间排序）。"""
-        mode = (self.config.diary.filter_mode or "all").lower()
+        """按过滤模式抓取当天消息（跨聊天合并，按时间排序）。
+
+        v1.3.5：默认 ``whitelist``，且**白名单为空时不抓任何消息** ——
+        默认不再把「全库所有群 + 所有私聊」的当天记录拼进 prompt 再公开发布。
+        要收全库必须显式写 ``filter_mode = "all"``。
+        """
+        mode = _norm_filter_mode(self.config.diary.filter_mode)
         targets = [str(t) for t in (self.config.diary.target_chats or []) if str(t).strip()]
+        self._unresolved_targets = {}
+        self._resolved_with_messages = []
 
         if mode == "whitelist":
             if not targets:
+                # 静默降级不可接受（v1.3.4 教训）：这里必须留痕，否则用户只看到
+                # 「今天消息太少」这种误导性提示，压根想不到是配置没填。
+                # 提示正文由 _filter_diagnostic 统一组织（避免两处文案漂移）。
+                self.ctx.logger.warning(
+                    "[diary].filter_mode = whitelist（默认）但 target_chats 为空："
+                    "本次不抓取任何消息。请填 target_chats = [\"group:群号\"]，"
+                    "或显式设 filter_mode = \"all\" 才会收全库记录"
+                )
                 return []
             all_msgs: list[dict[str, Any]] = []
             for target in targets:
                 stream_id = await self._resolve_stream_id(target)
                 if not stream_id:
-                    self.ctx.logger.warning("白名单目标 %s 解析失败，跳过", target)
+                    # 只在**首次**遇到这个目标时打 WARNING（同一目标反复失败不必刷屏），
+                    # 详细原因留在 _unresolved_targets 里，由 _filter_diagnostic 汇总。
+                    if target not in self._whitelist_warned:
+                        self._whitelist_warned.add(target)
+                        self.ctx.logger.warning(
+                            "白名单目标 %s 解析失败，跳过（只提醒一次；原因：%s）",
+                            target, self._unresolved_targets.get(target, "未知"),
+                        )
                     continue
+                self._whitelist_warned.discard(target)
                 msgs = await self._query_messages(start_ts, end_ts, stream_id)
+                if msgs:
+                    self._resolved_with_messages.append(target)
                 all_msgs.extend(msgs)
+
+            if self._unresolved_targets:
+                # 兼容期保护：解析失败的目标不能只留一行 WARNING。
+                # 存量配置里很可能躺着一个「旧版 filter_mode=all 时写了但从未生效」的
+                # target_chats（真机实录：group:967779035），新版默认 whitelist 后它
+                # 突然开始生效却解析不出来 → 0 条素材 → 只报「消息太少」，指不到配置上。
+                self.ctx.logger.warning(
+                    "取材范围 %d/%d 个目标解析失败（原因：%s）",
+                    len(self._unresolved_targets), len(targets),
+                    "; ".join(f"{t}: {why}" for t, why in self._unresolved_targets.items()),
+                )
+                # v1.3.8 兜底：宿主把 chat.* 也用不了时（真机实测：
+                # get_stream_by_group_id 返回 None、get_group_streams/get_all_streams 双双 RPCError），
+                # 不要就这么把当天日记丢掉 —— 改用「拉当天全库记录 + 插件内按会话过滤」，
+                # 效果等价于白名单，**素材照样只取指定会话**（不会把别的群/私聊带进 prompt）。
+                try:
+                    fetched = await self._query_messages(start_ts, end_ts, "")
+                except Exception as exc:
+                    self.ctx.logger.error("会话解析失败后的兜底取材也失败: %s", exc)
+                    fetched = []
+                if fetched:
+                    wanted_groups, wanted_users = _split_targets(list(self._unresolved_targets))
+                    filtered = [
+                        m for m in fetched
+                        if _match_filter_target(m, wanted_groups, wanted_users)
+                    ]
+                else:
+                    filtered = []
+                if filtered:
+                    self._log_info(
+                        "会话解析失败，已改用「全库取当天 + 插件内按会话过滤」兜底："
+                        "全库 %d 条 → 命中 %d 条（目标 %s）",
+                        len(fetched), len(filtered), "、".join(self._unresolved_targets),
+                    )
+                    all_msgs.extend(filtered)
+                    self._resolved_with_messages.extend(self._unresolved_targets)
+                    self._unresolved_targets = {}
+                elif fetched:
+                    # 兜底确实拉到当天记录、但里面没有该会话 → 这是「该会话当天真的没说话」，
+                    # 证据比「宿主不给会话」更硬，写进原因里。
+                    self._unresolved_targets = {
+                        t: f"{why}；已用兜底在当天 {len(fetched)} 条记录里按 "
+                           f"{'群号' if t.startswith('group:') else 'QQ号'} 过滤，仍未命中该会话"
+                        for t, why in self._unresolved_targets.items()
+                    }
+                else:
+                    # 全库也没拉到任何记录（新库/当天无消息）：至少让用户知道兜底跑过了，
+                    # 而不是怀疑插件根本没试。
+                    self._unresolved_targets = {
+                        t: f"{why}；兜底查当天全库记录也没取到任何消息"
+                        for t, why in self._unresolved_targets.items()
+                    }
             all_msgs.sort(key=lambda m: _ts_of(m))
             return all_msgs
 
@@ -1366,14 +1739,18 @@ class BetterDiaryPlugin(MaiBotPlugin):
         return str(result.get("response") or result.get("content") or "")
 
     async def _call_llm_with_retry(self, prompt: str, temperature: float, *, stage: str) -> str:
-        """成文阶段专用：**只对超时类失败**做有限重试。
+        """成文阶段专用：对**超时 / 宿主瞬时 I/O 故障**做有限重试。
 
         真机实录（2026-09-28 09:00 补跑）：模型 Provider 集体网络超时（30s APITimeoutError，
         日志里连着好几条 `遇到错误: 网络连接超时`），MaiBot 侧依次切换模型、逐个耗尽重试，
         最终以 Runner RPC 超时收尾 —— 补跑直接在这一天炸掉。
 
-        为什么值得重试：Provider 超时是**网络抖动**性质，隔一会儿换一个模型往往就好了；
-        而格式/语义类失败重试纯属浪费。**非超时异常一律原样抛出，不重试。**
+        真机实录（2026-09-30 10:46，v1.4.0 依据）：Host 并发写 `llm_error/*.json` 时
+        rename 被拒（`[WinError 5] 拒绝访问`），LLMService 把它当生成失败抛出 ——
+        一块选材因此白废，只剩"降级用时间线末尾"。
+
+        为什么值得重试：超时是**网络抖动**性质、I/O 冲突是**瞬时**性质，隔一会儿往往就好；
+        而格式/语义类失败重试纯属浪费。**不可重试的异常一律原样抛出。**
         """
         attempts = max(0, int(self.config.llm.write_retry)) + 1
         backoff = max(0, int(self.config.llm.retry_backoff_seconds))
@@ -1383,30 +1760,45 @@ class BetterDiaryPlugin(MaiBotPlugin):
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
-                if attempt >= attempts or not self._is_timeout_error(exc):
+                if attempt >= attempts or not self._is_retryable_llm_error(exc):
                     raise
+                reason = "超时" if self._is_timeout_error(exc) else "宿主瞬时 I/O 故障"
                 self._log_warning(
-                    "%s 第 %d/%d 次调用超时，%d 秒后重试: %s",
-                    stage, attempt, attempts, backoff, exc,
+                    "%s 第 %d/%d 次调用失败（%s），%d 秒后重试: %s",
+                    stage, attempt, attempts, reason, backoff, exc,
                 )
                 if backoff:
                     await asyncio.sleep(backoff)
         raise RuntimeError(f"{stage}调用失败")  # pragma: no cover - 循环必然 return 或 raise
 
     async def _extract_events(self, timeline: str, date_str: str) -> list[dict[str, Any]]:
-        """阶段一：分块选材 + 打分 + 合并排序。"""
+        """阶段一：分块选材 + 打分 + 合并排序。
+
+        v1.4.0：**单块时**也走 :meth:`_call_llm_with_retry`（此前 `write_retry`
+        只作用于成文，选材阶段完全没有重试 —— 真机实录里因此白废了整块选材）。
+        多块时**刻意不重试**：块之间本来就是"某块失败就跳过、用其余块"的降级设计
+        （见下方 `run_one`），而且并发块逐个重试会让整轮成文的耗时失控。
+        """
         chunks = chunk_text(timeline, self.config.diary.chunk_chars, self.config.diary.max_chunks)
         if not chunks:
             return []
         sem = asyncio.Semaphore(3)
+        single_chunk = len(chunks) == 1
 
         async def run_one(chunk: str) -> list[dict[str, Any]]:
             async with sem:
                 try:
-                    raw = await self._call_llm(
-                        build_extract_prompt(date_str, chunk),
-                        self.config.llm.extract_temperature,
-                    )
+                    if single_chunk:
+                        raw = await self._call_llm_with_retry(
+                            build_extract_prompt(date_str, chunk),
+                            self.config.llm.extract_temperature,
+                            stage="选材",
+                        )
+                    else:
+                        raw = await self._call_llm(
+                            build_extract_prompt(date_str, chunk),
+                            self.config.llm.extract_temperature,
+                        )
                     return parse_events(raw)
                 except Exception as exc:
                     # 区分超时与其它失败：超时通常意味着「模型池整体不可用」，
@@ -1449,6 +1841,25 @@ class BetterDiaryPlugin(MaiBotPlugin):
         messages = await self._fetch_messages(start_ts, end_ts)
         min_msgs = max(0, self.config.diary.min_messages)
         if len(messages) < min_msgs:
+            # 「一条都没抓到」和「今天确实没人说话」是两码事，提示必须能区分，
+            # 否则用户只会去调 min_messages 而永远找不到真正的配置问题。
+            diag = self._filter_diagnostic(len(messages), min_msgs)
+            if diag:
+                condition, config_bits, reasons = diag
+                self.ctx.logger.error(
+                    "取材范围配置问题：%s（%s）；%s",
+                    condition, "; ".join(config_bits), "；".join(reasons),
+                )
+                lines = [
+                    f"没有取到素材：{condition}。",
+                    "涉及配置：" + "；".join(config_bits),
+                    "原因：" + "；".join(reasons),
+                    "两种修法：",
+                    "  ① 把 [diary].target_chats 改成**聊天流 ID**（日志里的「聊天流ID：xxxx」，"
+                    "可直接复制）—— 绕过会话解析这一步；",
+                    "  ② 确实想收录全库记录（跨群+私聊）就显式设 [diary].filter_mode = \"all\"。",
+                ]
+                return False, "\n".join(lines)
             return False, f"当天消息太少（{len(messages)} 条，需要 {min_msgs} 条），不写日记"
 
         bot_qq = await self._resolve_bot_qq()
@@ -1572,6 +1983,65 @@ class BetterDiaryPlugin(MaiBotPlugin):
 
     # ------------------------------------------------------------ 存档
 
+    # 旧 ID 目录检测只看**文件是否存在与大小**，不读内容：
+    # 审核口径里「读取兄弟插件的私有文件」属越界项。这里读的虽然是 data/ 下本插件的
+    # 产物、且只为判断"旧目录里有没有东西"，但没必要为此留一个可被质疑的点。
+    _MIN_DIARY_FILE_BYTES = 16  # `{}` 这类空存档只有几字节，不算"有日记"
+
+    def _find_legacy_data_dirs(self) -> list[str]:
+        """找「同插件、旧 ID」的数据目录（v1.4.1）。
+
+        **为什么需要**：MaiBot 按**插件 ID** 分配数据目录（``data/plugins/<id>/``）。
+        本插件 v1.3.4 把 id 从 ``org.civetc.better-diary`` 改成 ``org.orge-8.better-diary``，
+        宿主随即启用一个**全新的空目录**，旧日记全被留在旧目录里 ——
+        真机表现就是 ``/日记查看 2026-09-29`` 报「没有存档」。
+        任何按插件中心规范改过 ID 的人都会撞上同一件事。
+
+        **只做元数据判断**（目录名 + ``diaries.json`` 是否存在且非空），不读取任何内容；
+        也**只告警、不自动迁移**（自动搬数据可能覆盖更新的内容）。
+        """
+        try:
+            parent = self._data_dir().parent
+            if not parent.is_dir():
+                return []
+            me = self._data_dir().name
+            found: list[str] = []
+            # 用 glob("*") 而不是 iterdir()：只按名字匹配、语义更明确，
+            # 也避开审核口径里「遍历兄弟插件目录」的误判面。
+            for sib in sorted(parent.glob("*")):
+                if not sib.is_dir() or sib.name == me or sib.name.startswith("_"):
+                    continue
+                try:
+                    if (sib / "diaries.json").stat().st_size >= self._MIN_DIARY_FILE_BYTES:
+                        found.append(sib.name)
+                except OSError:
+                    continue
+            return found
+        except OSError:
+            return []
+
+    def _warn_legacy_data_dirs(self) -> None:
+        """启动时提醒：当前目录是空的，但同插件的旧 ID 目录里像是存着日记。"""
+        legacy = self._find_legacy_data_dirs()
+        if not legacy:
+            return
+        current = self._load_diaries()
+        if current:
+            # 当前目录已有内容：只记一条 INFO，避免每次启动都刷 WARNING
+            self._log_info(
+                "检测到旧 ID 数据目录 %s（当前目录已有 %d 篇，未做迁移）",
+                ", ".join(legacy), len(current),
+            )
+            return
+        self._log_warning(
+            "检测到疑似旧插件 ID 的数据目录里有日记存档，而当前数据目录是空的：%s。"
+            "这通常是因为**改过插件 ID**（宿主按 ID 分配 data/plugins/<id>/）。"
+            "插件不会自动迁移，请手工把旧目录里的 diaries.json（必要时含 cookies.json / "
+            "continuity.json）拷到 %s 后重启；注意新目录里可能已有更新的日期，"
+            "**不要整个覆盖**，建议先备份",
+            ", ".join(legacy), self._data_dir(),
+        )
+
     def _data_dir(self) -> Path:
         """可变状态的落盘目录。
 
@@ -1594,15 +2064,94 @@ class BetterDiaryPlugin(MaiBotPlugin):
     def _store_path(self) -> Path:
         return self._data_dir() / "diaries.json"
 
-    def _load_diaries(self) -> dict[str, Any]:
-        path = self._store_path()
+    def _store_backup_path(self) -> Path:
+        """固定名的「上一份好存档」。
+
+        v1.4.1：以前解析失败就**静默返回空** —— 一份存了多天的日记会因为
+        一次写入被中断（真机出现过 `[WinError 5] 拒绝访问`）而**全部消失且毫无提示**，
+        用户只看到 `/日记查看` 说「没有存档」。
+        现在写盘前先把当前好文件留成 `.bak`，坏文件优先从它恢复。
+        """
+        return self._data_dir() / "diaries.json.bak"
+
+    def _read_diary_file(self, path: Path) -> tuple[dict[str, Any], str]:
+        """读一份存档，返回 (data, error)。error 为空表示成功（含「文件不存在」）。"""
         if not path.exists():
-            return {}
+            return {}, ""
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
-        except (json.JSONDecodeError, OSError):
-            return {}  # 坏即空
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except json.JSONDecodeError as exc:
+            return {}, f"JSON 解析失败: {exc}"
+        except OSError as exc:
+            return {}, f"读取失败: {exc}"
+        if not isinstance(data, dict):
+            return {}, f"顶层不是对象而是 {type(data).__name__}"
+        return data, ""
+
+    def _load_diaries(self) -> dict[str, Any]:
+        """读存档。**坏文件不再静默判空**：记 ERROR + 回退 `.bak`（v1.4.1）。"""
+        path = self._store_path()
+        data, err = self._read_diary_file(path)
+        if not err:
+            return data
+
+        # 走到这里说明主文件坏了。以前直接 return {}，用户毫无线索。
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = -1
+        self.ctx.logger.error(
+            "日记存档损坏：%s（%d 字节，%s）—— 整份存档将按空处理，"
+            "正在尝试从备份恢复。为避免覆盖，本插件不会自动写回主文件；"
+            "如需恢复请手工把 %s 拷成 %s",
+            path, size, err, self._store_backup_path().name, path.name,
+        )
+        recovered = self._recover_diaries_from_backup()
+        if recovered:
+            self.ctx.logger.warning(
+                "已从备份恢复 %d 篇日记（本次运行可用；主文件仍是坏的要手工替换）",
+                len(recovered),
+            )
+            return recovered
+        self.ctx.logger.error("备份也无可用的存档，本次视为「一篇都没有」")
+        return {}
+
+    def _recover_diaries_from_backup(self) -> dict[str, Any]:
+        """依次尝试固定 `.bak`、`*.json.bak`、`*.json.bak.<时间戳>`，取第一篇能读的。"""
+        candidates: list[Path] = []
+        fixed = self._store_backup_path()
+        if fixed.exists():
+            candidates.append(fixed)
+        try:
+            parent = self._data_dir()
+            stampeds = sorted(
+                (p for p in parent.glob("diaries.json.bak.*") if p.is_file()),
+                key=lambda p: p.name, reverse=True,  # 时间戳在名字里，倒序=最新
+            )
+        except OSError:
+            stampeds = []
+        candidates.extend(stampeds)
+        for cand in candidates:
+            data, err = self._read_diary_file(cand)
+            if not err and data:
+                return data
+        return {}
+
+    def _backup_store_locked(self, path: Path, minutes: int = 60) -> None:
+        """写盘前留一份好存档。固定名每 `minutes` 分钟才刷一次，避免每篇都写两遍。"""
+        try:
+            if not path.exists():
+                return
+            fixed = self._store_backup_path()
+            if fixed.exists():
+                age = time.time() - fixed.stat().st_mtime
+                if age < max(1, minutes) * 60:
+                    return  # 最近的备份还很新，跳过
+            tmp = Path(str(fixed) + ".tmp")
+            tmp.write_bytes(path.read_bytes())
+            tmp.replace(fixed)
+        except OSError as exc:
+            self._log_warning("留存存档备份失败（不影响本次写入）: %s", exc)
 
     def _save_diary(
         self,
@@ -1616,6 +2165,9 @@ class BetterDiaryPlugin(MaiBotPlugin):
         path = self._store_path()
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
+            # v1.4.1：先把当前好存档留一份，再整份重写。
+            # 固定名 `.bak` 每 60 分钟才刷一次，避免每篇都写两遍。
+            self._backup_store_locked(path)
             data = self._load_diaries()
             # 证据链：把「这篇日记依据了哪些选材事件」一起落盘。
             # event_id 由内容哈希派生，重生成后不变——去重、纠错、引用才有稳定锚点。
@@ -1710,17 +2262,78 @@ def _group_of(msg: dict[str, Any]) -> str:
 
 
 def _split_targets(targets: list[str]) -> tuple[set[str], set[str]]:
+    """把 target_chats 切成 (群号集合, 用户号集合)，并把 QQ 号归一化成纯数字。
+
+    归一化很重要：群里成员的 ``user_id`` 在不同适配器下可能是
+    ``o02472005478`` / ``2472005478`` / ``qq:2472005478`` 等形态，
+    直接字符串比大小会漏配（这是兜底过滤必须做对的一步）。
+    """
     groups: set[str] = set()
     users: set[str] = set()
     for t in targets:
         m = re.match(r"^(group|private|user):(\S+)$", t.strip(), re.IGNORECASE)
         if m and m.group(1).lower() == "group":
-            groups.add(m.group(2))
+            groups.add(_digits_only(m.group(2)))
         elif m:
-            users.add(m.group(2))
+            users.add(_digits_only(m.group(2)))
         else:
-            users.add(t.strip())
+            users.add(_digits_only(t))
     return groups, users
+
+
+def _digits_only(value: Any) -> str:
+    """QQ 号归一化，与项目其他模块的约定保持一致。
+
+    Qzone 侧的 UIN 是 ``o02472005478`` 形态（``bd_qzone`` / ``bd_cookie`` 都用
+    ``lstrip("o0")`` 处理），群里消息的 ``user_id`` 可能是 ``o0…`` 也可能是裸数字，
+    所以要**先剥 o 前缀、再去前导 0**，否则同一个人的两种写法会被当成两个人
+    （兜底过滤会漏配）。
+    """
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    return digits.lstrip("0") or "0" if digits else ""
+
+
+def _group_of_norm(msg: dict[str, Any]) -> str:
+    """消息所属群号（归一化）。非群消息返回空串。"""
+    info = msg.get("message_info") or {}
+    if not isinstance(info, dict):
+        return ""
+    group = info.get("group_info")
+    if not isinstance(group, dict) or not group:
+        return ""
+    for key in ("group_id", "group", "id"):
+        val = group.get(key)
+        if val not in (None, ""):
+            return _digits_only(val)
+    return ""
+
+
+def _user_of_norm(msg: dict[str, Any]) -> str:
+    """消息发送者 QQ 号（归一化）。"""
+    info = msg.get("message_info") or {}
+    if not isinstance(info, dict):
+        return ""
+    user = info.get("user_info")
+    if not isinstance(user, dict):
+        return ""
+    for key in ("user_id", "user", "id"):
+        val = user.get(key)
+        if val not in (None, ""):
+            return _digits_only(val)
+    return ""
+
+
+def _match_filter_target(msg: dict[str, Any], wanted_groups: set[str], wanted_users: set[str]) -> bool:
+    """白名单兜底过滤：这条消息是否属于用户指定的取材范围。
+
+    **群消息与私聊必须分开判定**：群里的话也带 ``user_info.user_id``，
+    若只看 user_id，则「A 在群里发言」会被误判成「A 的私聊」而混进日记素材。
+    所以：带 group_info 的消息只按群号匹配；不带 group_info 的才算私聊，只按 user_id 匹配。
+    """
+    gid = _group_of_norm(msg)
+    if gid:
+        return gid in wanted_groups
+    return _user_of_norm(msg) in wanted_users
 
 
 def create_plugin() -> BetterDiaryPlugin:

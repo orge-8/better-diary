@@ -411,6 +411,9 @@ print("NOHTTPX-LOAD-OK")
     check("admin_ids 默认空", cfg.security.admin_ids == [])
     check("target_chats 默认空 list", cfg.diary.target_chats == [])
     check("llm.task_name 默认 utils", cfg.llm.task_name == "utils")
+    check("filter_mode 默认 whitelist（v1.3.5 起不收全库）", cfg.diary.filter_mode == "whitelist")
+    check("allow_all_users 默认关闭", cfg.security.allow_all_users is False)
+    check("命令冷却默认 300 秒", cfg.security.command_cooldown_seconds == 300)
 
     print("\n[2] 组件注册与 pattern")
     commands = {}
@@ -492,7 +495,7 @@ print("NOHTTPX-LOAD-OK")
         plugin.set_plugin_config(
             {
                 "plugin": {"enabled": True, "config_version": "1.0.0"},
-                "diary": {"min_messages": 2},
+                "diary": {"min_messages": 2, "filter_mode": "all"},
                 "schedule": {"enabled": False},
                 "llm": {"timeout_seconds": 60},
                 "security": {"admin_ids": []},
@@ -517,7 +520,7 @@ print("NOHTTPX-LOAD-OK")
         plugin2.set_plugin_config(
             {
                 "plugin": {"enabled": True, "config_version": "1.0.0"},
-                "diary": {"min_messages": 999},
+                "diary": {"min_messages": 999, "filter_mode": "all"},
             }
         )
         ok2, reason = asyncio.run(plugin2._generate_for_date("2026-09-26"))
@@ -545,7 +548,7 @@ print("NOHTTPX-LOAD-OK")
                 except AttributeError:
                     pg._ctx = ctx_bad
                 pg.set_plugin_config({"plugin": {"enabled": True, "config_version": "1.0.0"},
-                                      "diary": {"min_messages": 2}, "schedule": {"enabled": False}})
+                                      "diary": {"min_messages": 2, "filter_mode": "all"}, "schedule": {"enabled": False}})
                 ok_bad, msg_bad = asyncio.run(pg._generate_for_date("2026-09-26"))
                 check(f"{label}不生成", ok_bad is False, f"{label} 竟通过：{msg_bad!r}")
             gate_store = gate_dir / "diaries.json"
@@ -555,6 +558,115 @@ print("NOHTTPX-LOAD-OK")
         check("含「无法」的正常句子不误判", bd.diary_output_problem(
             "2026年9月26日 星期六，多云。\n晚上听阿讲事，我一时无法理解他为什么那么想。") == "")
         check("空串判定为不可发布", bd.diary_output_problem("") == "输出为空")
+
+        print("\n[5c] 取材范围默认 whitelist（v1.3.5：默认不收全库）")
+        with tempfile.TemporaryDirectory() as td_scope:
+            scope_dir = Path(td_scope)
+            # 默认配置 + 假消息库：必须一条都不抓，且给出可执行的提示
+            ps = plugin_mod.create_plugin()
+            try:
+                ps.ctx = ctx
+            except AttributeError:
+                ps._ctx = ctx
+            ps.set_plugin_config({"plugin": {"enabled": True, "config_version": "1.0.0"},
+                                  "schedule": {"enabled": False}})
+            ps._data_dir = lambda: scope_dir  # type: ignore[assignment]
+            _fetched = asyncio.run(ps._fetch_messages(0.0, 1e12))
+            check("默认 whitelist + 空 target_chats 不抓任何消息", _fetched == [], str(len(_fetched)))
+
+            ok_s, why_s = asyncio.run(ps._generate_for_date("2026-09-26"))
+            check("默认配置不生成日记", ok_s is False, why_s)
+            check("提示指明是配置问题（不是「消息太少」）",
+                  "target_chats" in why_s and "太少" not in why_s, why_s)
+
+            # filter_mode = all 才收全库
+            ps.set_plugin_config({"plugin": {"enabled": True, "config_version": "1.0.0"},
+                                  "diary": {"filter_mode": "all", "min_messages": 2},
+                                  "schedule": {"enabled": False}})
+            _all_msgs = asyncio.run(ps._fetch_messages(0.0, 1e12))
+            check("显式 filter_mode=all 才收全库", len(_all_msgs) > 0, str(len(_all_msgs)))
+
+            # 未知取值回退 whitelist（fail-closed），不能静默变成 all
+            ps.set_plugin_config({"plugin": {"enabled": True, "config_version": "1.0.0"},
+                                  "diary": {"filter_mode": "b1acklist"},
+                                  "schedule": {"enabled": False}})
+            check("未知 filter_mode 回退 whitelist",
+                  ps.config.diary.filter_mode == "whitelist", ps.config.diary.filter_mode)
+            check("未知 filter_mode 不抓全库",
+                  asyncio.run(ps._fetch_messages(0.0, 1e12)) == [])
+
+            # 明确配了白名单就照常取（走 get_by_time_in_chat）
+            # 白名单要先经 chat.get_stream_by_group_id 解析出 stream_id，而 FakeCtx 没有
+            # chat 命名空间（解析失败会被跳过），所以这里换一个能解析出 stream_id 的 ctx。
+            # 参数名必须与实现一致：插件用 **kwargs 调用（group_id= / user_id=），
+            # 写成位置参数会 TypeError，于是"解析成功"这条路径根本没被覆盖到。
+            class _Chat:
+                async def get_stream_by_group_id(self, group_id, platform="qq"):
+                    return {"stream_id": "s_wl"}
+
+                async def get_stream_by_user_id(self, user_id, platform="qq"):
+                    return {"stream_id": "s_wl"}
+
+                async def get_group_streams(self, platform="qq"):
+                    return []
+
+                async def get_all_streams(self, platform="qq"):
+                    return []
+
+            async def _msgs_result():
+                return {"success": True, "messages": make_messages(1789507200.0)}
+
+            ps.ctx.chat = _Chat()
+            ps.ctx.message = SimpleNamespace(
+                get_by_time_in_chat=lambda *a, **k: _msgs_result(),
+                get_by_time=lambda *a, **k: _msgs_result(),
+            )
+            ps.set_plugin_config({"plugin": {"enabled": True, "config_version": "1.0.0"},
+                                  "diary": {"filter_mode": "whitelist",
+                                            "target_chats": ["group:123"]},
+                                  "schedule": {"enabled": False}})
+            _wl = asyncio.run(ps._fetch_messages(0.0, 1e12))
+            check("白名单命中时照常取材", len(_wl) > 0, str(len(_wl)))
+
+        print("\n[5d] 调度器不被单次失败打死（v1.3.6，真机实录驱动）")
+        # 真机 2026-09-29 22:54：Provider 集体超时把 _scheduled_run 抛穿，
+        # 旧写法把整个 while 包在一个 try 里 → 调度器直接退出，当天再也没触发。
+        with tempfile.TemporaryDirectory() as td_sched:
+            psch = plugin_mod.create_plugin()
+            try:
+                psch.ctx = ctx
+            except AttributeError:
+                psch._ctx = ctx
+            psch.set_plugin_config({"plugin": {"enabled": True, "config_version": "1.0.0"},
+                                    "schedule": {"enabled": False},
+                                    "security": {"admin_ids": ["888"]}})
+            psch._data_dir = lambda: Path(td_sched)  # type: ignore[assignment]
+
+            _fire = {"n": 0}
+
+            def _tick():
+                _fire["n"] += 1
+                if _fire["n"] == 1:
+                    return 0.01, "main"
+                # 第二步跳出 while：SystemExit 不是 Exception，_schedule_loop 不该吞它
+                raise SystemExit("测试：第二次进入循环即退出")
+
+            _boom_calls = {"n": 0}
+
+            async def _boom():
+                _boom_calls["n"] += 1
+                raise RuntimeError("[E_TIMEOUT] 请求 cap.call 超时 (180000ms)")
+
+            psch._next_fire = _tick  # type: ignore[assignment]
+            psch._run_main_with_silence_wait = _boom  # type: ignore[assignment]
+
+            _raised = False
+            try:
+                asyncio.run(psch._schedule_loop())
+            except SystemExit:
+                _raised = True
+            check("单次触发确实抛了异常（前置条件）", _boom_calls["n"] == 1, str(_boom_calls))
+            check("单次触发失败后调度循环继续（未退出）", _raised and _fire["n"] == 2, str(_fire))
 
         print("\n[6] 权限：fail-closed 与静默拒绝（v1.3.4 起默认不放行所有人）")
         plugin3 = plugin_mod.create_plugin()
@@ -980,7 +1092,7 @@ print("NOHTTPX-LOAD-OK")
             pc._ctx = ctx
         pc.set_plugin_config({
             "plugin": {"enabled": True, "config_version": "1.0.0"},
-            "diary": {"min_messages": 2},
+            "diary": {"min_messages": 2, "filter_mode": "all"},
             "schedule": {"enabled": False, "catch_up_enabled": True, "catch_up_days": 3},
         })
         pc._data_dir = lambda: catch_dir  # type: ignore[assignment]
@@ -1012,7 +1124,7 @@ print("NOHTTPX-LOAD-OK")
             pf._ctx = ctx
         pf.set_plugin_config({
             "plugin": {"enabled": True, "config_version": "1.0.0"},
-            "diary": {"min_messages": 2},
+            "diary": {"min_messages": 2, "filter_mode": "all"},
             "schedule": {"enabled": False},
             "security": {"admin_ids": []},
         })
