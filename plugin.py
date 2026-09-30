@@ -1187,21 +1187,68 @@ class BetterDiaryPlugin(MaiBotPlugin):
             )
             await asyncio.sleep(interval * 60)
 
+    async def _silence_scope_messages(self, start_ts: float, end_ts: float) -> list[dict[str, Any]]:
+        """按**取材范围**取最近消息，供静默检查用（v1.4.2）。
+
+        为什么不能直接用全库：v1.3.5 起默认 ``filter_mode = "whitelist"``，
+        取材只取 ``target_chats``；而静默检查原本查的是**全库** —— 于是
+        "等这个群安静下来再写"实际变成"等**整个 bot 所有会话**都安静下来"。
+        别的群/私聊一直在聊就会把当天日记一路推到 ``max_wait_hours`` 上限，
+        而那批消息**根本不会进日记**。作用域必须与取材一致。
+
+        规则：``whitelist`` 只看白名单会话（解析不出来时复用"全库 + 插件内过滤"兜底）；
+        ``all`` / ``blacklist`` 保持全库（这两种模式下看全库才是对的）。
+        """
+        size = await self._compute_filter_size()
+        if size > 1:
+            # 多会话/全库：多查几路只为判断"有没有新消息"，不值得，直接查全库
+            return await self._query_messages(start_ts, end_ts, "")
+
+        mode = _norm_filter_mode(self.config.diary.filter_mode)
+        targets = [str(t) for t in (self.config.diary.target_chats or []) if str(t).strip()]
+        if mode != "whitelist" or not targets:
+            return await self._query_messages(start_ts, end_ts, "")
+
+        collected: list[dict[str, Any]] = []
+        unresolved: list[str] = []
+        for target in targets:
+            stream_id = await self._resolve_stream_id(target)
+            if not stream_id:
+                unresolved.append(target)
+                continue
+            try:
+                collected.extend(await self._query_messages(start_ts, end_ts, stream_id))
+            except Exception:  # noqa: BLE001 - 单路失败不该让整次判定失败
+                unresolved.append(target)
+        if unresolved:
+            try:
+                fetched = await self._query_messages(start_ts, end_ts, "")
+            except Exception:  # noqa: BLE001
+                return collected
+            wanted_groups, wanted_users = _split_targets(unresolved)
+            collected.extend(
+                m for m in fetched if _match_filter_target(m, wanted_groups, wanted_users)
+            )
+        return collected
+
     async def _chat_is_quiet(self, minutes: int) -> bool:
-        """最近 ``minutes`` 分钟内是否没有任何新消息（全库）。
+        """最近 ``minutes`` 分钟内，**取材范围**里是否没有任何新消息。
 
         查询失败按「已静默」处理并留日志 —— 这是可选的体验增强，绝不能因为它
         挡住当天日记（不丢天优先）。
         """
         now = datetime.datetime.now()
         start = now - datetime.timedelta(minutes=max(1, minutes))
+        scope_label = self._filter_scope_label()
         try:
-            msgs = await self._query_messages(start.timestamp(), now.timestamp(), "")
+            msgs = await self._silence_scope_messages(start.timestamp(), now.timestamp())
         except Exception as exc:  # noqa: BLE001
             self._log_warning("静默检查失败（按已静默处理，照常生成）: %s", exc)
             return True
         if msgs:
-            self.ctx.logger.info("静默检查：最近 %d 分钟内还有 %d 条新消息", minutes, len(msgs))
+            self.ctx.logger.info(
+                "静默检查（%s）：最近 %d 分钟内还有 %d 条新消息", scope_label, minutes, len(msgs)
+            )
             return False
         return True
 
@@ -1677,6 +1724,26 @@ class BetterDiaryPlugin(MaiBotPlugin):
             ]
         msgs.sort(key=lambda m: _ts_of(m))
         return msgs
+
+    async def _compute_filter_size(self) -> int:
+        """取材范围涉及的会话数（0 = 未指定）。
+
+        v1.4.2：给静默检查用 —— 只有"**单一会话**的白名单"才值得按会话精确查询，
+        多会话或全库模式下逐个查一遍纯属浪费，不如直接查全库。
+        """
+        mode = _norm_filter_mode(self.config.diary.filter_mode)
+        targets = [str(t) for t in (self.config.diary.target_chats or []) if str(t).strip()]
+        if mode == "whitelist":
+            return len(targets)
+        return 999  # all / blacklist：按"全库"处理
+
+    def _filter_scope_label(self) -> str:
+        """静默检查的作用域说明（写进日志，避免用户以为它在看全库）。"""
+        mode = _norm_filter_mode(self.config.diary.filter_mode)
+        targets = [str(t) for t in (self.config.diary.target_chats or []) if str(t).strip()]
+        if mode == "whitelist" and targets:
+            return f"取材范围 {'、'.join(targets)}"
+        return f"全库（filter_mode={mode}）"
 
     async def _query_messages(self, start_ts: float, end_ts: float, chat_id: str) -> list[dict[str, Any]]:
         kwargs: dict[str, Any] = {

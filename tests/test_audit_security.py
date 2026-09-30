@@ -1399,6 +1399,99 @@ def test_legacy_id_data_dir_is_detected(tmp_path, caplog):
         [r.getMessage() for r in caplog.records]
 
 
+def test_silence_check_is_scoped_to_filter_range(tmp_path):
+    """静默检查必须跟随取材范围（v1.4.2）。
+
+    v1.3.5 起默认取白名单，但静默检查查的是**全库** —— 于是"等这个群安静下来再写"
+    实际变成"等整个 bot 所有会话都安静下来"。别的群/私聊一直在聊，就会把当天日记
+    一路推到 max_wait_hours 上限，而那批消息**根本不会进日记**。
+    """
+    plugin = MOD.create_plugin()
+    host = FakeHost()
+    ctx = build_context("org.orge-8.better-diary", rpc_call=host.rpc_call)
+    plugin._set_context(ctx)
+    plugin._data_dir = lambda: tmp_path  # type: ignore[assignment]
+
+    target_group = "967779035"
+    other_group = "111111"
+
+    def mk(ts, text, gid):
+        return {"timestamp": str(ts), "processed_plain_text": text,
+                "message_info": {"group_info": {"group_id": gid},
+                                 "user_info": {"user_id": "1", "user_nickname": "A"}}}
+
+    # 目标群安静，别的群在聊
+    other_only = [mk(1759100000, "别的群在聊", other_group)]
+
+    async def all_day(*a, **k):
+        return {"success": True, "messages": other_only}
+
+    async def target_chat(chat_id, start, end, **k):
+        return {"success": True, "messages": []}  # 目标群没有新消息
+
+    plugin.ctx.message = SimpleNamespace(get_by_time=all_day, get_by_time_in_chat=target_chat)
+
+    # 白名单指向目标群，且能解析出 stream_id
+    class _Chat:
+        async def get_stream_by_group_id(self, group_id, platform="qq"):
+            return {"stream_id": "s_target"}
+
+        async def get_stream_by_user_id(self, user_id, platform="qq"):
+            return {"stream_id": "s_target"}
+
+        async def get_group_streams(self, platform="qq"):
+            return []
+
+        async def get_all_streams(self, platform="qq"):
+            return []
+
+    plugin.ctx.chat = _Chat()
+    cfg = get_default_config(MOD.BetterDiaryConfig)
+    cfg["diary"]["filter_mode"] = "whitelist"
+    cfg["diary"]["target_chats"] = [f"group:{target_group}"]
+    cfg["schedule"]["enabled"] = False
+    plugin.set_plugin_config(cfg)
+
+    assert asyncio.run(plugin._chat_is_quiet(5)) is True, \
+        "目标群安静就该判静默，别的群在聊不该阻断"
+    assert "取材范围" in plugin._filter_scope_label(), plugin._filter_scope_label()
+
+    # 目标群自己在聊 → 不静默
+    async def target_chat_busy(chat_id, start, end, **k):
+        return {"success": True, "messages": [mk(1759100001, "目标群在聊", target_group)]}
+
+    plugin.ctx.message = SimpleNamespace(get_by_time=all_day, get_by_time_in_chat=target_chat_busy)
+    assert asyncio.run(plugin._chat_is_quiet(5)) is False, "目标群在聊必须判未静默"
+
+    # 会话解析不出来（真机宿主的老问题）→ 兜底仍按取材范围过滤
+    class _ChatDead:
+        async def get_stream_by_group_id(self, group_id, platform="qq"):
+            return None
+
+        async def get_stream_by_user_id(self, user_id, platform="qq"):
+            return None
+
+        async def get_group_streams(self, platform="qq"):
+            raise RuntimeError("RPCError")
+
+        async def get_all_streams(self, platform="qq"):
+            raise RuntimeError("RPCError")
+
+    plugin.ctx.chat = _ChatDead()
+    plugin.ctx.message = SimpleNamespace(get_by_time=all_day, get_by_time_in_chat=target_chat_busy)
+    assert asyncio.run(plugin._chat_is_quiet(5)) is True, \
+        "兜底也要按取材范围判断：只有别的群在聊时仍算静默"
+
+    # all 模式：全库有消息 → 不静默（这种模式下看全库才是对的）
+    plugin.ctx.chat = _Chat()
+    cfg = get_default_config(MOD.BetterDiaryConfig)
+    cfg["diary"]["filter_mode"] = "all"
+    cfg["schedule"]["enabled"] = False
+    plugin.set_plugin_config(cfg)
+    assert asyncio.run(plugin._chat_is_quiet(5)) is False
+    assert "全库" in plugin._filter_scope_label(), plugin._filter_scope_label()
+
+
 def test_write_retry_gives_up_after_configured_attempts(tmp_path):
     """重试次数用完就抛，绝不无限重试。"""
     plugin = _cfg_plugin(tmp_path, llm={"write_retry": 2, "retry_backoff_seconds": 0})
