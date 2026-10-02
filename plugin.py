@@ -20,7 +20,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
 
-from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase
+from maibot_sdk import API, Command, Field, MaiBotPlugin, PluginConfigBase
 from pydantic import field_validator
 
 if __package__:  # 包式加载（Runner 真机：插件目录作为包，不在 sys.path 上）
@@ -31,6 +31,7 @@ if __package__:  # 包式加载（Runner 真机：插件目录作为包，不在
         build_write_prompt,
         chunk_text,
         date_display,
+        date_line_overridden,
         diary_output_problem,
         ensure_date_line,
         event_id,
@@ -51,6 +52,7 @@ else:  # 平铺兜底（脚本直跑 / 旧测试夹具）
         build_write_prompt,
         chunk_text,
         date_display,
+        date_line_overridden,
         diary_output_problem,
         ensure_date_line,
         event_id,
@@ -311,6 +313,57 @@ class BetterDiaryConfig(PluginConfigBase):
     qzone: QzoneSection = Field(default_factory=QzoneSection)
     llm: LLMSection = Field(default_factory=LLMSection)
     security: SecuritySection = Field(default_factory=SecuritySection)
+
+
+# ------------------------------------------------- 插件间 API 的纯工具
+
+#: 给其它插件看的摘要里，单条文本 / 名字的字符上限（够用，又不至于把 payload 撑大）
+_DIGEST_TEXT_LIMIT = 120
+_DIGEST_NAME_LIMIT = 32
+#: ``days`` 参数的上限。这是跨插件契约的一部分：改它要同步改 ``api_get_day_digest`` 的
+#: docstring 与 README 里的接口说明。
+_DIGEST_MAX_DAYS = 30
+#: ``meta`` / 跨天连续性里每个列表最多暴露几项
+_DIGEST_LIST_LIMIT = 8
+
+
+def _digest_clip(value: Any, limit: int) -> str:
+    """把任意值压成单行短文本；越界一律截断（只去空白，不改写内容）。
+
+    跨插件边界上不做任何「聪明」的清洗：调用方拿到什么就是什么，语义由本插件
+    （数据所有方）负责。截断是为了给调用方的提示词预算设一个硬上界。
+    """
+
+    text = " ".join(str(value or "").split())
+    if not text:
+        return ""
+    return text[:limit].rstrip() if limit > 0 else text
+
+
+def _digest_list(value: Any, limit: int = _DIGEST_LIST_LIMIT) -> list[str]:
+    """把 ``meta`` / 连续性里的列表压成「去重 + 截断」的短文本列表。"""
+
+    if not isinstance(value, (list, tuple)):
+        return []
+    out: list[str] = []
+    for item in value:
+        text = _digest_clip(item, _DIGEST_NAME_LIMIT)
+        if text and text not in out:
+            out.append(text)
+        if len(out) >= max(0, limit):
+            break
+    return out
+
+
+def _digest_int(value: Any, default: int) -> int:
+    """``int`` 的容错版：``None`` / 字符串 / bool 都不能让跨插件调用炸掉。"""
+
+    if isinstance(value, bool):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 # ---------------------------------------------------------------- 插件主体
@@ -985,6 +1038,118 @@ class BetterDiaryPlugin(MaiBotPlugin):
                     lines.append(f"- {label}：" + "、".join(values[:8]))
         await self._send_long("\n".join(lines), stream_id)
         return True, "", 2
+
+    # ---- API: 给其它插件读的只读选材摘要 ----
+
+    @API(
+        "get_day_digest",
+        description=(
+            "只读查询日记的选材摘要（谁、做了什么、原话、话题、还没了结的事），"
+            "供其它插件了解「这几天聊了什么」；不含日记正文，只读不写"
+        ),
+        version="1",
+        public=True,
+    )
+    async def api_get_day_digest(self, date: str = "", days: int = 1, **kwargs: Any) -> dict[str, Any]:
+        """对外暴露的**只读**选材摘要。
+
+        跨插件契约（改字段名或语义等于破坏兼容，需同时递增 ``version``）：
+
+        - **只读**：不生成日记、不调模型、不写盘、不改任何状态；读的是既有存档
+          （坏存档由 ``_load_diaries`` 自己记 ERROR 并回退 ``.bak``）。
+        - **不含日记正文**（``content``）、``published_at``、``model_date_line`` ——
+          那些是她的私密成品与内部留痕，其它插件没有理由读。
+        - 返回值是纯 dict（bool/int/str/None/list），可直接过 msgpack。
+        - **取不到任何一天也不抛异常**：返回 ``days: []`` + ``reason``，由调用方降级。
+        - ``date`` 留空 = 存档里最新的一天；``days`` 从那一天起最多往回取几天（1~30）。
+        - ``items`` 至多 ``[diary] max_events`` 条（默认 3），即「当天最值得写的几件」。
+          选材降级那天（``material_mode == "timeline_tail"``）``items`` 会是空的，
+          此时 ``meta`` 里的话题/人物仍在，调用方自行决定要不要用；
+          **不许由调用方臆造**。
+        """
+
+        try:
+            limit = max(1, min(_DIGEST_MAX_DAYS, _digest_int(days, 1)))
+            want = self._normalize_date(str(date or "").strip())
+            archive = self._load_diaries()
+            dates = sorted((d for d in archive if isinstance(d, str)), reverse=True)
+            if want:
+                dates = [d for d in dates if d <= want]
+            picked = [d for d in dates[:limit] if isinstance(archive.get(d), Mapping)]
+            return {
+                "schema_version": 1,
+                "count": len(picked),
+                "days": [
+                    self._digest_day(d, cast(Mapping[str, Any], archive[d])) for d in picked
+                ],
+                "continuity": self._digest_continuity(),
+                "reason": "" if picked else ("该日期之前没有存档" if want else "还没有任何日记存档"),
+            }
+        except Exception as exc:  # noqa: BLE001 —— 跨插件边界绝不抛
+            self.ctx.logger.error("get_day_digest 失败：%s", exc, exc_info=True)
+            return {
+                "schema_version": 1,
+                "count": 0,
+                "days": [],
+                "continuity": {},
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
+
+    def _digest_day(self, date_str: str, entry: Mapping[str, Any]) -> dict[str, Any]:
+        """一天的存档 → 给别的插件看的摘要条目（**只挑中性事实**）。"""
+
+        raw_events = entry.get("events")
+        items: list[dict[str, str]] = []
+        if isinstance(raw_events, list):
+            for event in raw_events:
+                if not isinstance(event, dict):
+                    continue
+                what = _digest_clip(event.get("what"), _DIGEST_TEXT_LIMIT)
+                if not what:
+                    continue  # 与 ``_save_diary`` 落盘时的过滤判据保持一致
+                items.append(
+                    {
+                        "event_id": _digest_clip(event.get("event_id"), 40),
+                        "who": _digest_clip(event.get("who"), _DIGEST_NAME_LIMIT),
+                        "what": what,
+                        "quote": _digest_clip(event.get("quote"), _DIGEST_TEXT_LIMIT),
+                    }
+                )
+        meta = entry.get("meta") if isinstance(entry.get("meta"), Mapping) else {}
+        return {
+            "date": date_str,
+            "generated_at": _digest_clip(entry.get("generated_at"), 32),
+            "material_mode": _digest_clip(entry.get("material_mode"), 24)
+            or ("events" if items else "timeline_tail"),
+            "items": items,
+            "meta": {
+                key: _digest_list(cast(Mapping[str, Any], meta).get(key))
+                for key in ("topics", "people", "projects", "unresolved")
+            },
+        }
+
+    def _digest_continuity(self) -> dict[str, Any]:
+        """跨天累积（best-effort）：读不到就返回空 dict，**绝不影响 ``days``**。
+
+        这里只暴露从聊天素材累积出来的摘要字段；``previous_summary`` 也是由选材
+        事件的 ``what`` 拼的，不含日记正文。
+        """
+
+        try:
+            state = self._load_continuity()
+        except Exception:  # noqa: BLE001 —— 连续性缺失只影响「延续感」
+            return {}
+        if not isinstance(state, Mapping):
+            return {}
+        source = cast(Mapping[str, Any], state)
+        return {
+            "previous_summary": _digest_clip(source.get("previous_summary"), 200),
+            "important_events": _digest_list(source.get("important_events")),
+            "ongoing_projects": _digest_list(source.get("ongoing_projects")),
+            "ongoing_topics": _digest_list(source.get("ongoing_topics")),
+            "unresolved_items": _digest_list(source.get("unresolved_items")),
+            "updated_at": _digest_clip(source.get("updated_at"), 32),
+        }
 
     # ------------------------------------------------------------ 权限
 
@@ -1995,6 +2160,16 @@ class BetterDiaryPlugin(MaiBotPlugin):
                 "日期行已规范化：模型原文 %r → %r",
                 _raw_first[:60], content.split("\n", 1)[0],
             )
+        # v1.4.3（折中方案）：成品永远只有一行**正确日期**的日期行，但模型原来写的是
+        # 哪一天不能就此消失 —— 落进存档 model_date_line，并在日志里点名（WARNING：
+        # 「模型写错日期」提示 prompt/补写基准可能有问题，不只是格式差异）。
+        # 覆盖两种真机形态：首行写错（就地改写）、首行对但第二行写错（折叠掉那一行）。
+        model_date_line = date_line_overridden(body, date_display(date_str))
+        if model_date_line:
+            self.ctx.logger.warning(
+                "模型写的日期行不是 %s，已去掉并统一为正确日期（原文记入存档 model_date_line）: %r",
+                date_str, model_date_line[:60],
+            )
         # 引用体检（非阻断，只留痕）：选材成文时才查——降级用时间线末尾时
         # 模型可以引用任意聊天原话，没有可比对的素材列表。
         if used_events:
@@ -2019,6 +2194,7 @@ class BetterDiaryPlugin(MaiBotPlugin):
         self._save_diary(
             date_str, content, stats,
             events=used_events, material_mode=material_mode, meta=meta,
+            model_date_line=model_date_line,
         )
         # 累积跨天连续性（纯累积 + 保序去重，不再额外调 LLM）
         if used_events or meta:
@@ -2228,6 +2404,7 @@ class BetterDiaryPlugin(MaiBotPlugin):
         events: list[dict[str, Any]] | None = None,
         material_mode: str = "",
         meta: dict[str, Any] | None = None,
+        model_date_line: str = "",
     ) -> None:
         path = self._store_path()
         try:
@@ -2255,6 +2432,9 @@ class BetterDiaryPlugin(MaiBotPlugin):
                 "material_mode": material_mode or ("events" if provenance else "timeline_tail"),
                 "meta": dict(meta or {}),
                 "published_at": str(prev.get("published_at") or ""),
+                # v1.4.3：成品里只有一行正确日期的日期行；模型原来写错的那一行
+                # 记在这里（空串表示模型写的就是当天/压根没写日期行）。
+                "model_date_line": str(model_date_line or prev.get("model_date_line") or ""),
             }
             tmp = path.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")

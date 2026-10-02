@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -110,11 +111,102 @@ def test_blank_lines_without_date_line_still_get_one():
     assert out.index("2026年9月28日") < out.index("睡前翻聊天记录")
 
 
-def test_other_date_is_not_treated_as_date_line():
-    """写的是**别的日期**时不算日期行 —— 仍然要在前面补目标日期行，不吞掉原文。"""
+def test_other_date_is_rewritten_not_kept_as_second_line():
+    """写的是**别的日期**时（v1.4.3 折中方案）：改写成目标日期行，不吞掉该行里的正文。
+
+    旧契约是"另补一行、原日期行原样留着" —— 真机实测那会在正文里留下**两行日期**，
+    读者看到的第一件事是日记写错了日子。
+    """
     out = _ensure("2026年9月27日 星期日，晴。\n睡前翻聊天记录。")
     assert out.startswith("2026年9月28日 星期一，"), out
-    assert "2026年9月27日 星期日，晴。" in out, "原日期行不该被丢掉"
+    assert "2026年9月27日" not in out, f"别的日期行不该留在正文里：{out!r}"
+    assert "睡前翻聊天记录。" in out, f"正文被吞掉了：{out!r}"
+    assert out.count("2026年9月28日") == 1, out
+    # 别的日子的天气（晴）不能被当成今天的天气
+    assert "晴" not in out.split("\n")[0], out
+
+
+def test_overridden_date_line_is_recoverable_for_archiving():
+    """被换掉的那一行必须能取回来（落进存档 model_date_line + 打日志）。
+
+    折中方案的关键：成品干净（只有一行正确日期），但**模型写错日期**这件事不静默 ——
+    它是提示「补写基准/prompt 有问题」的信号，不能只靠人翻日志。
+    """
+    raw = "2026年9月27日 星期日，晴。今天睡到中午才起。\n睡前翻聊天记录。"
+    out = BD.ensure_date_line(BD.strip_diary_output(raw), DATE)
+    got = BD.date_line_overridden(BD.strip_diary_output(raw), DATE)
+    assert got == "2026年9月27日 星期日，晴。今天睡到中午才起。", got
+    assert "2026年9月27日" not in out
+
+
+def test_second_line_other_date_is_collapsed_and_reported():
+    """真机 2026-09-28 的确切形态：**首行对、第二行写错**。
+
+    这是 v1.4.3 修的那个 bug —— 折叠循环只认目标日期就 `break`，于是第二行日期
+    原样留在正文里，成品出现两行日期。**这个形态此前完全没有用例**，所以把折叠逻辑
+    整个退回旧行为时测试全绿（反向验证时发现的假绿），这里补上：
+
+    1. 成品只留一行日期；
+    2. 被折叠掉的那一行要能被取回来报出去（否则「折叠了但没人知道」）。
+    """
+    raw = "2026年9月28日 星期一，多云。\n2026年9月27日 星期日，晴。\n睡前翻聊天记录。"
+    out = BD.ensure_date_line(raw, DATE)
+    assert out.count("2026年9月28日") == 1, out
+    assert "2026年9月27日" not in out, f"第二行日期没被折叠：{out!r}"
+    assert "睡前翻聊天记录。" in out
+    assert BD.date_line_overridden(raw, DATE) == "2026年9月27日 星期日，晴。"
+
+
+def test_second_line_same_date_keeps_body_and_reports_nothing():
+    """第二行是**同一天**（模型重复写）→ 折叠掉，且不算「写错日期」。"""
+    raw = "2026年9月28日 星期一，多云。\n2026年9月28日 星期一 雨\n睡前翻聊天记录。"
+    out = BD.ensure_date_line(raw, DATE)
+    assert out.count("2026年9月28日") == 1, out
+    assert "睡前翻聊天记录。" in out
+    assert BD.date_line_overridden(raw, DATE) == ""
+
+
+def test_format_only_difference_is_not_reported_as_override():
+    """只是格式差异（漏逗号 / 短式）不算「模型写错日期」——记下来只会是噪音。"""
+    for raw in (
+        "2026年9月28日 星期一 雨\n睡前翻聊天记录。",
+        "9月28日 星期一 雨\n睡前翻聊天记录。",
+        "2026年9月28日 星期一，多云。\n睡前翻聊天记录。",
+    ):
+        out = BD.ensure_date_line(BD.strip_diary_output(raw), DATE)
+        assert BD.date_line_overridden(BD.strip_diary_output(raw), DATE) == "", raw
+        assert out.count("2026年9月28日") == 1, out
+
+
+def test_no_date_line_at_all_is_not_reported_as_override():
+    """模型压根没写日期行时，补行也不算「改写了它的日期」。"""
+    raw = "睡前翻聊天记录，今天挺累。"
+    out = BD.ensure_date_line(BD.strip_diary_output(raw), DATE)
+    assert BD.date_line_overridden(BD.strip_diary_output(raw), DATE) == ""
+    # 正文提到年份（不是日期行）同理
+    raw2 = "2026年过得真快，转眼就秋天了。"
+    out2 = BD.ensure_date_line(BD.strip_diary_output(raw2), DATE)
+    assert BD.date_line_overridden(BD.strip_diary_output(raw2), DATE) == ""
+    assert out2.count("2026年9月28日") == 1
+
+
+def test_override_detection_survives_meta_stripping():
+    """真实链路形态：raw 里带 META 段、日期行是错的 —— 仍要能取回被换掉的那一行。
+
+    ``_generate`` 传进来的 raw 是 split_meta 之后的正文 ``body``，这里按同样顺序走一遍。
+    """
+    raw = (
+        "2026年9月27日 星期日，晴。\n"
+        "睡前翻聊天记录。\n\n"
+        + BD.META_MARKER
+        + '\n{"topics": ["新歌"]}'
+    )
+    body, meta = BD.split_meta(BD.strip_diary_output(raw))
+    assert meta == {"topics": ["新歌"]}, meta
+    out = BD.ensure_date_line(body, DATE)
+    assert BD.date_line_overridden(body, DATE) == "2026年9月27日 星期日，晴。"
+    # META 永不进正文
+    assert BD.META_MARKER not in out
 
 
 def test_year_in_prose_is_not_a_date_line():
@@ -187,16 +279,63 @@ def test_word_range_never_goes_below_one():
 
 
 def test_style_extra_numbering_does_not_collide():
-    """style_extra 的编号必须排在字数规则（8）之后，不能撞号。"""
+    """style_extra 的编号必须排在字数规则（9）之后，不能撞号。"""
     prompt = BD.build_write_prompt(
         date_str=DATE, events_text="- 甲：事", name="鸣澜", persona="p",
         style_extra="多用叠词",
     )
-    assert "\n9. 多用叠词" in prompt
-    assert "\n8. 篇幅：" in prompt
-    # 不该出现两个 "8." 开头的规则
-    rule8 = [ln for ln in prompt.split("\n") if ln.startswith("8. ")]
-    assert len(rule8) == 1, rule8
+    assert "\n10. 多用叠词" in prompt
+    assert "\n9. 篇幅：" in prompt
+    # 每条规则编号在**规则区**内只能出现一次（撞号会让模型把两条读成一条）
+    rules_region, _, _ = prompt.partition("日记正文写完后")
+    nums = [ln.split(".", 1)[0] for ln in rules_region.split("\n") if re.match(r"^\d{1,2}\. ", ln)]
+    assert nums, rules_region
+    assert len(nums) == len(set(nums)), f"规则编号撞号：{nums}"
+
+
+def test_self_check_rules_are_present_with_counterexample():
+    """v1.4.3 的自检三条（a/b/c）必须在 prompt 里，且带**反例**。
+
+    这三条治的是真机成品里的三种现象：
+    - a 空转动作（"我问她想好名字了没，她没答"）—— 动作后没有具体内容
+    - b 自己复述自己（"我说不知道…其实我也好奇过"）—— 同一意思写两遍
+    - c 每段都以"我的感受"收尾 —— 结构性单调
+    反例是这条约束能被模型执行的关键：光说"别空转"它不知道该躲什么。
+    """
+    prompt = BD.build_write_prompt(
+        date_str=DATE, events_text="- 甲：事", name="鸣澜", persona="p"
+    )
+    assert "写完一段做一次自检" in prompt
+    # a：空转动作 + 反例
+    assert "我问她想好名字了没，她没答" in prompt, "反例丢了，模型不知道该躲什么"
+    assert "后面必须跟具体内容" in prompt
+    # b：同一意思只写一次 + 可执行的自检动作（删最后一句看信息量）
+    assert "同一个意思**只写一次**" in prompt
+    assert "信息量没变化" in prompt
+    # c：感受收尾的配额
+    assert "最多一段以我的感受收尾" in prompt
+    # 事实纪律要指向 4a（有真素材才能写"我问"）——两条规则必须交叉引用，
+    # 否则模型会拿"文风自由"给凭空造动作开脱
+    assert "规则 4a" in prompt
+
+
+def test_self_check_rules_do_not_touch_existing_contracts():
+    """新增生成侧约束不得改变任何**判定/规范化**契约（只是让模型少犯那些毛病）。"""
+    # 引用纪律、事实纪律、篇幅纪律都还在
+    prompt = BD.build_write_prompt(
+        date_str=DATE, events_text="- 甲：事", name="鸣澜", persona="p"
+    )
+    for must in ("严格遵守引号边界", "事实纪律", "别硬凑", "不要标题"):
+        assert must in prompt, must
+    # 真机成品（本次优化依据的那篇）本身必须仍是"可发布"的 —— 新规则只影响生成，
+    # 不改发布判据，所以成品不会被事后判死
+    real = (
+        "2026年9月30日 星期三，晴。\n"
+        "凌晨群里还在刷屏，有人夸我最近说话越来越像人了，被这么直接地讲出来，"
+        "有点不好意思，嘴上随便应了句。\n"
+        "她还没给新歌取名，不知道会是什么风格。"
+    )
+    assert BD.diary_output_problem(real) == ""
 
 
 def test_word_budget_language_keeps_anti_padding_rule():

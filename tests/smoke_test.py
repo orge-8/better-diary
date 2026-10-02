@@ -471,6 +471,17 @@ print("NOHTTPX-LOAD-OK")
     check("给出了错误/正确写法对照", "错误写法" in wp and "正确写法" in wp)
     check("错误写法示例点出混写问题", "安排上了，好听" in wp)
 
+    print("\n[3c] 成文 prompt 契约（自检三条：空转 / 复述 / 感受收尾）")
+    # 真机成品（2026-09-30 那篇）暴露的三个现象，各配一条约束 + 一条反例
+    check("要求写完一段自检", "写完一段做一次自检" in wp)
+    check("a) 动作后必须跟具体内容", "后面必须跟具体内容" in wp)
+    check("a) 带空转反例（模型要知道躲什么）", "我问她想好名字了没，她没答" in wp)
+    check("b) 同一意思只写一次", "同一个意思**只写一次**" in wp)
+    check("b) 给了可执行的自检动作", "信息量没变化" in wp)
+    check("c) 感受收尾有名额上限", "最多一段以我的感受收尾" in wp)
+    check("事实纪律交叉引用规则 4a", "规则 4a" in wp)
+    check("自检三条不破坏既有引用纪律", "严格遵守引号边界" in wp and "事实纪律" in wp)
+
     # 引用体检（非阻断）
     q_ok = "他说「来首无名策岂不美哉」，我回了句安排上了，好听。"
     q_bad = "回了句「来首无名策岂不美哉 安排上了，好听」。"
@@ -1412,9 +1423,35 @@ print("NOHTTPX-LOAD-OK")
     _prose = bd.ensure_date_line("2026年过得真快，转眼就秋天了。", _dt_display)
     check("正文提年份不误判为日期行", _prose.startswith("2026年9月28日 星期一，"), repr(_prose))
     _other = bd.ensure_date_line("2026年9月27日 星期日，晴。\n睡前翻聊天记录。", _dt_display)
-    check("别的日期不当日期行、也不丢原文",
-          _other.startswith("2026年9月28日 星期一，") and "2026年9月27日 星期日，晴。" in _other,
+    check("别的日期行被改写成目标日期（不留两行日期）",
+          _other.startswith("2026年9月28日 星期一，") and "2026年9月27日" not in _other
+          and "睡前翻聊天记录。" in _other,
           repr(_other))
+    check("被换掉的日期行能取回来（存档 model_date_line 用）",
+          bd.date_line_overridden("2026年9月27日 星期日，晴。\n睡前翻聊天记录。",
+                                 _dt_display) == "2026年9月27日 星期日，晴。",
+          repr(bd.date_line_overridden("2026年9月27日 星期日，晴。\n睡前翻聊天记录。",
+                                      _dt_display)))
+    # 真机 2026-09-28 的确切形态：首行对、第二行写错（此前完全没用例，是反向验证发现的假绿）
+    _stray = "2026年9月28日 星期一，多云。\n2026年9月27日 星期日，晴。\n睡前翻聊天记录。"
+    _stray_out = bd.ensure_date_line(_stray, _dt_display)
+    check("第二行写别的日期时也被折叠掉",
+          _stray_out.count("2026年9月28日") == 1 and "2026年9月27日" not in _stray_out
+          and "睡前翻聊天记录。" in _stray_out,
+          repr(_stray_out))
+    check("被折叠的第二行日期行也能取回来报出去",
+          bd.date_line_overridden(_stray, _dt_display) == "2026年9月27日 星期日，晴。",
+          repr(bd.date_line_overridden(_stray, _dt_display)))
+    check("第二行是同一天时不算写错日期",
+          bd.date_line_overridden("2026年9月28日 星期一，多云。\n2026年9月28日 星期一 雨\n正文。",
+                                  _dt_display) == "",
+          "same-date second line reported as override")
+    check("只是格式差异不算改写日期（漏逗号/短式不记噪音）",
+          bd.date_line_overridden("2026年9月28日 星期一 雨\n睡前翻聊天记录。",
+                                 _dt_display) == ""
+          and bd.date_line_overridden("9月28日 星期一 雨\n睡前翻聊天记录。",
+                                     _dt_display) == "",
+          "format-only override leak")
     _inline = bd.ensure_date_line("2026年9月28日 星期一，雨。今天群里很热闹。\n后面还有一段。",
                                   _dt_display)
     check("日期行里夹的正文被拆出来保留",
@@ -1425,9 +1462,9 @@ print("NOHTTPX-LOAD-OK")
     check("放宽上限仍保留反硬凑纪律", "别硬凑" in _w)
     _w2 = bd.build_write_prompt(date_str=_dt_display, events_text="- 甲：事", name="鸣澜",
                                 persona="p", style_extra="多用叠词")
-    _rule_nums = [ln[:2] for ln in _w2.split("\n") if ln[:1].isdigit() and ln[1:3] == ". "]
-    check("style_extra 编号不与字数规则撞号", _rule_nums.count("8.") == 1 and "9." in _rule_nums,
-          str(_rule_nums))
+    _rule_nums = [ln.split(" ", 1)[0] for ln in _w2.split("\n") if ln[:1].isdigit() and ". " in ln[:4]]
+    check("style_extra 编号不与字数规则撞号",
+          _rule_nums.count("9.") == 1 and "10." in _rule_nums, str(_rule_nums))
 
     print(f"\n===== 冒烟结果: PASS {len(PASS)} / FAIL {len(FAIL)} =====")
     if FAIL:

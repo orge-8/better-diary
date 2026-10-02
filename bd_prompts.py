@@ -434,8 +434,9 @@ def build_write_prompt(
     """
     name_line = f"我的名字是{name}。" if name else ""
     persona_line = persona or "是一个爱聊天的机器人。"
-    # 编号必须排在规则 8（字数）之后 —— 曾经硬编码成 8，与字数规则撞号
-    style_line = f"\n9. {style_extra}" if style_extra else ""
+    # 编号必须排在规则 9（篇幅）之后 —— 曾硬编码成 8、v1.4.3 又因新增规则 4 顺延，
+    # 两次都与前面的规则撞号（撞号会让模型把两条规则读成一条）。
+    style_line = f"\n10. {style_extra}" if style_extra else ""
     tol = max(0, int(word_tolerance))
     target = max(1, int(word_target))
     lo, hi = max(1, target - tol), target + tol
@@ -462,13 +463,24 @@ def build_write_prompt(
    错误写法：回了句「来首无名策岂不美哉 安排上了，好听」（把自己的回复也塞进了引号，读起来像整句都是我说的）
    正确写法：有人提了《无名策》，回了句「来首无名策岂不美哉」，我说安排上了，好听。
    另外，凡是引用聊天原话都用「」，不要用 "" 或 '' 代替；能顺带点出是谁说的更好。
-4. 禁止出现：开头问候语；结尾总结或展望（如"明天也要加油""真是充实的一天"）；"我意识到/我明白了/我突然发现"句式；连续感叹号；排比句。
-5. 像睡前随手写的：句子短，允许有点碎，允许口语和自嘲，想到哪写到哪，但别写成聊天记录复述。
-6. **事实纪律**：主观感受和情绪可以自由写；但**没有依据就不得制造**人物、地点、对话、结果或新的事实。
+4. **写完一段做一次自检**（v1.4.3 新增），这三条都要过：
+   a) 段落里出现「我问 / 我说 / 我回」这类动作时，**后面必须跟具体内容** ——
+      对方说了什么，或我心里怎么想。只有动作、没有内容，就是空转，删掉。
+      错误：我问她想好名字了没，她没答 （"我问了"素材里没有，"她没答"等于什么都没写成）
+      正确：她还没给新歌取名，不知道会是什么风格，有点好奇。
+   b) 同一个意思**只写一次**。不许「我说了A，其实我心里也是A」这种自己复述自己。
+      自检办法：把这一段的最后一句删掉，如果读起来信息量没变化，就删掉它再往下写。
+   c) 段落最后一句别都落在「我的感受」上。全篇最多一段以我的感受收尾，
+      其余落在**对方的话、事情的结果、或者还没解开的地方**上。
+5. 禁止出现：开头问候语；结尾总结或展望（如"明天也要加油""真是充实的一天"）；"我意识到/我明白了/我突然发现"句式；连续感叹号；排比句。
+6. 像睡前随手写的：句子短，允许有点碎，允许口语和自嘲，想到哪写到哪，但别写成聊天记录复述。
+7. **事实纪律**：主观感受和情绪可以自由写；但**没有依据就不得制造**人物、地点、对话、结果或新的事实。
    拿不准的地方用"好像""应该是""记不清了"这类不确定语气带过 —— 文风自由不等于客观事实可以补写。
-7. 上面的跨天线索（若有）只能用来引出想法、疑问、期待，或带原日期的回顾；
+   ⚠️ 规则 4a 说的「我问/我说」只能用在**素材真有的互动**上：素材里没写我问过，就不要写我问过。
+   缺转场就直接写结果（「她还没给新歌取名。」），比编一个动作再让它落空强。
+8. 上面的跨天线索（若有）只能用来引出想法、疑问、期待，或带原日期的回顾；
    它**不能单独证明今天发生了什么**，今天的事必须有「值得记的事」作依据。
-8. 篇幅：{lo}~{hi} 字，{target} 字上下最舒服。**字数是给你留的余地，不是任务** ——
+9. 篇幅：{lo}~{hi} 字，{target} 字上下最舒服。**字数是给你留的余地，不是任务** ——
    宁可短一点也别硬凑；写完了觉得还差口气，就多补一句感受，别去堆形容词。除第一行外就是日记正文：不要标题、不要 markdown、不要"日记"二字开头、不要任何前后缀或解释。{style_line}
 
 日记正文写完后，另起一段只输出下面这两行（用于归档，**不会被发表**）：
@@ -562,15 +574,85 @@ def parse_date_line(line: str, date_str: str) -> tuple[str, str] | None:
     return weather, _DATE_TAIL_RE.sub("", rest).strip()
 
 
+def _looks_like_date_line(line: str) -> bool:
+    """这一行**长得像日期行**吗（不比对具体日期）。
+
+    用于 v1.4.3 修的缺口：``parse_date_line`` 只认**目标日期**，
+    对"别的日期行"返回 None，于是 :func:`ensure_date_line` 的折叠循环一遇到
+    "模型写了另一天"就 ``break`` —— 那行日期会原样留在正文里。
+
+    真机实例（2026-09-28 那篇，补写/跨天触发时模型写了前一天的日期）：
+    ```
+    2026年9月28日 星期一，多云。
+    2026年9月28日 星期一 雨          ← 两行日期，天气还互相冲突
+    ```
+    """
+    rest = _MD_DECOR_RE.sub("", str(line or "").lstrip())
+    return bool(_FULL_DATE_RE.match(rest) or _SHORT_DATE_RE.match(rest))
+
+
+def date_line_overridden(raw: str, date_str: str) -> str:
+    """返回模型写的**日期不对**的那一行日期行；全都是正确日期则返回空串。
+
+    只用于留痕（v1.4.3「折中方案」）：成品里永远只有一行**正确日期**的日期行，
+    但模型原来写的是哪一天不能就此消失 —— 落进存档字段 ``model_date_line`` 并打日志。
+
+    扫描**所有**行而不是只看首行，因为真机有两种形态：
+    - 首行就写错（``2026年9月27日 …`` 当首行）→ 就地改写成目标日期
+    - 首行对、**第二行**写错（``…9月28日，多云。`` 后面又跟一行 ``…9月27日，晴。``）
+      → 折叠掉第二行
+    两种都要报出来；漏掉后一种就等于「折叠了但没人知道为什么」，而那正是 2026-09-28
+    真机那篇的形态。
+
+    判据是**日期真的不同**：只是格式差异（漏逗号、短式 ``9月28日``、缺句号）返回空串，
+    那种情况模型写的就是当天，记下来只是噪音。短式缺年份、无法比对时也不报。
+    """
+    target = _target_ymd(date_str)
+    if target is None:
+        return ""  # 目标日期本身解析不出来 → 宁可不报也不误报
+    for line in str(raw or "").split("\n"):
+        stripped = line.strip()
+        if not _looks_like_date_line(stripped):
+            continue
+        ymd = _target_ymd(stripped)
+        if ymd is not None and ymd != target:
+            return stripped
+    return ""
+
+
+def _strip_date_components(line: str) -> str:
+    """剥掉一行里的「日期 + 星期 + 天气」，返回剩下的正文残留。
+
+    用于首行是**别的日期**时：整行改写成目标日期，但那一行若还夹着正文
+    （如 ``2026年9月27日，睡到中午才起`` 里的后半句），不能连正文一起丢掉。
+    """
+    rest = _MD_DECOR_RE.sub("", str(line or "").lstrip())
+    m = _FULL_DATE_RE.match(rest) or _SHORT_DATE_RE.match(rest)
+    if m:
+        rest = rest[m.end():]
+    m = _WEEKDAY_RE.match(rest)
+    if m:
+        rest = rest[m.end():]
+    m = _WEATHER_RE.match(rest)
+    if m:
+        rest = rest[m.end():]
+    return rest
+
+
 def ensure_date_line(content: str, date_str: str) -> str:
     """保证第一行是日期行，并把它**规范成** ``<日期>，<天气>。``。
 
-    三种输入都能正确处理：
+    四种输入都能正确处理：
 
     1. 没写日期行 → 补一行（天气用默认值）。
     2. 写了但格式不标准（缺逗号 / 缺句号 / 用短式 ``9月28日``）→ 就地规范化，
        **保留模型自己写的天气**，不覆盖成默认值。
     3. 写了两行日期行（模型偶发）→ 折叠成一行；被折叠那行里若夹着正文，正文保留。
+    4. **写了另一天的日期行**（v1.4.3 修）→ 同样折叠掉，不让它在正文里留一行
+       "第二行日期"。这一行里的天气**不采用**（它属于别的日子，用了会写错天气）。
+
+    「模型写错了日期」这件事不再靠人眼看日志发现：调用方用 :func:`date_line_overridden`
+    取到被替换掉的那一行，落进存档字段 ``model_date_line``（见 plugin `_save_diary`）。
 
     ⚠️ 空内容会被补成 ``「<日期>，多云。\\n（今天没写出什么来。）」`` 这种**占位文本**，
     它是给「聊天里回看」兜底用的展示文案，**不是可发布的日记**。
@@ -582,24 +664,32 @@ def ensure_date_line(content: str, date_str: str) -> str:
     # 跳过可能存在的空行，日期行必须是**第一个非空行**
     idx = next((i for i, ln in enumerate(lines) if ln.strip()), 0)
     parsed = parse_date_line(lines[idx], date_str)
-    if parsed is None:
+    if parsed is None and _looks_like_date_line(lines[idx]):
+        # 首行是**别的日期**的日期行（v1.4.3）：直接改写成目标日期。
+        # 天气不采用 —— 那是别的日子的天气，用了会把今天的天气写错。
+        # 这一行的正文残留（如 ``2026年9月28日，出来看流星雨`` 里的后半句）保留。
+        leftover_head = _DATE_TAIL_RE.sub("", _strip_date_components(lines[idx])).strip()
+        lines[idx] = f"{date_str}，{DEFAULT_WEATHER}。"
+        if leftover_head:
+            lines.insert(idx + 1, leftover_head)
+    elif parsed is None:
         # 没有可识别的日期行 → 补一行。若有前导空行，插在**第一个非空行之前**，
         # 而不是直接 return（曾经写成 `... if idx == 0 else content`，
         # 结果「空行开头且没写日期行」时整篇缺日期头）。
         lines.insert(idx, f"{date_str}，{DEFAULT_WEATHER}。")
         return "\n".join(lines)
-
-    weather, leftover = parsed
-    lines[idx] = f"{date_str}，{weather or DEFAULT_WEATHER}。"
-    if leftover:
-        # 模型把正文第一句挤进了日期行 → 拆出来，别丢内容
-        lines.insert(idx + 1, leftover)
-    # 折叠紧随其后的重复日期行
-    while len(lines) > idx + 1:
+    else:
+        weather, leftover = parsed
+        lines[idx] = f"{date_str}，{weather or DEFAULT_WEATHER}。"
+        if leftover:
+            # 模型把正文第一句挤进了日期行 → 拆出来，别丢内容
+            lines.insert(idx + 1, leftover)
+    # 折叠紧随其后的日期行 —— **不论它写的是哪一天**。
+    # 只认目标日期的写法会让"模型写了昨天"这种形态漏网（真机踩过）。
+    while len(lines) > idx + 1 and _looks_like_date_line(lines[idx + 1]):
         nxt = parse_date_line(lines[idx + 1], date_str)
-        if nxt is None:
-            break
-        tail = nxt[1]
+        # 同一天：沿用它的正文残留；另一天：整行丢弃（天气也不采用，那是别的日子的）
+        tail = nxt[1] if nxt is not None else ""
         del lines[idx + 1]
         if tail:
             lines.insert(idx + 1, tail)
