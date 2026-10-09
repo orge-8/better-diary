@@ -3,7 +3,8 @@
 对比旧 diary_plugin 的核心改进：
 1. 两阶段生成 —— 阶段一按块提取"值得写的事"并打分，阶段二只喂精选事件成文，
    避免 50k 时间线一次进 prompt 导致模型按时间顺序线性复述聊天记录；
-2. 反 AI 腔规则 + 强制引用聊天原话，日记有记忆点而不是转述；
+2. 反 AI 腔：规则从 10 条压到 6 条、开场骨架按日期轮换、篇幅按素材丰富度分三档，
+   引用也不再是硬性指标（素材给了原话才顺口引一句）—— 结构定式是最容易被认出来的 AI tell；
 3. 字数软控制（模型侧遵守），不做硬截断砍句子；
 4. 天气/心情由模型随文生成，替代关键词计数猜测。
 """
@@ -18,17 +19,20 @@ import tempfile
 import time
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Tuple, cast
 
 from maibot_sdk import API, Command, Field, MaiBotPlugin, PluginConfigBase
 from pydantic import field_validator
 
 if __package__:  # 包式加载（Runner 真机：插件目录作为包，不在 sys.path 上）
     from .bd_prompts import (
+        ai_tone_hits,
         build_continuity_line,
         build_extract_prompt,
         build_timeline,
+        build_timeline_fallback_text,
         build_write_prompt,
+        choose_word_budget,
         chunk_text,
         date_display,
         date_line_overridden,
@@ -36,20 +40,26 @@ if __package__:  # 包式加载（Runner 真机：插件目录作为包，不在
         ensure_date_line,
         event_id,
         events_to_text,
-        parse_events,
+        parse_events_detailed,
         quote_attribution_risk,
+        self_quote_in_brackets,
         split_meta,
         strip_diary_output,
+        timeline_speaker_lines,
+        trailing_date_line,
         update_continuity,
     )
     from .bd_cookie import CookieStore, redact_secrets
     from .bd_search import format_hits, on_this_day, search_diaries
 else:  # 平铺兜底（脚本直跑 / 旧测试夹具）
     from bd_prompts import (
+        ai_tone_hits,
         build_continuity_line,
         build_extract_prompt,
         build_timeline,
+        build_timeline_fallback_text,
         build_write_prompt,
+        choose_word_budget,
         chunk_text,
         date_display,
         date_line_overridden,
@@ -57,10 +67,13 @@ else:  # 平铺兜底（脚本直跑 / 旧测试夹具）
         ensure_date_line,
         event_id,
         events_to_text,
-        parse_events,
+        parse_events_detailed,
         quote_attribution_risk,
+        self_quote_in_brackets,
         split_meta,
         strip_diary_output,
+        timeline_speaker_lines,
+        trailing_date_line,
         update_continuity,
     )
     from bd_cookie import CookieStore, redact_secrets
@@ -231,8 +244,10 @@ class PluginSection(PluginConfigBase):
 class DiarySection(PluginConfigBase):
     """日记生成配置。"""
 
-    word_target: int = Field(default=350, description="日记目标字数（正文）。只是最舒服的长度，不是硬指标")
-    word_tolerance: int = Field(default=150, description="目标字数的上下浮动。区间放宽一点，模型写长了不必回头删")
+    # ⚠️ 这两个值是「篇幅三档」里的**长档**基准（短档 0.4×、中档 0.7×，见 choose_word_budget）。
+    # 装在真机上的实例不会跟着改（config.toml 落盘后不回写），要改请在 config.toml 里改。
+    word_target: int = Field(default=350, description="日记目标字数（正文）：按素材丰富度分短/中/长三档，这里是**长档**基准（短 0.4 倍 / 中 0.7 倍）。只是最舒服的长度，不是硬指标")
+    word_tolerance: int = Field(default=150, description="目标字数的上下浮动（同样按档位缩放）。区间放宽一点，模型写长了不必回头删")
     max_events: int = Field(default=3, description="日记最多写几件事")
     min_messages: int = Field(default=20, description="当天消息少于此数不生成日记")
     chunk_chars: int = Field(default=6000, description="时间线分块字符数")
@@ -1028,15 +1043,13 @@ class BetterDiaryPlugin(MaiBotPlugin):
             return True, "", 2
         mode = str(entry.get("material_mode") or "").strip()
         lines: list[str] = [f"{date_str} 的日记依据（素材模式：{mode or '旧版存档'}）："]
-        events = entry.get("events") if isinstance(entry.get("events"), list) else []
+        events = [e for e in (entry.get("events") or []) if isinstance(e, dict)]
         if events:
-            for e in events:
-                if not isinstance(e, dict):
-                    continue
-                line = f"- {e.get('who') or '?'}：{e.get('what') or ''}"
-                if e.get("quote"):
-                    line += f"（原话：「{e['quote']}」）"
-                lines.append(line)
+            # 复用 events_to_text：与成文时**同一套**渲染，作者自己的话不会被标成「原话」
+            self_name = await self._resolve_nickname()
+            lines.extend(
+                events_to_text(events, self_labels={"我", self_name}).split("\n")
+            )
         else:
             lines.append("- 该日期没有结构化选材事件（旧版存档，或选材降级用时间线末尾写成）")
         meta = entry.get("meta") if isinstance(entry.get("meta"), dict) else {}
@@ -1050,6 +1063,10 @@ class BetterDiaryPlugin(MaiBotPlugin):
                 values = [str(v) for v in (meta.get(key) or []) if str(v).strip()]
                 if values:
                     lines.append(f"- {label}：" + "、".join(values[:8]))
+        # v1.5.0：AI 腔命中标签（非阻断，只给运营看「这篇是不是又在写套话」）
+        tone = [str(v) for v in (entry.get("ai_tone_hits") or []) if str(v).strip()]
+        if tone:
+            lines.append("- AI 腔命中：" + "、".join(tone))
         await self._send_long("\n".join(lines), stream_id)
         return True, "", 2
 
@@ -2031,7 +2048,8 @@ class BetterDiaryPlugin(MaiBotPlugin):
         sem = asyncio.Semaphore(3)
         single_chunk = len(chunks) == 1
 
-        async def run_one(chunk: str) -> list[dict[str, Any]]:
+        async def run_one(chunk: str) -> Tuple[list[dict[str, Any]], str]:
+            """返回 (本块事件列表, 空块原因)。有事件时原因恒为 ``ok``。"""
             async with sem:
                 try:
                     if single_chunk:
@@ -2045,16 +2063,27 @@ class BetterDiaryPlugin(MaiBotPlugin):
                             build_extract_prompt(date_str, chunk),
                             self.config.llm.extract_temperature,
                         )
-                    return parse_events(raw)
+                    events, note = parse_events_detailed(raw)
+                    if not events:
+                        return [], note
+                    return events, "ok"
                 except Exception as exc:
                     # 区分超时与其它失败：超时通常意味着「模型池整体不可用」，
                     # 成文阶段会因此降级失败，日志上看得出因果才排得动
                     kind = "超时" if self._is_timeout_error(exc) else "失败"
                     self.ctx.logger.warning("选材分块%s（跳过本块）: %s", kind, exc)
-                    return []
+                    return [], f"调用{kind}: {exc}"
 
         results = await asyncio.gather(*(run_one(c) for c in chunks))
-        merged: list[dict[str, Any]] = [e for chunk_events in results for e in chunk_events]
+        merged: list[dict[str, Any]] = [e for chunk_events, _ in results for e in chunk_events]
+        # 空块原因留痕：把「确实无事」和「解析失败」分开 —— 旧版统一打
+        # 「选材为空（解析失败或确实无事）」，真机上完全分不清（2026-10-07 卡住的正是这个）。
+        _empty_notes = [(i, note) for i, (_, note) in enumerate(results, 1) if note != "ok"]
+        if _empty_notes:
+            self.ctx.logger.warning(
+                "选材空块: %s",
+                "; ".join(f"块{i}: {note}" for i, note in _empty_notes),
+            )
         merged.sort(key=lambda e: e["score"], reverse=True)
         # 简单去重：what 前 16 字相同视为同一件事
         seen: set[str] = set()
@@ -2117,32 +2146,64 @@ class BetterDiaryPlugin(MaiBotPlugin):
 
         # 阶段一：选材；失败或为空则降级用时间线末尾
         events = await self._extract_events(timeline, date_display(date_str))
+        # 作者本人的称呼：素材渲染靠它把"别人说的"与"我自己的话"分开（先于成文解析）
+        self_name = await self._resolve_nickname()
+        self_labels = {"我", self_name}
         used_events: list[dict[str, Any]] = []
         if events:
             events = events[: max(1, self.config.diary.max_events)]
             used_events = events
-            events_text = events_to_text(events)
+            events_text = events_to_text(events, self_labels=self_labels)
             self.ctx.logger.info("选材完成: %d 件入选", len(events))
+            # 素材留痕（**隐私安全版**）：只记条数 / 事件 ID / 自身原话件数，
+            # 绝不把聊天原话写进日志 —— 与 v1.3.4 起「引用体检告警只打事件 ID」同一条约定。
+            # 「自身原话 > 0」是「阶段一抓了作者自己的话」的直接信号（归属错的常见上游）；
+            # 要看素材原话原文，用 /日记来源。
+            _self_quotes = sum(
+                1
+                for e in events
+                if e.get("quote") and str(e.get("who") or "").strip() in self_labels
+            )
+            self.ctx.logger.info(
+                "选材素材: %d 件（自身原话 %d 件）[%s]",
+                len(events),
+                _self_quotes,
+                ", ".join(event_id(date_str, e) for e in events),
+            )
         else:
-            self.ctx.logger.warning("选材为空（解析失败或确实无事），降级用时间线末尾")
-            tail = timeline[-4000:]
-            events_text = "（选材环节没跑通，下面是当天聊天记录的末尾片段，从中挑你有印象的写）\n" + tail
+            # 具体原因已在上方「选材空块」日志里按块列出（确实无事 / 解析失败 / 调用失败）；
+            # 这条保留同样的关键字，方便沿用旧的日志检索习惯，但不再笼统归因。
+            self.ctx.logger.warning("选材为空，降级用时间线末尾（原因见上方「选材空块」）")
+            events_text = build_timeline_fallback_text(timeline[-4000:])
 
         # 阶段二：成文
         persona = await self._resolve_persona()
-        name = await self._resolve_nickname()
+        name = self_name
         is_today = date_str == self._today_str()
         # 跨天连续性：只用于引出回顾与延续，**不能当作「今天发生了什么」的依据**（纪律写进 prompt）
         continuity = self._load_continuity()
+        # 篇幅三档：素材少就短写、素材多才摊开，避免每天都被要求写到同一个长度
+        # （固定长度会逼模型凑字，凑出来的多半就是空转动作/复述自己/感受收尾那三样）。
+        # 档位由素材丰富度**确定性**决定，日志可回读。
+        _budget = choose_word_budget(
+            max(80, self.config.diary.word_target),
+            max(0, self.config.diary.word_tolerance),
+            event_count=len(used_events),
+            material_mode="events" if used_events else "timeline_tail",
+        )
+        self.ctx.logger.info(
+            "篇幅档位: %s（目标 %d，区间 %d~%d，依据：%s）",
+            _budget["tier"], _budget["target"], _budget["lo"], _budget["hi"], _budget["reason"],
+        )
         prompt = build_write_prompt(
             date_str=date_display(date_str),
             events_text=events_text,
             name=name,
             persona=persona,
             style_extra=self.config.diary.style_extra,
-            word_target=max(80, self.config.diary.word_target),
+            word_target=_budget["target"],
             max_events=max(1, self.config.diary.max_events),
-            word_tolerance=max(0, self.config.diary.word_tolerance),
+            word_tolerance=_budget["tolerance"],
             # 补写过去的日期必须声明相对时间的基准，否则模型会按「真正的今天」解读素材里的「昨天」
             temporal_anchor="" if is_today else date_display(date_str),
             continuity_text=build_continuity_line(continuity),
@@ -2174,6 +2235,14 @@ class BetterDiaryPlugin(MaiBotPlugin):
                 "日期行已规范化：模型原文 %r → %r",
                 _raw_first[:60], content.split("\n", 1)[0],
             )
+        # 真机 2026-10-08：模型把日期行又写了一遍在结尾（天气还和首行不一致）。
+        # ensure_date_line 会删掉它，这里留痕，避免下次又靠人眼看才发现。
+        _tail = trailing_date_line(body, date_display(date_str))
+        if _tail is not None:
+            self.ctx.logger.info(
+                "日记结尾的重复日期行已删除（该行天气 %s）",
+                _tail[0] or "未写",
+            )
         # v1.4.3（折中方案）：成品永远只有一行**正确日期**的日期行，但模型原来写的是
         # 哪一天不能就此消失 —— 落进存档 model_date_line，并在日志里点名（WARNING：
         # 「模型写错日期」提示 prompt/补写基准可能有问题，不只是格式差异）。
@@ -2184,8 +2253,8 @@ class BetterDiaryPlugin(MaiBotPlugin):
                 "模型写的日期行不是 %s，已去掉并统一为正确日期（原文记入存档 model_date_line）: %r",
                 date_str, model_date_line[:60],
             )
-        # 引用体检（非阻断，只留痕）：选材成文时才查——降级用时间线末尾时
-        # 模型可以引用任意聊天原话，没有可比对的素材列表。
+        # 引用体检（非阻断，只留痕）。
+        # ①「素材原话」类的判据只有选材成文时才查得动 —— 降级路径没有事件可比。
         if used_events:
             risk = quote_attribution_risk(content, [e.get("quote", "") for e in used_events])
             if risk:
@@ -2197,18 +2266,34 @@ class BetterDiaryPlugin(MaiBotPlugin):
                     len(used_events),
                     ", ".join(str(e.get("event_id") or "?") for e in used_events),
                 )
-        _target = max(1, self.config.diary.word_target)
-        _tol = max(0, self.config.diary.word_tolerance)
+        # ②「「」里装了作者自己说过的话」——**两条路径都查**。
+        # 它不依赖素材事件：时间线每行本来就标着说话人，所以
+        # 降级路径（timeline_tail，没有 used_events）同样查得到。
+        # 真机 2026-10-07 那两处归属错都属这一类，而那天恰好走的就是降级路径。
+        _self_lines = [
+            text
+            for who, text in timeline_speaker_lines(timeline)
+            if who in self_labels or who == "我"
+        ]
+        _self_risk = self_quote_in_brackets(content, _self_lines)
+        if _self_risk:
+            self.ctx.logger.warning("引用体检告警：%s", _self_risk)
+        # AI 腔检测（**非阻断**，只留痕）。命中率的分布变化就是"改了 prompt 之后
+        # 腔调有没有真的降下来"的回归指标，连续跑几天看即可。
+        # ⚠️ 只记录标签、不记录命中原文：日志不得出现聊天逐字原话（本插件硬约定）。
+        _tone = ai_tone_hits(content)
         self.ctx.logger.info(
             "日记成文: %d 字（目标 %d，区间 %d~%d）",
-            len(content), _target, max(1, _target - _tol), _target + _tol,
+            len(content), _budget["target"], _budget["lo"], _budget["hi"],
         )
+        if _tone:
+            self.ctx.logger.info("AI 腔检测命中 %d 项: %s", len(_tone), "、".join(_tone))
 
         material_mode = "events" if used_events else "timeline_tail"
         self._save_diary(
             date_str, content, stats,
             events=used_events, material_mode=material_mode, meta=meta,
-            model_date_line=model_date_line,
+            model_date_line=model_date_line, tone_hits=_tone,
         )
         # 累积跨天连续性（纯累积 + 保序去重，不再额外调 LLM）
         if used_events or meta:
@@ -2419,6 +2504,7 @@ class BetterDiaryPlugin(MaiBotPlugin):
         material_mode: str = "",
         meta: dict[str, Any] | None = None,
         model_date_line: str = "",
+        tone_hits: list[str] | None = None,
     ) -> None:
         path = self._store_path()
         try:
@@ -2449,6 +2535,9 @@ class BetterDiaryPlugin(MaiBotPlugin):
                 # v1.4.3：成品里只有一行正确日期的日期行；模型原来写错的那一行
                 # 记在这里（空串表示模型写的就是当天/压根没写日期行）。
                 "model_date_line": str(model_date_line or prev.get("model_date_line") or ""),
+                # v1.5.0：AI 腔检测的命中标签（空列表 = 没命中）。非阻断，只用于回看
+                # 「改了 prompt 之后腔调有没有真的降下来」，不参与任何发布判定。
+                "ai_tone_hits": [str(x) for x in (tone_hits or []) if str(x or "").strip()],
             }
             tmp = path.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")

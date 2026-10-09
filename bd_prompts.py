@@ -10,7 +10,7 @@ import datetime
 import hashlib
 import json
 import re
-from typing import Any, Dict, List, Mapping, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Tuple
 
 # 单条消息在时间线里的最大文本长度（过长消息截断，保 token 预算）
 _MSG_TEXT_LIMIT = 80
@@ -76,15 +76,32 @@ def diary_output_problem(content: str) -> str:
     return ""
 
 
+# 日记里的「」引用片段。正文里的「」成对出现；不成对的由正则自然忽略。
+_QUOTE_SPAN_RE = re.compile(r"「([^「」]*)」")
+
+# 归属比对时保留的字符集（中日韩汉字/假名、字母、数字）。
+# 标点、空格、emoji、破折号一律丢掉 —— 它们是模型复述时最容易变样的部分。
+_PLAIN_KEEP_RE = re.compile(r"[^\u4e00-\u9fff\u3040-\u30ffa-zA-Z0-9]")
+
+
+def _clip(text: str, limit: int = 30) -> str:
+    text = str(text or "")
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
 def quote_attribution_risk(content: str, given_quotes: list[str]) -> str:
     """引用体检（**非阻断**，只用于日志留痕）。可用返回空串，可疑返回原因。
 
-    真机反馈过的缺陷：模型把「」当成"待填占位"用，于是写出
-    ``「来首无名策岂不美哉 安排上了，好听」`` —— 别人的原话和自己的回复挤在同一对
-    引号里，读起来像整句都是日记作者说的。**归属错了，等于替别人说话。**
+    真机反馈过两类缺陷：
 
-    这里只做一件事：日记里出现了「」，但**没有任何一条素材原话被原样引用**
-    → 极度可疑（要么自造原话，要么引号边界写错），打一条 WARNING 供排查。
+    1. 模型把「」当成"待填占位"用，写出 ``「来首无名策岂不美哉 安排上了，好听」``
+       —— 别人的原话和自己的回复挤在同一对引号里。**归属错了，等于替别人说话。**
+    2. 真机 2026-10-07：一对「」里焊进了**两个不同人**的话
+       （被引用人的原话 + 作者自己的回复），整句却归给了被引用人。
+
+    两类都靠同一条判据抓：**测引号边界**。
+    若某个「」的内容**包含**某条素材原话、却不等于它 → 边界画错了（越界）。
+    比"有没有原样引用"更强 —— 后者只能发现"一句都没引到"，对归属错完全失明。
     刻意不阻断：模型可能对原话做轻微改写，这时候误报比漏报更烦人。
     """
     body = content or ""
@@ -94,9 +111,99 @@ def quote_attribution_risk(content: str, given_quotes: list[str]) -> str:
     given = [q for q in given if q]
     if not given:
         return ""
+    # ① 引号越界：某对「」里除了一条素材原话，还混进了别的内容
+    for span in (m.group(1).strip() for m in _QUOTE_SPAN_RE.finditer(body)):
+        for q in given:
+            if span and q != span and q in span:
+                return (
+                    f"引号越界：「{_clip(span)}」里除素材原话「{_clip(q)}」外还混进了别的内容"
+                    "（可能跨了说话人）"
+                )
+    # ② 一句原话都没原样引到
     if any(q in body for q in given):
         return ""
     return "日记里有「」但没有原样引用任何一条素材原话（可能自造原话或引号边界写错）"
+
+
+def _plain(text: str) -> str:
+    """归到"只留中日韩/字母/数字"的比对形态。
+
+    为什么要归一：真机消息里满是 emoji、空格、破折号，而模型写进日记时常常
+    顺手丢掉 emoji、或把破折号数量写变了。逐字比对会在这些噪声上假阴性，
+    所以归属核对一律先 `_plain` 再比对。
+    """
+    return _PLAIN_KEEP_RE.sub("", str(text or ""))
+
+
+def self_quote_in_brackets(content: str, self_lines: list[str], min_len: int = 5) -> str:
+    """日记里的「」装进了**作者自己说过的话** → 归属错（把自己的话当别人的引用）。
+
+    真机 2026-10-07 的两处都属这一类：
+    - ``台长…说「烧退了 鼻子还是堵的 先补个觉 我也鼻子堵」`` —— 后半句是我自己的回复；
+    - ``回了句「喔喔喔———— 守夜频段交班，早班就位」`` —— 整段都是我自己的回复。
+
+    比"引号越界"更直接：越界要靠"素材原话被包含"来推断，而这条拿**作者本人说过的话**
+    直接比对，不依赖素材里有没有抽到原话 —— 所以**降级路径（timeline_tail）也能查**。
+    非阻断，只留痕。
+
+    Args:
+        self_lines: 作者本人说过的话（时间线里 ``我:`` 那几行的内容）。
+        min_len: 短于此长度的原文不参与比对 —— 「嗯」「哦」这类短句容易误伤正文。
+    """
+    body = content or ""
+    if "「" not in body or "」" not in body:
+        return ""
+    spans = [m.group(1) for m in _QUOTE_SPAN_RE.finditer(body)]
+    plain_spans = [_plain(s) for s in spans]
+    if not any(plain_spans):
+        return ""
+    for raw in self_lines:
+        plain_self = _plain(raw)
+        if len(plain_self) < min_len:
+            continue
+        for span, plain_span in zip(spans, plain_spans):
+            if plain_span and plain_self in plain_span:
+                return (
+                    "引号里装了作者自己说过的话："
+                    f"「{_clip(span)}」里含我的原话「{_clip(raw)}」（自己的话必须写在「」外面）"
+                )
+    return ""
+
+
+def build_timeline_fallback_text(tail: str) -> str:
+    """选材跑不通时的降级素材：原始时间线 + **格式说明**。
+
+    ⚠️ 格式说明不能省：``build_write_prompt`` 从头到尾没解释过时间线是什么格式
+    （每行 ``昵称: 内容``）。不点明「冒号前是说话人、『我』是我自己」，模型就只能靠猜，
+    引号归属于是错了 —— 真机 2026-10-07 那篇就是降级路径写出来的。
+    """
+    return (
+        "（选材环节没跑通，下面是当天聊天记录的末尾片段，从中挑你有印象的写）\n"
+        "格式说明：每行是「说话人: 内容」，冒号前面是谁说的；其中「我」= 你自己说过的话，"
+        "其余昵称是别人说的。\n" + str(tail or "")
+    )
+
+
+def timeline_speaker_lines(timeline: str) -> list[tuple[str, str]]:
+    """把时间线文本拆回 ``(说话人, 内容)`` 列表，供归属核对用。
+
+    时间线的行形如 ``昵称: 内容`` / ``我: 内容``，另有 ``【晚上21点】`` 这类时段标记
+    （以 ``【`` 开头，直接跳过）。解析不出冒号的行也跳过。
+    """
+    out: list[tuple[str, str]] = []
+    for raw_line in str(timeline or "").split("\n"):
+        line = raw_line.strip()
+        if not line or line.startswith("【"):
+            continue
+        who, sep, text = line.partition(":")
+        if not sep:
+            who, sep, text = line.partition("：")
+        if not sep:
+            continue
+        text = text.strip()
+        if text:
+            out.append((who.strip(), text))
+    return out
 
 
 def _msg_time(msg: Dict[str, Any]) -> float:
@@ -131,17 +238,88 @@ def _hour_label(hour: int) -> str:
     return f"晚上{hour}点"
 
 
+def _reply_info_from_segments(
+    raw_segments: Any, bot_qq: str = ""
+) -> Tuple[str, str] | None:
+    """从消息 dict 的 ``raw_message`` 段列表里提取 ``(被引说话人, 被引原文)``。
+
+    背景（2026-10-09 源码级核实）：适配器（napcat-adapter 与 1.3.0+ 统一 QQ 连接器
+    逻辑同源）会把引用目标回查成 ``target_message_content`` + 真实说话人写进 reply 段，
+    而 Host 的 ``process_reply_component`` 分支①把它**不加前缀**直接拼进
+    ``processed_plain_text`` —— 于是「被引原文 + 我的回复」无缝黏在一条消息里，
+    说话人却记成了回复者。真机 2026-10-07「烧退了…先补个觉 我也鼻子堵」的归属错，
+    根子就在这一层。
+
+    本函数只认**回查成功**的 reply 段（有 ``target_message_content``）；
+    回查失败时段会被适配器整个丢弃，这里自然返回 ``None``，维持旧逻辑兜底。
+    群名片优先于昵称；被引的若是 bot 自己（极少见），说话人记为「我」。
+    """
+    if not isinstance(raw_segments, (list, tuple)):
+        return None
+    for seg in raw_segments:
+        if not isinstance(seg, Mapping) or str(seg.get("type") or "") != "reply":
+            continue
+        data = seg.get("data")
+        if not isinstance(data, Mapping):
+            return None
+        quoted = str(data.get("target_message_content") or "").strip()
+        if not quoted:
+            return None
+        sender_id = str(data.get("target_message_sender_id") or "").strip()
+        if bot_qq and sender_id and sender_id == bot_qq:
+            who = "我"
+        else:
+            who = (
+                sanitize_inline(
+                    str(
+                        data.get("target_message_sender_cardname")
+                        or data.get("target_message_sender_nickname")
+                        or sender_id
+                        or "某人"
+                    ),
+                    20,
+                )
+                or "某人"
+            )
+        return who, quoted
+    return None
+
+
 def build_timeline(messages: List[Dict[str, Any]], bot_qq: str = "") -> Tuple[str, Dict[str, int]]:
     """把消息 dict 列表构建成带时段标记的时间线文本。
 
+    引用回复拆分（v1.5.1）：消息带**回查成功**的 reply 段时，把被引原文按其真实
+    说话人**独立成行**（插在回复行之前 —— 被引消息必然早于回复，时序成立），
+    回复行只留回复者自己的话。这样：
+
+    - 被引原文不会因为黏在 bot 的消息里而被记成「我」说的；
+    - ``self_quote_in_brackets`` 拿「我:」行做核对时，不再把别人原话当成我的话。
+
+    被引原文若已在时间线里出现过（绝大多数引用回的是当天消息，原行本来就在），
+    则只剥离、不重复插行。剥离失败（正文形态与预期不符，如带 [图片] 前缀）时
+    **保守回退旧行为**，绝不因为拆分逻辑把消息弄丢。
+
     Returns:
-        (timeline_text, stats)，stats 含 total/bot/user 三项。
+        (timeline_text, stats)。stats 含 total/bot/user，另加 ``reply_split``
+        （成功拆分并剥离的引用回复条数，供日志回读）。
     """
-    stats = {"total": 0, "bot": 0, "user": 0}
+    stats = {"total": 0, "bot": 0, "user": 0, "reply_split": 0}
     if not messages:
         return "（今天没有聊天记录。）", stats
 
     parts: List[str] = []
+    seen_plain: set[str] = set()
+
+    def _emit(who: str, body: str) -> None:
+        """渲染一行并登记其归一形态（供被引原文判重）。"""
+        text = str(body or "").strip()
+        if not text:
+            return
+        if len(text) > _MSG_TEXT_LIMIT:
+            text = text[:_MSG_TEXT_LIMIT] + "……"
+        parts.append(f"{who}: {text}")
+        seen_plain.add(_plain(text))
+
     current_hour = -1
     for msg in sorted(messages, key=_msg_time):
         ts = _msg_time(msg)
@@ -168,9 +346,22 @@ def build_timeline(messages: List[Dict[str, Any]], bot_qq: str = "") -> Tuple[st
             text = f"[图片]{text}"
         if not text:
             continue
-        if len(text) > _MSG_TEXT_LIMIT:
-            text = text[:_MSG_TEXT_LIMIT] + "……"
-        parts.append(f"{who}: {text}")
+
+        # 引用回复拆分：Host 分支①把被引原文裸拼在正文开头，先精确剥离。
+        # startswith 必然成立（分支①返回的就是同一个字符串）；失败就保守走旧行为。
+        reply = _reply_info_from_segments(msg.get("raw_message"), bot_qq)
+        if reply and text.startswith(reply[1]):
+            quoted_who, quoted_text = reply
+            rest = text[len(quoted_text) :].strip()
+            plain_quoted = _plain(quoted_text)
+            if plain_quoted and plain_quoted not in seen_plain:
+                _emit(quoted_who, quoted_text)
+            if rest:
+                _emit(who, rest)
+            stats["reply_split"] += 1
+            continue
+
+        _emit(who, text)
 
     if len(parts) == 0:
         return "（今天没有聊天记录。）", stats
@@ -206,11 +397,17 @@ def build_extract_prompt(date_str: str, timeline_chunk: str) -> str:
 - 有人分享了自己的经历、作品或情绪波动（被安慰、被夸、闹笑话都算）
 - 群里真实聊开了的话题（有人接话、有来回的才算）
 - "我"本人参与并有来有回的有趣互动
+- 纯情绪反应（全场爆笑、集体哀嚎、齐刷刷刷同一句话）若是当天最有记忆点的，也算值得记的事
 - 忽略：纯表情或"哈哈"刷屏、无实质内容的水群、命令与系统消息、冷场单条发言
 - 必须忠实于记录，宁可漏掉也不许脑补细节
 
 只输出 JSON 数组，不要输出任何其他文字。格式：
 [{{"who": "人物昵称", "what": "发生了什么，40字以内", "quote": "聊天记录里最有味道的一句原话，没有就填空字符串", "score": 1到5的整数}}]
+
+quote 的三条硬性要求（很重要，写错的话整篇日记会替别人说话）：
+- 只能是**别人（不是"我"）**说的一句原话，**一字不改**照抄；
+- 必须来自**同一个人、同一条消息**，**绝不把两条消息、或两个人说的话拼在一起**；
+- 若最有味道的是「我」自己说的、或本段没有合适的别人原话，quote 一律填空字符串 ""。
 
 score 含义：5=当天最值得记的事，1=勉强可以提一句。没有值得写的事就输出 []
 
@@ -218,22 +415,33 @@ score 含义：5=当天最值得记的事，1=勉强可以提一句。没有值�
 {timeline_chunk}"""
 
 
-def parse_events(text: str) -> List[Dict[str, Any]]:
-    """宽容解析阶段一的 JSON 数组输出。坏输出返回空列表。"""
+def parse_events_detailed(text: str) -> Tuple[List[Dict[str, Any]], str]:
+    """解析阶段一的 JSON 数组输出，并**区分「确实无事」与「解析失败」**。
+
+    旧版 :func:`parse_events` 把 6 种情况全部折叠成 ``[]``：
+    空输入 / 没有 JSON 数组 / JSON 坏 / 不是数组 / 条目全无效 / 模型真返回 []。
+    前五种是**故障**，最后一种才是「确实无事」—— 混在一起时，
+    真机上「选材为空，降级用时间线末尾」就永远分不清是哪种（2026-10-07 那天卡住的正是这个）。
+
+    Returns:
+        ``(events, note)``。``note`` 为 ``ok``（有事件）或人类可读的空原因。
+    """
     if not text or not text.strip():
-        return []
+        return [], "模型返回为空"
     cleaned = text.strip()
     # 去掉可能的代码块围栏
     cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.MULTILINE).strip()
     start, end = cleaned.find("["), cleaned.rfind("]")
     if start == -1 or end <= start:
-        return []
+        if start != -1:
+            return [], "输出里有 [ 但没有闭合的 ]（可能被截断）"
+        return [], f"输出里没有 JSON 数组（{len(cleaned)} 字）"
     try:
         data = json.loads(cleaned[start : end + 1])
     except (json.JSONDecodeError, ValueError):
-        return []
+        return [], f"JSON 解析失败（截取 {end + 1 - start} 字）"
     if not isinstance(data, list):
-        return []
+        return [], f"输出不是数组（是 {type(data).__name__}）"
     events: List[Dict[str, Any]] = []
     for item in data:
         if not isinstance(item, dict):
@@ -250,7 +458,21 @@ def parse_events(text: str) -> List[Dict[str, Any]]:
                 "score": max(1, min(5, score)),
             }
         )
-    return [e for e in events if e["what"]]
+    valid = [e for e in events if e["what"]]
+    if not valid:
+        if not data:
+            return [], "模型明确返回空数组（确实无事）"
+        return [], f"数组 {len(data)} 条里没有有效事件（缺 what）"
+    return valid, "ok"
+
+
+def parse_events(text: str) -> List[Dict[str, Any]]:
+    """宽容解析阶段一的 JSON 数组输出。坏输出返回空列表。
+
+    只关心事件本身时用这个；要在日志里区分「确实无事」与「解析失败」时，
+    用 :func:`parse_events_detailed`。
+    """
+    return parse_events_detailed(text)[0]
 
 
 def event_id(date_str: str, event: Mapping[str, Any]) -> str:
@@ -270,15 +492,28 @@ def event_id(date_str: str, event: Mapping[str, Any]) -> str:
     return "ev_" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
 
 
-def events_to_text(events: List[Dict[str, Any]]) -> str:
-    """把精选事件列表渲染成阶段二的素材文本。"""
+def events_to_text(events: List[Dict[str, Any]], self_labels: Iterable[str] = ()) -> str:
+    """把精选事件列表渲染成阶段二的素材文本。
+
+    ``self_labels`` 是**日记作者本人**的称呼集合（"我" + bot 昵称）。命中的事件
+    **不**把 quote 渲染成「原话」形态 —— 否则素材会出现
+    ``- 我：…（原话：「我自己的话」）``，与规则「「」只能放**别人**说过的原话」
+    直接冲突。真机实测（2026-10-07）：模型照着素材，把作者自己的回复也塞进了「」，
+    读起来像别人的话。素材与规则打架时，模型多半信素材 —— 所以要让素材自己别制造歧义。
+    """
     if not events:
         return ""
+    labels = {str(s).strip() for s in (self_labels or ()) if str(s).strip()}
     lines: List[str] = []
     for e in events:
-        line = f"- {e['who']}：{e['what']}"
+        who = str(e.get("who") or "").strip()
+        line = f"- {who}：{e['what']}"
         if e.get("quote"):
-            line += f"（原话：「{e['quote']}」）"
+            if who in labels or who == "我":
+                # 作者自己的话：信息照留，但**明确禁止**用「」引用它
+                line += f"（我自己的话，写日记时不要用「」引用：「{e['quote']}」）"
+            else:
+                line += f"（原话：「{e['quote']}」）"
         lines.append(line)
     return "\n".join(lines)
 
@@ -407,6 +642,162 @@ def update_continuity(
     }
 
 
+# ---------------------------------------------------------------- 篇幅三档
+
+# 每次宣布「今天要写多少字」的见面礼：真人写日记不会每天等长。
+# 三档 = (目标字数系数, 容差系数)：素材少就短写，素材多才摊得开。
+_WORD_TIER_SCALES = {
+    "short": (0.4, 0.5),
+    "mid": (0.7, 0.7),
+    "long": (1.0, 1.0),
+}
+_WORD_TIER_NAMES = {"short": "短", "mid": "中", "long": "长"}
+
+# 短档再短也不能低于这个数（3 倍 :data:`MIN_DIARY_CHARS`）：低于它就逼近
+# ``diary_output_problem`` 那条 20 字语义闸，等于天天把模型往「输出过短」上推 ——
+# 生成侧的引导绝不能和发布闸打架。默认 350×0.4=140，远高于它。
+_MIN_TIER_TARGET = MIN_DIARY_CHARS * 3
+
+
+def choose_word_budget(
+    word_target: int,
+    word_tolerance: int,
+    *,
+    event_count: int = 0,
+    material_mode: str = "events",
+) -> Dict[str, Any]:
+    """按素材丰富度选篇幅档位（**纯函数**，便于单测）。
+
+    为什么不再"每天都写同样的长度"：固定 350±150 会逼着模型凑字，而凑出来的
+    多半就是空转动作、复述自己、每段感受收尾这三样（v1.4.3 治过的三种病）。
+
+    档位判据是**确定性**的 —— 同一天同样素材永远同一档，出问题能精确定位：
+
+    ==============================  ======
+    条件                            档位
+    ==============================  ======
+    ``material_mode == timeline_tail``（选材降级）  短
+    入选事件 ≤ 1 件                 短
+    入选事件 = 2 件                 中
+    入选事件 ≥ 3 件                 长
+    ==============================  ======
+
+    Args:
+        word_target: 配置的字数目标，作为**长档**基准。
+        word_tolerance: 配置的容差，同样按比例缩放。
+        event_count: 实际入选事件数。
+        material_mode: 素材来源（``events`` / ``timeline_tail``）。
+
+    Returns:
+        ``{"tier", "target", "tolerance", "lo", "hi", "reason"}``，
+        其中 ``tier`` 是「短/中/长」，``reason`` 供日志回读（不含聊天内容）。
+    """
+    base = max(1, int(word_target))
+    base_tol = max(0, int(word_tolerance))
+    try:
+        count = max(0, int(event_count))
+    except (TypeError, ValueError):
+        count = 0
+    mode = str(material_mode or "").strip()
+    if mode == "timeline_tail":
+        tier, reason = "short", "选材降级"
+    elif count <= 1:
+        tier, reason = "short", f"入选 {count} 件"
+    elif count == 2:
+        tier, reason = "mid", "入选 2 件"
+    else:
+        tier, reason = "long", f"入选 {count} 件"
+    scale, tol_scale = _WORD_TIER_SCALES[tier]
+    target = max(_MIN_TIER_TARGET, round(base * scale))
+    tolerance = max(0, round(base_tol * tol_scale))
+    # 下限也不许掉到语义闸以下（容差配得比目标还大时会走到这里）
+    lo = max(MIN_DIARY_CHARS + 1, target - tolerance)
+    hi = max(target + tolerance, lo + 1)
+    return {
+        "tier": _WORD_TIER_NAMES[tier],
+        "target": target,
+        "tolerance": tolerance,
+        "lo": lo,
+        "hi": hi,
+        "reason": reason,
+    }
+
+
+# ---------------------------------------------------------------- 开场轮换
+
+# 结构定式本身就是最大的 AI tell：每天「日期行 → 逐条转述 → 引用 → 感受收尾」，
+# 哪怕每一句都写得像人，读者看三篇就认出来了。这里给 4 种开场骨架，
+# 按**日期哈希**确定性轮换 —— 同一天一定同一种（可复现、可单测、出怪场能定位）。
+#
+# ⚠️ 文案里绝不用「」写词：引号在本插件的 prompt 里有专属含义（只能装别人的原话），
+# hint 里出现「」会让模型以为那也是引用，等于给规则 3 制造歧义。
+_OPENING_HINTS = (
+    "从今天印象最深的那件事写起，别先交代时间地点。",
+    "用今天听到的一句话开头，后面再说是什么事。",
+    "先写此刻的状态（困不困、心里还挂着什么），再回头说今天的事。",
+    '自由开场，但正文第一句不许出现"今天"这两个字。',
+)
+
+
+def opening_hint(date_str: str) -> str:
+    """按日期确定性轮换开场骨架。
+
+    同一个 ``date_str`` 永远返回同一条；不同日期大体均匀落在 4 种骨架上。
+    日期缺失/异常时返回第 0 条（不抛异常 —— 开场提示不值当让成文失败）。
+    """
+    digest = hashlib.sha256(str(date_str or "").encode("utf-8")).hexdigest()
+    return _OPENING_HINTS[int(digest[:8], 16) % len(_OPENING_HINTS)]
+
+
+# ---------------------------------------------------------------- AI 腔检测
+
+# AI 腔特征清单。**非阻断**：命中只写进存档字段 ai_tone_hits 并打一行 INFO，
+# 用于观察「改了 prompt 之后，腔调有没有真的降下来」—— 这是本方案的回归指标。
+#
+# ⚠️ 只取**强特征**：宁可漏报也不误报。日记是给人看的，误报只会把作者的注意力
+# 引到没问题的句子上。又因为要写进日志，一律只回标签、不回命中原文
+# （聊天原话可能被引号捎带进正文；本插件约定日志不得出现聊天逐字原话）。
+_AI_TONE_PATTERNS = (
+    ("总结式收尾", re.compile(r"真是[^。！？!\n]{0,12}的一[天晚日]")),
+    ("展望收尾", re.compile(r"明天也(?:要|得|会|记得|希望)")),
+    ("治愈系词汇", re.compile(r"充实|治愈|小确幸|治愈感")),
+    ("顿悟句式", re.compile(r"我(?:意识到|明白了|突然发现|懂得了|忽然觉得|终于明白)")),
+    ("连续感叹号", re.compile(r"[!！]{2,}")),
+)
+
+# 排比：同一行里连续 3 个短分句**开头两个字完全一样**（「一遍…一遍…一遍…」）。
+# 这是最典型的 AI 排比形态；正常口语不会连用三次同样的结构。
+_CLAUSE_SPLIT_RE = re.compile(r"[，,、；;]")
+
+
+def _parallelism_hit(content: str) -> bool:
+    for line in str(content or "").split("\n"):
+        clauses = [c.strip() for c in _CLAUSE_SPLIT_RE.split(line)]
+        clauses = [c for c in clauses if len(c) >= 2]
+        for i in range(len(clauses) - 2):
+            heads = {c[:2] for c in clauses[i : i + 3]}
+            if len(heads) == 1:
+                return True
+    return False
+
+
+def ai_tone_hits(content: str) -> List[str]:
+    """检测日记正文里的 AI 腔特征。返回**命中的标签列表**（去重、稳定顺序）。
+
+    无命中返回空列表。非阻断，调用方只做留痕与统计，不得据此判成品失败。
+    """
+    body = str(content or "")
+    if not body.strip():
+        return []
+    hits: List[str] = []
+    for label, pattern in _AI_TONE_PATTERNS:
+        if pattern.search(body) and label not in hits:
+            hits.append(label)
+    if _parallelism_hit(body) and "排比句式" not in hits:
+        hits.append("排比句式")
+    return hits
+
+
 def build_write_prompt(
     *,
     date_str: str,
@@ -420,10 +811,16 @@ def build_write_prompt(
     temporal_anchor: str = "",
     continuity_text: str = "",
 ) -> str:
-    """阶段二：基于精选素材写日记。
+    """阶段二：基于精选素材写日记（v1.5.0「去 AI 味」改写）。
+
+    改写的出发点：**AI 味的来源不是单句措辞，而是四个结构性问题** ——
+    规则过载（10 条编号规则让模型把算力花在"合规"上）、结构定式（日期→事件→
+    引用→感受，尤其"每篇必须有引用"）、视角错位（被设定成"复盘聊天记录的
+    书记员"而不是"过完了这一天的人"）、篇幅偏长（逼着模型凑字）。
 
     Args:
         word_target: 目标字数（正文）。**只是"最合适的长度"，不是硬指标**。
+            调用方通常传 :func:`choose_word_budget` 算出来的当档目标。
         word_tolerance: 上下浮动。区间宽一点更贴合「想到哪写到哪」的基调 ——
             真机实测模型常自然写到目标之上（目标 250 时写出 341 字），
             区间太窄等于每次都在越界，逼着它回头删或硬凑。
@@ -434,9 +831,6 @@ def build_write_prompt(
     """
     name_line = f"我的名字是{name}。" if name else ""
     persona_line = persona or "是一个爱聊天的机器人。"
-    # 编号必须排在规则 9（篇幅）之后 —— 曾硬编码成 8、v1.4.3 又因新增规则 4 顺延，
-    # 两次都与前面的规则撞号（撞号会让模型把两条规则读成一条）。
-    style_line = f"\n10. {style_extra}" if style_extra else ""
     tol = max(0, int(word_tolerance))
     target = max(1, int(word_target))
     lo, hi = max(1, target - tol), target + tol
@@ -448,40 +842,68 @@ def build_write_prompt(
             "不是真正的今天。\n"
         )
     continuity_block = f"\n{continuity_text}\n" if continuity_text.strip() else ""
+
+    # 规则区：原来 10 条编号规则吃到模型一半注意力，写出来谨慎、平、安全。
+    # v1.5.0 压到 6 条 —— 但**只压表述、不删约束**：
+    # 引号边界、日期行格式、事实纪律、META 块、不得硬凑，这些硬契约一条都没动；
+    # v1.4.3 治过的三种病（空转动作 / 复述自己 / 每段感受收尾）并成规则 4 的一句话。
+    # ⚠️ 编号**动态生成**：曾两次因为改规则数把 style_extra 的编号算错（撞号会让
+    # 模型把两条规则读成一条），交给 enumerate 就再也不会错。
+    rules = [
+        f"第一行固定为 {date_str}，X。其中 X 从 晴/多云/阴/雨 里选一个贴合今天聊天氛围的，"
+        "只选一个字都不许多。",
+        f"只写上面你真想写的事，最多写 {max_events} 件，可以只写一两件。"
+        "没劲的一天就写短点，三五句也行，绝不硬凑字数。",
+        # 引用降级：素材给了原话就顺口引一句，没给就不引 —— "每篇必须抄一句别人原话"
+        # 既不真人，又是 v1.2.7 / v1.4.5 那串引号归属病的上游诱因（为了完成指标硬凑引用）。
+        # **边界约束一条不留全部保留**，只是不再下达"必须引用"的指标。
+        "素材给了聊天原话就顺口引一句放进「」里，没给就不引 —— 不必为了引用而引用。\n"
+        "   「」里面只能放**别人说过的原话、一字不改**；我自己的话一律写在引号**外面**。\n"
+        "   错误写法：回了句「来首无名策岂不美哉 安排上了，好听」（把自己的回复也塞进了引号，"
+        "读起来像整句都是我说的）\n"
+        "   正确写法：有人提了《无名策》，回了句「来首无名策岂不美哉」，我说安排上了，好听。\n"
+        "   **一对「」只装一个人的一句话**，绝不能把两个人的话焊在同一对引号里。\n"
+        "   反例：「烧退了 鼻子还是堵的 先补个觉 我也鼻子堵」—— 前半句是别人说的、后半句是"
+        "我说的，这等于替别人发言；正确写法是别人说的进「」，我说的写引号外。\n"
+        "   聊天记录里若是**「引用后回复」**（先引了别人的话、再紧跟我的回复），"
+        "只引用**被引的那一句**，我的回复写在引号外面。\n"
+        "   另外，凡是引用聊天原话都用「」，不要用 \"\" 或 '' 代替；能顺带点出是谁说的更好。",
+        "像睡前随手写的：句子短，允许有点碎，允许口语和自嘲，想到哪写到哪，"
+        "但别写成聊天记录复述。\n"
+        "   三种啰嗦写法，写完通读一遍就删掉：只有动作没内容的句子；换个说法又说一遍；"
+        "每段都拿我的感受收尾。",
+        "**事实纪律**：主观感受和情绪可以自由写；但**没有依据就不得制造**人物、地点、对话、"
+        "结果或新的事实。\n"
+        "   拿不准的地方用\"好像\"\"应该是\"\"记不清了\"这类不确定语气带过 —— 文风自由不等于"
+        "客观事实可以补写。\n"
+        "   ⚠️ 「我问/我说」只能用在**素材真有的互动**上：素材里没写我问过，就不要写我问过"
+        "（这正是上面说的\"只有动作没内容\"）。缺转场就直接写结果（「她还没给新歌取名。」），"
+        "比编一个动作再让它落空强。\n"
+        "   上面的跨天线索（若有）只能用来引出想法、疑问、期待，或带原日期的回顾；"
+        "它**不能单独证明今天发生了什么**，今天的事必须有上面的素材作依据。",
+        "禁止出现：开头问候语；结尾总结或展望（如\"明天也要加油\"\"真是充实的一天\"）；"
+        "\"我意识到/我明白了/我突然发现\"句式；连续感叹号；排比句。",
+        f"篇幅：{lo}~{hi} 字，{target} 字上下最舒服。**字数是给你留的余地，不是任务** ——\n"
+        "   宁可短一点也别硬凑；写完了觉得还差口气，就多补一句感受，别去堆形容词。"
+        "除第一行外就是日记正文：不要标题、不要 markdown、不要\"日记\"二字开头、"
+        "不要任何前后缀或解释。",
+    ]
+    if style_extra and style_extra.strip():
+        rules.append(style_extra.strip())
+    rules_text = "\n".join(f"{i}. {rule}" for i, rule in enumerate(rules, 1))
+    # 视角：素材是"脑子里还留着的片段"，不是"整理好的聊天记录复盘"。
+    # 被设定成书记员 → 输出必然是转述体；过完了一天的人才会先有印象、再有顺序。
     return f"""{name_line}
 我{persona_line}
 {anchor_block}
-今天是 {date_str}。睡前翻了翻今天的聊天记录，值得记的事整理如下：
+今天是 {date_str}。这一天过完了，睡前随手记一下。脑子里还留着这些片段：
 
 {events_text}
 {continuity_block}
-现在以第一人称写一篇日记。规则（重要，逐条遵守）：
-1. 第一行固定为 {date_str}，X。其中 X 从 晴/多云/阴/雨 里选一个贴合今天聊天氛围的，只选一个字都不许多。
-2. 只写上面你真想写的事，最多写 {max_events} 件，可以只写一两件。没劲的一天就写短点，三五句也行，绝不硬凑字数。
-3. 至少一处用「」引用素材里给的聊天原话，并且**严格遵守引号边界**：
-   「」里面只能放**别人说过的原话、一字不改**；我自己的话一律写在引号**外面**。
-   错误写法：回了句「来首无名策岂不美哉 安排上了，好听」（把自己的回复也塞进了引号，读起来像整句都是我说的）
-   正确写法：有人提了《无名策》，回了句「来首无名策岂不美哉」，我说安排上了，好听。
-   另外，凡是引用聊天原话都用「」，不要用 "" 或 '' 代替；能顺带点出是谁说的更好。
-4. **写完一段做一次自检**（v1.4.3 新增），这三条都要过：
-   a) 段落里出现「我问 / 我说 / 我回」这类动作时，**后面必须跟具体内容** ——
-      对方说了什么，或我心里怎么想。只有动作、没有内容，就是空转，删掉。
-      错误：我问她想好名字了没，她没答 （"我问了"素材里没有，"她没答"等于什么都没写成）
-      正确：她还没给新歌取名，不知道会是什么风格，有点好奇。
-   b) 同一个意思**只写一次**。不许「我说了A，其实我心里也是A」这种自己复述自己。
-      自检办法：把这一段的最后一句删掉，如果读起来信息量没变化，就删掉它再往下写。
-   c) 段落最后一句别都落在「我的感受」上。全篇最多一段以我的感受收尾，
-      其余落在**对方的话、事情的结果、或者还没解开的地方**上。
-5. 禁止出现：开头问候语；结尾总结或展望（如"明天也要加油""真是充实的一天"）；"我意识到/我明白了/我突然发现"句式；连续感叹号；排比句。
-6. 像睡前随手写的：句子短，允许有点碎，允许口语和自嘲，想到哪写到哪，但别写成聊天记录复述。
-7. **事实纪律**：主观感受和情绪可以自由写；但**没有依据就不得制造**人物、地点、对话、结果或新的事实。
-   拿不准的地方用"好像""应该是""记不清了"这类不确定语气带过 —— 文风自由不等于客观事实可以补写。
-   ⚠️ 规则 4a 说的「我问/我说」只能用在**素材真有的互动**上：素材里没写我问过，就不要写我问过。
-   缺转场就直接写结果（「她还没给新歌取名。」），比编一个动作再让它落空强。
-8. 上面的跨天线索（若有）只能用来引出想法、疑问、期待，或带原日期的回顾；
-   它**不能单独证明今天发生了什么**，今天的事必须有「值得记的事」作依据。
-9. 篇幅：{lo}~{hi} 字，{target} 字上下最舒服。**字数是给你留的余地，不是任务** ——
-   宁可短一点也别硬凑；写完了觉得还差口气，就多补一句感受，别去堆形容词。除第一行外就是日记正文：不要标题、不要 markdown、不要"日记"二字开头、不要任何前后缀或解释。{style_line}
+现在以第一人称写一篇日记。
+开场：{opening_hint(date_str)}
+规则（重要，逐条遵守）：
+{rules_text}
 
 日记正文写完后，另起一段只输出下面这两行（用于归档，**不会被发表**）：
 {META_MARKER}
@@ -639,10 +1061,40 @@ def _strip_date_components(line: str) -> str:
     return rest
 
 
+def trailing_date_line(content: str, date_str: str) -> tuple[str, str] | None:
+    """判断**最后一个非空行**是不是目标日期的日期行。
+
+    真机踩坑（2026-10-08）：模型把日期行又写了一遍在**结尾**（当签名用），
+    而且天气和首行不一致（首行「阴。」、尾行「晴」）——
+    发布出去就是首尾两行日期 + 天气自相矛盾。旧版只看首行，结尾那行从来没人管。
+
+    Returns:
+        是 → ``(天气, 删掉该行之后的内容)``；不是 → ``None``。
+        天气可能为空串（模型没写天气）。
+    """
+    lines = str(content or "").split("\n")
+    idx = len(lines) - 1
+    while idx >= 0 and not lines[idx].strip():
+        idx -= 1
+    if idx < 0:
+        return None
+    parsed = parse_date_line(lines[idx], date_str)
+    if parsed is None:
+        return None
+    weather, leftover = parsed
+    del lines[idx]
+    if leftover:
+        lines.insert(idx, leftover)
+    return weather, "\n".join(lines)
+
+
 def ensure_date_line(content: str, date_str: str) -> str:
     """保证第一行是日期行，并把它**规范成** ``<日期>，<天气>。``。
 
-    四种输入都能正确处理：
+    五种输入都能正确处理：
+
+    0. **结尾多写了一行日期**（v1.4.5 修，真机 2026-10-08）→ 删掉该行；
+       若首行压根没有日期行，就**沿用结尾那行的天气**（别浪费模型已经写的天气）。
 
     1. 没写日期行 → 补一行（天气用默认值）。
     2. 写了但格式不标准（缺逗号 / 缺句号 / 用短式 ``9月28日``）→ 就地规范化，
@@ -660,6 +1112,16 @@ def ensure_date_line(content: str, date_str: str) -> str:
     """
     if not content:
         return f"{date_str}，{DEFAULT_WEATHER}。\n（今天没写出什么来。）"
+    # ① 先处理**结尾**的日期行：删掉它，并把它写的天气留作备用。
+    #    模型有时把日期行当签名写在最后，留着就是"两行日期"（真机 2026-10-08）。
+    tail_weather = ""
+    _tail = trailing_date_line(content, date_str)
+    if _tail is not None:
+        tail_weather, content = _tail
+    if not content.strip():
+        # 整篇就只有那一行日期（罕见）→ 保留它的天气，按空内容兜底
+        return f"{date_str}，{tail_weather or DEFAULT_WEATHER}。\n（今天没写出什么来。）"
+
     lines = content.split("\n")
     # 跳过可能存在的空行，日期行必须是**第一个非空行**
     idx = next((i for i, ln in enumerate(lines) if ln.strip()), 0)
@@ -676,7 +1138,8 @@ def ensure_date_line(content: str, date_str: str) -> str:
         # 没有可识别的日期行 → 补一行。若有前导空行，插在**第一个非空行之前**，
         # 而不是直接 return（曾经写成 `... if idx == 0 else content`，
         # 结果「空行开头且没写日期行」时整篇缺日期头）。
-        lines.insert(idx, f"{date_str}，{DEFAULT_WEATHER}。")
+        # 天气优先用**结尾那行日期行**留下的（模型写了就别浪费），没有才用默认值。
+        lines.insert(idx, f"{date_str}，{tail_weather or DEFAULT_WEATHER}。")
         return "\n".join(lines)
     else:
         weather, leftover = parsed

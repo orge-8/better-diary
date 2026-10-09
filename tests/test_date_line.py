@@ -238,6 +238,56 @@ def test_dash_date_format_also_works():
     assert out.count("2026年9月28日") == 1
 
 
+def test_trailing_duplicate_date_line_is_removed():
+    """真机 2026-10-08：模型在结尾又写了一遍日期行（天气还和首行不一致）。"""
+    body = (
+        "2026年10月8日 星期四，阴。\n"
+        "烧退了，鼻子还是有点堵，但整个人活过来了。\n"
+        "Rana 昨天发的图还没细看，等明天精神再好一点补上。\n"
+        "2026年10月8日 星期四，晴"
+    )
+    out = BD.ensure_date_line(body, "2026年10月8日 星期四")
+    lines = [ln for ln in out.split("\n") if ln.strip()]
+    assert lines[0] == "2026年10月8日 星期四，阴。", out
+    assert out.count("2026年10月8日") == 1, f"结尾的日期行没删掉：{out!r}"
+    assert "晴" not in out, f"结尾那行的天气不该被留下来：{out!r}"
+    assert "等明天精神再好一点补上。" in out, "正文不能被误删"
+
+
+def test_date_line_only_at_the_end_is_moved_to_the_top():
+    """模型把日期行只写在结尾时：搬上去，并**沿用它的天气**（别浪费）。"""
+    out = BD.ensure_date_line(
+        "烧退了，今天终于有精力翻聊天记录。\n2026年10月8日 星期四，晴",
+        "2026年10月8日 星期四",
+    )
+    assert out.split("\n")[0] == "2026年10月8日 星期四，晴。", out
+    assert "晴" in out and "多云" not in out, out
+    assert "烧退了，今天终于有精力翻聊天记录。" in out
+
+
+def test_trailing_weather_not_used_when_head_has_one():
+    """首行已有日期行时，结尾那行的天气不采用（首行才是权威位置）。"""
+    out = BD.ensure_date_line(
+        "2026年10月8日 星期四，雨。\n正文一句。\n2026年10月8日 星期四，晴",
+        "2026年10月8日 星期四",
+    )
+    assert out.split("\n")[0] == "2026年10月8日 星期四，雨。", out
+    assert out.count("2026年10月8日") == 1, out
+
+
+def test_trailing_line_that_only_looks_like_prose_is_kept():
+    """结尾是正文（提到年份但不是日期行）→ 不能被删。"""
+    body = "2026年10月8日 星期四，阴。\n今天聊到 2026年过得真快。"
+    out = BD.ensure_date_line(body, "2026年10月8日 星期四")
+    assert "2026年过得真快" in out, out
+
+
+def test_trailing_date_line_helper_returns_weather_and_stripped_text():
+    got = BD.trailing_date_line("正文。\n2026年10月8日 星期四，晴", "2026年10月8日 星期四")
+    assert got is not None and got[0] == "晴" and got[1] == "正文。", got
+    assert BD.trailing_date_line("只有正文，没有日期行。", "2026年10月8日 星期四") is None
+
+
 def test_parse_date_line_rejects_foreign_dates():
     """parse_date_line 对别的日期返回 None（供折叠逻辑判断）。"""
     assert BD.parse_date_line("2026年9月27日 星期日，晴。", DATE) is None
@@ -279,44 +329,85 @@ def test_word_range_never_goes_below_one():
 
 
 def test_style_extra_numbering_does_not_collide():
-    """style_extra 的编号必须排在字数规则（9）之后，不能撞号。"""
+    """style_extra 必须排在**所有规则之后**，且规则区编号不撞号。
+
+    v1.5.0 起编号由 ``enumerate`` 动态生成 —— 历史上有两次因为改规则条数把
+    style_extra 的编号算错（撞号会让模型把两条规则读成一条），交给程序就再也不会错。
+    """
     prompt = BD.build_write_prompt(
         date_str=DATE, events_text="- 甲：事", name="鸣澜", persona="p",
         style_extra="多用叠词",
     )
-    assert "\n10. 多用叠词" in prompt
-    assert "\n9. 篇幅：" in prompt
+    assert "\n8. 多用叠词" in prompt
+    assert "\n7. 篇幅：" in prompt
     # 每条规则编号在**规则区**内只能出现一次（撞号会让模型把两条读成一条）
     rules_region, _, _ = prompt.partition("日记正文写完后")
     nums = [ln.split(".", 1)[0] for ln in rules_region.split("\n") if re.match(r"^\d{1,2}\. ", ln)]
     assert nums, rules_region
     assert len(nums) == len(set(nums)), f"规则编号撞号：{nums}"
+    # 编号必须是连续递增的 1..N（编号乱跳同样会让模型读串）
+    assert nums == [str(i) for i in range(1, len(nums) + 1)], f"规则编号不连续：{nums}"
+
+
+def test_opening_hint_is_rotated_and_deterministic():
+    """开场骨架：同一天永远同一种（可复现），不同天轮换得开（不构成定式）。
+
+    「每天同一副骨架」是最大的 AI tell —— 哪怕每句都像人写的，连看三篇就认出来了。
+    """
+    hint = BD.opening_hint(DATE)
+    assert hint == BD.opening_hint(DATE)
+    seen = {BD.opening_hint(f"2026-01-{d:02d}") for d in range(1, 29)}
+    assert len(seen) >= 3, seen  # 28 天里至少要轮换到 3 种以上
+    # hint 里不许出现「」：引号在本 prompt 里有专属含义（只能装别人的原话），
+    # 出现在开场提示里会给规则 3 制造歧义
+    assert "「" not in hint and "」" not in hint, hint
+
+
+def test_write_prompt_uses_human_viewpoint_and_opening():
+    """视角转换：「整理聊天记录」→「脑子里还留着这些片段」+ 开场 hint 进 prompt。"""
+    prompt = BD.build_write_prompt(
+        date_str=DATE, events_text="- 甲：事", name="鸣澜", persona="p"
+    )
+    assert "这一天过完了，睡前随手记一下" in prompt
+    # 旧的书记员视角不能留
+    assert "睡前翻了翻今天的聊天记录" not in prompt
+    assert f"开场：{BD.opening_hint(DATE)}" in prompt
+
+
+def test_quote_duty_is_downgraded_but_bounds_kept():
+    """引用降级：不再下达"至少一处引用"的指标，但**边界约束一条不能少**。"""
+    prompt = BD.build_write_prompt(
+        date_str=DATE, events_text="- 甲：事", name="鸣澜", persona="p"
+    )
+    assert "没给就不引" in prompt
+    assert "至少一处用「」引用" not in prompt
+    # 边界硬约束
+    for must in ("只能放", "一字不改", "外面", "一对「」只装一个人的一句话", "引用后回复"):
+        assert must in prompt, must
 
 
 def test_self_check_rules_are_present_with_counterexample():
-    """v1.4.3 的自检三条（a/b/c）必须在 prompt 里，且带**反例**。
+    """三种病（空转动作 / 复述自己 / 每段感受收尾）的约束在 v1.5.0 里**压缩但没删**。
 
     这三条治的是真机成品里的三种现象：
     - a 空转动作（"我问她想好名字了没，她没答"）—— 动作后没有具体内容
     - b 自己复述自己（"我说不知道…其实我也好奇过"）—— 同一意思写两遍
     - c 每段都以"我的感受"收尾 —— 结构性单调
-    反例是这条约束能被模型执行的关键：光说"别空转"它不知道该躲什么。
+
+    ⚠️ v1.5.0 把它们压成规则 4 的**一句话**（10 条编号规则会让模型把算力花在合规上，
+    产出反而谨慎、平、安全），但约束必须还在 —— 判定方法是**这三种现象还有对应禁令**。
     """
     prompt = BD.build_write_prompt(
         date_str=DATE, events_text="- 甲：事", name="鸣澜", persona="p"
     )
-    assert "写完一段做一次自检" in prompt
-    # a：空转动作 + 反例
-    assert "我问她想好名字了没，她没答" in prompt, "反例丢了，模型不知道该躲什么"
-    assert "后面必须跟具体内容" in prompt
-    # b：同一意思只写一次 + 可执行的自检动作（删最后一句看信息量）
-    assert "同一个意思**只写一次**" in prompt
-    assert "信息量没变化" in prompt
-    # c：感受收尾的配额
-    assert "最多一段以我的感受收尾" in prompt
-    # 事实纪律要指向 4a（有真素材才能写"我问"）——两条规则必须交叉引用，
-    # 否则模型会拿"文风自由"给凭空造动作开脱
-    assert "规则 4a" in prompt
+    # a：只有动作没内容的句子
+    assert "只有动作没内容" in prompt, "空转约束丢了"
+    # b：换个说法又说一遍
+    assert "换个说法又说一遍" in prompt, "复述自己的约束丢了"
+    # c：每段都拿感受收尾
+    assert "每段都拿我的感受收尾" in prompt, "感受收尾约束丢了"
+    # 事实纪律仍然交叉引用 a（有真素材才能写"我问"）—— 否则模型会拿"文风自由"开脱
+    assert "只有动作没内容" in prompt and "素材里没写我问过" in prompt
 
 
 def test_self_check_rules_do_not_touch_existing_contracts():
@@ -325,7 +416,7 @@ def test_self_check_rules_do_not_touch_existing_contracts():
     prompt = BD.build_write_prompt(
         date_str=DATE, events_text="- 甲：事", name="鸣澜", persona="p"
     )
-    for must in ("严格遵守引号边界", "事实纪律", "别硬凑", "不要标题"):
+    for must in ("只能放", "一字不改", "事实纪律", "别硬凑", "不要标题"):
         assert must in prompt, must
     # 真机成品（本次优化依据的那篇）本身必须仍是"可发布"的 —— 新规则只影响生成，
     # 不改发布判据，所以成品不会被事后判死

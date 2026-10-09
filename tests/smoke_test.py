@@ -15,6 +15,7 @@ import asyncio
 import importlib.util
 import json
 import logging
+import re
 import sys
 import tempfile
 import time as _time
@@ -471,16 +472,21 @@ print("NOHTTPX-LOAD-OK")
     check("给出了错误/正确写法对照", "错误写法" in wp and "正确写法" in wp)
     check("错误写法示例点出混写问题", "安排上了，好听" in wp)
 
-    print("\n[3c] 成文 prompt 契约（自检三条：空转 / 复述 / 感受收尾）")
-    # 真机成品（2026-09-30 那篇）暴露的三个现象，各配一条约束 + 一条反例
-    check("要求写完一段自检", "写完一段做一次自检" in wp)
-    check("a) 动作后必须跟具体内容", "后面必须跟具体内容" in wp)
-    check("a) 带空转反例（模型要知道躲什么）", "我问她想好名字了没，她没答" in wp)
-    check("b) 同一意思只写一次", "同一个意思**只写一次**" in wp)
-    check("b) 给了可执行的自检动作", "信息量没变化" in wp)
-    check("c) 感受收尾有名额上限", "最多一段以我的感受收尾" in wp)
-    check("事实纪律交叉引用规则 4a", "规则 4a" in wp)
-    check("自检三条不破坏既有引用纪律", "严格遵守引号边界" in wp and "事实纪律" in wp)
+    print("\n[3c] 成文 prompt 契约（v1.5.0 瘦身：三种病压缩成一句话 + 引用降级）")
+    # 真机成品（2026-09-30 那篇）暴露的三个现象 → v1.4.3 拆成三条自检，
+    # v1.5.0 把三条压成一句话（规则过载本身就是 AI tell），**约束一条不许少**。
+    check("空转动作约束还在（形式变了）", "只有动作没内容" in wp)
+    check("复述自己约束还在（形式变了）", "换个说法又说一遍" in wp)
+    check("感受收尾约束还在（形式变了）", "每段都拿我的感受收尾" in wp)
+    check("旧的「写完一段做一次自检」已移除（单次生成里执行不了）",
+          "写完一段做一次自检" not in wp)
+    check("规则编号不再超 6 条 + style_extra（瘦身）", len([ln for ln in wp.split("\n")
+          if re.match(r"^\d{1,2}\. ", ln)]) <= 8, "规则数")
+    # 引用降级：不再下达「至少一处引用」的指标，但边界约束全部保留
+    check("不再要求「至少一处用「」引用」", "至少一处用「」引用" not in wp)
+    check("引用改成「给了就引、没给就不引」", "没给就不引" in wp)
+    check("引用边界硬约束保留（这是十二分不能松的）", "只能放" in wp and "一字不改" in wp)
+    check("瘦身没带走事实纪律与硬契约", "事实纪律" in wp and "不得制造" in wp and "不要标题" in wp)
 
     # 引用体检（非阻断）
     q_ok = "他说「来首无名策岂不美哉」，我回了句安排上了，好听。"
@@ -521,6 +527,116 @@ print("NOHTTPX-LOAD-OK")
         saved = json.loads(store.read_text(encoding="utf-8")) if store.exists() else {}
         check("存档含当日内容", "2026-09-26" in saved and saved["2026-09-26"]["word_count"] > 0)
         check("config 读取了 Host 人设", "personality.personality" in ctx.config_calls)
+
+        print("\n[4b] v1.5.0 人味三件套接线（篇幅档位 / AI 腔落盘）")
+        # ① 选材 2 件 → 中档 245±105
+        _prompts: list[str] = []
+
+        def llm_two(prompt: str) -> dict:
+            _prompts.append(prompt)
+            if "日记素材编辑" in prompt:
+                return {"success": True, "response": json.dumps(
+                    [{"who": "Acer", "what": "坐五小时大巴回来", "quote": "路边锅盔很香", "score": 5},
+                     {"who": "某人", "what": "拍了萤火虫", "quote": "", "score": 3}],
+                    ensure_ascii=False)}
+            return {"success": True, "response": "2026年9月27日 星期日，多云。\n又是一个人坐车回来，饿了一天。"}
+
+        with tempfile.TemporaryDirectory() as td_hr:
+            hr_dir = Path(td_hr)
+            ctx_hr = FakeCtx(hr_dir, make_messages(1789507200.0), llm_two)
+            ph = plugin_mod.create_plugin()
+            try:
+                ph.ctx = ctx_hr
+            except AttributeError:
+                ph._ctx = ctx_hr
+            ph.set_plugin_config(
+                {
+                    "plugin": {"enabled": True, "config_version": "1.0.0"},
+                    "diary": {"min_messages": 2, "filter_mode": "all"},
+                    "schedule": {"enabled": False},
+                    "security": {"admin_ids": []},
+                }
+            )
+            ok_hr, _ = asyncio.run(ph._generate_for_date("2026-09-27"))
+            check("2 件素材也能成文", ok_hr)
+            _write_prompt = next((p for p in _prompts if "睡前随手记一下" in p), "")
+            check("成文 prompt 用的是**新视角**", "睡前随手记一下" in _write_prompt, _write_prompt[:80])
+            check("成文 prompt 带开场 hint", "开场：" in _write_prompt)
+            check("2 件 → 中档 245 字（140~350）",
+                  "篇幅：140~350 字，245 字上下" in _write_prompt, "档位没接上 choose_word_budget")
+            _saved_hr = json.loads((hr_dir / "diaries.json").read_text(encoding="utf-8"))
+            _entry = _saved_hr.get("2026-09-27", {})
+            check("存档带 ai_tone_hits 字段（空列表 = 没命中）",
+                  _entry.get("ai_tone_hits") == [], str(_entry.get("ai_tone_hits")))
+
+        # ② 选材返回空数组 → 降级 timeline_tail → 短档 140±75
+        _prompts_tail: list[str] = []
+
+        def llm_none(prompt: str) -> dict:
+            _prompts_tail.append(prompt)
+            if "日记素材编辑" in prompt:
+                return {"success": True, "response": "[]"}
+            return {"success": True, "response": "2026年9月28日 星期一，阴。\n今天没聊几句就散了。"}
+
+        with tempfile.TemporaryDirectory() as td_tail:
+            tail_dir = Path(td_tail)
+            ctx_tl = FakeCtx(tail_dir, make_messages(1789507200.0), llm_none)
+            pt = plugin_mod.create_plugin()
+            try:
+                pt.ctx = ctx_tl
+            except AttributeError:
+                pt._ctx = ctx_tl
+            pt.set_plugin_config(
+                {
+                    "plugin": {"enabled": True, "config_version": "1.0.0"},
+                    "diary": {"min_messages": 2, "filter_mode": "all"},
+                    "schedule": {"enabled": False},
+                    "security": {"admin_ids": []},
+                }
+            )
+            ok_tl, _ = asyncio.run(pt._generate_for_date("2026-09-28"))
+            check("选材为空也能降级成文", ok_tl)
+            _tail_prompt = next((p for p in _prompts_tail if "睡前随手记一下" in p), "")
+            check("降级 → 短档 140 字（65~215）",
+                  "篇幅：65~215 字，140 字上下" in _tail_prompt, "降级没走到短档")
+            _saved_tl = json.loads((tail_dir / "diaries.json").read_text(encoding="utf-8"))
+            check("降级那天 material_mode 仍是 timeline_tail",
+                  _saved_tl.get("2026-09-28", {}).get("material_mode") == "timeline_tail")
+
+        # ③ AI 腔检测：套话连篇的示例正文 → 命中标签落进存档（但照常成文）
+        with tempfile.TemporaryDirectory() as td_tone:
+            tone_dir = Path(td_tone)
+
+            def llm_tone(prompt: str) -> dict:
+                if "日记素材编辑" in prompt:
+                    return {"success": True, "response": "[]"}
+                return {"success": True, "response": (
+                    "2026年9月29日 星期二，晴。\n"
+                    "今天真是充实的一天！！我意识到要慢下来，明天也要加油。"
+                )}
+
+            ctx_tone = FakeCtx(tone_dir, make_messages(1789507200.0), llm_tone)
+            pn = plugin_mod.create_plugin()
+            try:
+                pn.ctx = ctx_tone
+            except AttributeError:
+                pn._ctx = ctx_tone
+            pn.set_plugin_config(
+                {
+                    "plugin": {"enabled": True, "config_version": "1.0.0"},
+                    "diary": {"min_messages": 2, "filter_mode": "all"},
+                    "schedule": {"enabled": False},
+                    "security": {"admin_ids": []},
+                }
+            )
+            ok_tone, _ = asyncio.run(pn._generate_for_date("2026-09-29"))
+            check("AI 腔正文**照常成文**（检测器非阻塞）", ok_tone)
+            _tone_entry = json.loads((tone_dir / "diaries.json").read_text(encoding="utf-8"))["2026-09-29"]
+            check("AI 腔命中落进存档", len(_tone_entry.get("ai_tone_hits") or []) >= 4,
+                  str(_tone_entry.get("ai_tone_hits")))
+            check("命中项只是标签、不含原文",
+                  all("明天" not in h and "充实" not in h for h in _tone_entry["ai_tone_hits"]),
+                  str(_tone_entry["ai_tone_hits"]))
 
         print("\n[5] 消息过少拒写")
         plugin2 = plugin_mod.create_plugin()
@@ -1457,14 +1573,84 @@ print("NOHTTPX-LOAD-OK")
     check("日期行里夹的正文被拆出来保留",
           "今天群里很热闹。" in _inline and "2026年9月28日 星期一，雨。\n" in _inline, repr(_inline))
     _w = bd.build_write_prompt(date_str=_dt_display, events_text="- 甲：事", name="鸣澜", persona="p")
-    check("默认篇幅区间已放宽到 200~500", "200~500" in _w and "350 字上下" in _w)
+    check("默认篇幅区间仍是可回读的基准值", "200~500" in _w and "350 字上下" in _w)
     check("旧的字数文案已移除", "上下浮动 80 字" not in _w)
     check("放宽上限仍保留反硬凑纪律", "别硬凑" in _w)
     _w2 = bd.build_write_prompt(date_str=_dt_display, events_text="- 甲：事", name="鸣澜",
                                 persona="p", style_extra="多用叠词")
     _rule_nums = [ln.split(" ", 1)[0] for ln in _w2.split("\n") if ln[:1].isdigit() and ". " in ln[:4]]
-    check("style_extra 编号不与字数规则撞号",
-          _rule_nums.count("9.") == 1 and "10." in _rule_nums, str(_rule_nums))
+    # v1.5.0：规则瘦身到 7 条（含 style_extra），编号动态生成 → 不再需要和哪一条去撞
+    check("style_extra 排在最后且不撞号", _rule_nums[-1] == "8." and len(_rule_nums) == len(set(_rule_nums)),
+          str(_rule_nums))
+
+    print("\n[18] 引号归属：素材不制造歧义 + 引号越界体检（真机 2026-10-07 实录）")
+    _q_line = "烧退了 鼻子还是堵的 先补个觉"
+    # 真机第三段：一对「」焊了两个人的话（Bravocat 的原话 + bot 自己的回复）
+    _merged = f"晚上台长说「{_q_line} 我也鼻子堵」，听着就难受。"
+    _risk = bd.quote_attribution_risk(_merged, [_q_line])
+    check("引号越界（跨说话人）被体检抓住", "引号越界" in _risk, repr(_risk))
+    # 真机第一段形态：引号里 = 被引用原文 + 我的回复（「喔喔喔」重复）
+    _echo = "回了句「喔喔喔———— 喔喔喔———— 守夜频段交班，早班就位」"
+    check("引用后回复导致的越界也被抓住",
+          "引号越界" in bd.quote_attribution_risk(
+              _echo, ["喔喔喔———— 守夜频段交班，早班就位"]), "")
+    # 边界正确 → 不误报
+    _clean = f"晚上台长说「{_q_line}」，我说我也鼻子堵。"
+    check("边界正确的引用不报越界", bd.quote_attribution_risk(_clean, [_q_line]) == "", "")
+    # 「我」自己的话不再被渲染成「原话」（素材与规则不能再打架）
+    _mat = bd.events_to_text(
+        [
+            {"who": "我", "what": "接力交班", "quote": "喔喔喔———— 守夜频段交班，早班就位"},
+            {"who": "Bravocat", "what": "感冒了", "quote": _q_line},
+        ],
+        self_labels={"我", "鸣澜"},
+    )
+    check("「我」的原话不再标成「原话」",
+          "- 我：接力交班（我自己的话" in _mat and "（原话：「喔喔喔" not in _mat, repr(_mat))
+    check("别人的原话照旧标「原话」", f"（原话：「{_q_line}」）" in _mat, repr(_mat))
+    _mat2 = bd.events_to_text([{"who": "鸣澜", "what": "接力", "quote": "守夜频段交班"}],
+                              self_labels={"我", "鸣澜"})
+    check("昵称形态的「我」也被识别", "我自己的话" in _mat2, repr(_mat2))
+    # prompt 侧：阶段一 quote 硬约束 + 阶段二「一对引号只装一个人」
+    _ex = bd.build_extract_prompt(_dt_display, "我: 测试\n某人: 测试")
+    check("阶段一限定 quote 只能是别人的话、不得拼接",
+          '别人（不是"我"）' in _ex and "绝不把两条消息" in _ex, "")
+    check("阶段一要求「我」自己的话 quote 填空", 'quote 一律填空字符串 ""' in _ex, "")
+    _wr2 = bd.build_write_prompt(date_str=_dt_display, events_text="- 甲：事", name="鸣澜", persona="p")
+    check("阶段二写明一对「」只装一个人", "一对「」只装一个人的一句话" in _wr2, "")
+    check("阶段二写明「引用后回复」只引被引的那一句", "引用后回复" in _wr2, "")
+    # 降级路径（真机那天就是 timeline_tail）：素材是原始时间线，上面两条修复不生效，
+    # 靠「自己的话被装进「」」这条判据兜住。
+    check("「」里装了自己的话会被抓住（真机第三段，原话带 emoji）",
+          "自己说过的话" in bd.self_quote_in_brackets(
+              f"晚上台长说「{_q_line} 我也鼻子堵」，听着就难受。", ["我也鼻子堵😭"]), "")
+    check("「」整段都是自己的回复也会抓住（真机第一段）",
+          "自己说过的话" in bd.self_quote_in_brackets(
+              "回了句「喔喔喔———— 喔喔喔———— 守夜频段交班，早班就位」",
+              ["喔喔喔———— 守夜频段交班，早班就位"]), "")
+    check("「」里只有别人的话不报",
+          bd.self_quote_in_brackets(f"台长说「{_q_line}」，我说我也鼻子堵。",
+                                    ["我也鼻子堵😭"]) == "", "")
+    _tl = "【晚上21点】\nBravocat: 烧退了\n我: 我也鼻子堵\n"
+    check("时间线能拆出说话人（时段标记被跳过）",
+          bd.timeline_speaker_lines(_tl) == [("Bravocat", "烧退了"), ("我", "我也鼻子堵")],
+          str(bd.timeline_speaker_lines(_tl)))
+    _fb = bd.build_timeline_fallback_text(_tl)
+    check("降级素材带格式说明（点明「我」是谁）",
+          "格式说明" in _fb and "「我」= 你自己说过的话" in _fb and "Bravocat: 烧退了" in _fb, "")
+    # 真机 2026-10-08：模型把日期行又写了一遍在结尾（天气还不一致）
+    _dup_tail = bd.ensure_date_line(
+        "2026年10月8日 星期四，阴。\n烧退了，鼻子还是有点堵。\n2026年10月8日 星期四，晴",
+        "2026年10月8日 星期四",
+    )
+    check("结尾的重复日期行被删掉", _dup_tail.count("2026年10月8日") == 1, repr(_dup_tail))
+    check("保留首行天气、不采用结尾那行的", "阴" in _dup_tail and "晴" not in _dup_tail, repr(_dup_tail))
+    _only_tail = bd.ensure_date_line(
+        "烧退了，今天终于有精力翻聊天记录。\n2026年10月8日 星期四，晴",
+        "2026年10月8日 星期四",
+    )
+    check("日期行只写在结尾时搬上去并沿用天气",
+          _only_tail.split("\n")[0] == "2026年10月8日 星期四，晴。", repr(_only_tail))
 
     print(f"\n===== 冒烟结果: PASS {len(PASS)} / FAIL {len(FAIL)} =====")
     if FAIL:
