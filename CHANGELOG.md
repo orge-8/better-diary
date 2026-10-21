@@ -11,6 +11,7 @@
 
 | 版本 | 主题 | 一句话 |
 |---|---|---|
+| 1.7.1 | 能力声明修复 | 补上漏声明的 `chat.get_group_streams` / `chat.get_all_streams`——这两条降级路径此前从未生效；`max_version` 收到有据的 1.3.99 |
 | 1.7.0 | 输出额度 | 给思考型模型留够输出空间（按请求覆盖 max_tokens）；空输出按抽样故障重试，不再一枪打死 |
 | 1.6.0 | 事实纪律 | 天气/META/时间一律以当天素材为准；重启不丢「今天」；移除趋势统计与素材落盘 |
 | 1.5.4 | 追踪落盘 | 同日多次生成用 `-2`/`-3` 递增序号互不覆盖，另有 `_runs.jsonl` 索引 |
@@ -18,6 +19,67 @@
 | 1.5.2 | 可观测性 | 素材落盘 `trace_dump` + 分块触顶告警，落盘默认关闭 |
 | 1.5.1 | 数据正确性 | 引用回复拆分，治「引号归属病」的上游根因 |
 | 1.5.0 | 文风 | 去 AI 味四个结构性改动 + 篇幅三档 + AI 腔检测器 |
+
+---
+
+## v1.7.1 — 能力声明修复：两条降级路径此前从未生效
+
+送审被插件中心打回两条，均属 manifest 与实现不一致。版本号 bump 到 1.7.1：
+它不是文案调整，而是**改变了运行时行为**（补声明后两条降级路径才真正可用）。
+
+### ① `capabilities` 补 `chat.get_group_streams` / `chat.get_all_streams`
+
+这是**真故障，不只是声明不整齐**。这两条能力在 `_resolve_stream_id` 的降级路径里
+经 `for list_method in (...)` + `getattr` **动态**调用，静态扫描看不见；而 Host 是按
+能力名**精确比对**授权的，未声明的调用会被直接拒绝 —— 也就是说，v1.7.1 之前这两条
+降级路径**从来没生效过**（静默降级为解析失败），白名单目标只能靠主接口
+`get_stream_by_*` 一条路走通。主接口一返回 `None`（真机实录过的情形），当天日记就是空的。
+
+讽刺的是，该函数当时的注释还写着「能力声明与使用一致是固定检查项」。
+已把那段自相矛盾的注释改写为准确描述，并说明为什么必须走动态调用。
+
+补充依据：`maibot_sdk/context.py` 的 `_CAPABILITY_RESULT_KEYS` 里确有
+`chat.get_all_streams` / `chat.get_group_streams` 两个条目，且 `capabilities/chat.py`
+内部正是以这两个名字发起 `call_capability` —— 它们是一等能力，不是内部方法。
+
+### ② `host_application.max_version`：1.99.99 → 1.3.99
+
+`X.99.99` 是「无限兼容」写法，兼容上限没有真实依据。改后的 1.3.99 有据可查：
+
+- MaiBot 主程序截至 2026-10 已发布到 **1.3.7 / 1.3.8**；
+- 本插件 README 明确记载已适配「**1.3.0 起 napcat-adapter 不兼容**」的变更
+  （改为直连 NapCat HTTP 取 cookie）—— 即 1.3.x 是**实际验证过的版本线**。
+
+`min_version=1.2.3` 保持不变：`plugin.config_version` 是 Host 1.2.3 才引入的硬性要求。
+
+### 新增 `tests/test_manifest_capabilities.py`（12 条）
+
+三层扫描钉死这个坑，防止再次漏声明：
+
+| 层 | 覆盖 | 说明 |
+|---|---|---|
+| L1 | `self.ctx.<group>.<method>()` | AST 显式调用 |
+| L2 | `getattr(self.ctx.<group>, …)` | 能穿透「`for` 元组 → 函数形参 → getattr」这条链（正是本次事故的形态） |
+| L3 | 带组前缀的完整名字符串 ∩ SDK 能力全集 | 抓拼接/间接引用等 L1/L2 覆盖不到的形态 |
+
+两个刻意的设计取舍：
+
+- **能力全集一律扫 SDK 源码里的 `call_capability` 字面量**，不手抄常量表 ——
+  `llm.generate` 就不在 `_CAPABILITY_RESULT_KEYS` 里（它返回结构不统一，走单独分支），
+  手抄必漏。
+- **L3 只认带组前缀的完整名，不做裸名匹配**。实测裸名误报率不可接受：
+  `.get("query")` 会命中 `database.query`、`"count": len(x)` 会命中 `database.count`。
+  误报比漏报更致命 —— 它会把人训练成无脑忽略红色。
+
+已做**反向验证**：把 manifest 退回 1.99.99 + 删掉两条 capability 后，
+`test_fallback_paths_actually_declared` / `test_capabilities_cover_dynamic_getattr` /
+`test_max_version_is_not_open_ended` 三条用例如期变红，确认闸门不是假绿。
+
+> ⚠️ **已知的门禁误报，别照它改**：devkit 的 `check_plugin.py` 用正则匹配
+> `self.ctx.<proxy>.<method>(`，同样看不到动态调用，现在会报
+> `WARN 能力/无多余声明 声明了但源码未用到: chat.get_all_streams, chat.get_group_streams`。
+> 这条 WARN 是**误报**，照它把两条声明删掉就会重新引入上面的静默故障。
+> 以 `tests/test_manifest_capabilities.py` 的结论为准。
 
 ---
 

@@ -1951,9 +1951,16 @@ class BetterDiaryPlugin(MaiBotPlugin):
             return target
         kind, ident = m.group(1).lower(), m.group(2)
 
-        # 注意：这里**刻意用显式属性访问**（而不是 getattr(self.ctx.chat, name)），
-        # 因为「能力声明与使用一致」是插件中心 AI 审核的固定检查项 ——
-        # 用 getattr 动态取名会让静态扫描看不到 chat.* 调用，被误判成「声明了但没用」。
+        # 主路径**刻意用显式属性访问**（而不是 getattr），让静态扫描能直接看到
+        # ``chat.get_stream_by_*`` 调用，与 manifest 声明对得上。
+        #
+        # 但降级路径②③必须按名字遍历（``for list_method in (...)`` + getattr），
+        # 这两个方法名就**不会**出现在静态调用里 —— 而 Host 是按能力名**精确比对**
+        # 授权的：manifest 没声明的调用会被直接拒绝，降级路径会静默拿不到结果。
+        # 所以 ``chat.get_group_streams`` / ``chat.get_all_streams`` 必须一并写进
+        # _manifest.json 的 capabilities（v1.7.1 修复：此前漏声明，这两条降级路径
+        # 实际永远解析失败，与本函数注释声称的「能力声明与使用一致」自相矛盾）。
+        # 一致性由 tests/test_manifest_capabilities.py 钉死，删声明会直接测试失败。
         async def _resolve_primary() -> Any:
             if kind == "group":
                 return await self.ctx.chat.get_stream_by_group_id(group_id=ident)
