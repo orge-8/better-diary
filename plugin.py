@@ -33,6 +33,7 @@ if __package__:  # 包式加载（Runner 真机：插件目录作为包，不在
         build_timeline_fallback_text,
         build_write_prompt,
         choose_word_budget,
+        chunk_coverage,
         chunk_text,
         date_display,
         date_line_overridden,
@@ -48,6 +49,8 @@ if __package__:  # 包式加载（Runner 真机：插件目录作为包，不在
         timeline_speaker_lines,
         trailing_date_line,
         update_continuity,
+        weather_hint,
+        filter_meta_against_evidence,
     )
     from .bd_cookie import CookieStore, redact_secrets
     from .bd_search import format_hits, on_this_day, search_diaries
@@ -60,6 +63,7 @@ else:  # 平铺兜底（脚本直跑 / 旧测试夹具）
         build_timeline_fallback_text,
         build_write_prompt,
         choose_word_budget,
+        chunk_coverage,
         chunk_text,
         date_display,
         date_line_overridden,
@@ -75,6 +79,8 @@ else:  # 平铺兜底（脚本直跑 / 旧测试夹具）
         timeline_speaker_lines,
         trailing_date_line,
         update_continuity,
+        weather_hint,
+        filter_meta_against_evidence,
     )
     from bd_cookie import CookieStore, redact_secrets
     from bd_search import format_hits, on_this_day, search_diaries
@@ -86,6 +92,22 @@ _SEND_LIMIT = 1500
 
 # 与 PluginSection.config_version 的默认值保持一致（配置垫片要用）
 _DEFAULT_CONFIG_VERSION = "1.0.0"
+
+# ---------------------------------------------------------------- max_tokens 能力探针
+# 背景（真机 2026-10-20）：宿主任 utils 任务配 max_tokens=4096，而 MiniMax-M3 是
+# **自适应思考模型**——它把思维链也算进 max_tokens 额度。模型一决定"先想再答"，
+# 4096 就被思维链吃光，正文一个 token 都没轮到，插件拿到的是空串。
+# 修法是把上限抬高，但插件必须知道 Host 的 llm.generate 到底收不收这个参数：
+# 传了不生效等于白传，还可能被严格校验入参的 Host 直接拒掉。
+# 探针思路：**要求模型复述 10 个字，同时把上限压到 1**。
+#   输出被截断（≤ _PROBE_TRUNCATED_MAX 字）→ 参数真的生效；
+#   原样复述回来（≥ 10 字）                 → 参数被忽略/不支持；
+#   调用直接报错（严格校验未知入参）        → 同样判不支持。
+_PROBE_TEXT = "甲乙丙丁戊己庚辛壬癸"
+_PROBE_PROMPT = f"请原样重复下面这 10 个字，除此之外不要输出任何内容：{_PROBE_TEXT}"
+_PROBE_TOKENS = 1
+_PROBE_TRUNCATED_MAX = 4
+_PROBE_TIMEOUT_SECONDS = 60
 
 
 # ---------------------------------------------------------------- 配置模型
@@ -149,7 +171,7 @@ def _find_stream_id_deep(node: Any, depth: int = 0) -> str:
     """递归找「像 stream_id 的值」。
 
     为什么需要它：兜底解析时 ``_find_by_value`` 命中的往往是**内层**的
-    ``{group_id: "967779035"}``，而真正的 ``stream_id`` 挂在**外层**流对象上
+    ``{group_id: "123456789"}``，而真正的 ``stream_id`` 挂在**外层**流对象上
     （``{stream_id: "…", chat: {group_id: "…"}}`` 是宿主的常见形态）。
     所以取流 ID 必须能从内层一路找回外层，而不是只看命中那一层。
 
@@ -302,6 +324,12 @@ class LLMSection(PluginConfigBase):
     timeout_seconds: int = Field(default=180, description="单次 LLM 调用超时（秒）")
     write_retry: int = Field(default=1, description="成文阶段遇到**超时**类失败时额外重试几次。0 = 不重试（超时即判失败）")
     retry_backoff_seconds: int = Field(default=20, description="成文重试前的等待秒数。给网络抖动一点恢复时间，避免紧接着撞同一堵墙")
+    # v1.7.0：思考型模型（MiniMax-M3 等）把思维链算进 max_tokens，宿主 utils 任务
+    # 默认的 4096 会被思维链吃光 → 正文为空 → 当天日记直接判失败。
+    # 这里按请求覆盖它，是**不动宿主全局配置**的前提下唯一能只救本插件的做法。
+    max_tokens: int = Field(default=16384, description="单次 LLM 调用的输出 token 上限（传给 Host，覆盖 utils 任务的默认值）。思考型模型会把思维链算进这个额度，4096 会被思维链吃光导致正文为空。0 = 不传，沿用宿主配置")
+    empty_retry: int = Field(default=1, description="拿到**空输出**时额外重试几次。自适应思考是随机的（这一次想了、下一次可能直接答），重试能救回一部分。0 = 不重试")
+    probe_max_tokens: bool = Field(default=True, description="首次 LLM 调用前探测一次 Host 是否真的接受并按预期应用 max_tokens；不支持时自动改为不传，并在日志里点名该怎么修。关掉则假定支持直接传")
 
 
 class SecuritySection(PluginConfigBase):
@@ -407,6 +435,9 @@ class BetterDiaryPlugin(MaiBotPlugin):
     _generating = False
     _sched_task = None
     _catchup_task = None
+    _resume_task = None
+    # 「本进程正在走一次定时触发（含等静默）」：启动补偿靠它避让，避免与常规调度撞车
+    _sched_busy = False
     _cookie_store = None
     _cfg_fallback_warned = False
     # 每个会话最近一次 /日记 的时间戳（秒），用于命令冷却；不落盘
@@ -765,7 +796,10 @@ class BetterDiaryPlugin(MaiBotPlugin):
 
     async def on_load(self) -> None:
         self._generating = False
+        self._sched_busy = False
         self._sched_task: asyncio.Task | None = None
+        self._catchup_task: asyncio.Task | None = None
+        self._resume_task: asyncio.Task | None = None
         try:
             # 各子步骤分层防御：任一失败都只记日志，绝不让插件注册整体失败
             try:
@@ -784,12 +818,23 @@ class BetterDiaryPlugin(MaiBotPlugin):
                     self._start_catch_up()
                 except Exception as exc:  # noqa: BLE001
                     self._log_error("启动补跑未能开始（插件仍可加载）：%s", exc, exc_info=True)
+                # 启动补偿：补上「被重启打断的那一次今天」。与补跑互补 —— 补跑
+                # 刻意不含今天（range(days,0,-1)），而这一条只管今天。
+                try:
+                    self._start_resume()
+                except Exception as exc:  # noqa: BLE001
+                    self._log_error("启动补偿未能开始（插件仍可加载）：%s", exc, exc_info=True)
+            # 输出额度直接决定「思考型模型会不会写出正文」，加载时必须能从日志读回
+            _mt = max(0, int(self.config.llm.max_tokens or 0))
             self._log_info(
-                "better-diary 已加载：定时 %s（%s），字数目标 %d，发布目标 %s",
+                "better-diary 已加载：定时 %s（%s），字数目标 %d，发布目标 %s，"
+                "输出额度 %s（探测 max_tokens 支持: %s）",
                 self.config.schedule.time if self.config.schedule.enabled else "关闭",
                 self.config.llm.task_name,
                 self.config.diary.word_target,
                 "QQ空间" if self.config.qzone.enabled else "仅存档",
+                f"{_mt} tokens" if _mt > 0 else "宿主默认",
+                "开" if self.config.llm.probe_max_tokens else "关",
             )
             # v1.4.1：改过插件 ID 会让数据目录换一个（宿主按 ID 分配），
             # 旧日记留在旧目录里 → 启动时提醒一次，别让用户以为"日记丢了"。
@@ -808,6 +853,9 @@ class BetterDiaryPlugin(MaiBotPlugin):
         if self._catchup_task is not None:
             self._catchup_task.cancel()
             self._catchup_task = None
+        if self._resume_task is not None:
+            self._resume_task.cancel()
+            self._resume_task = None
         self._log_info("better-diary 已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
@@ -1347,41 +1395,222 @@ class BetterDiaryPlugin(MaiBotPlugin):
 
     # ------------------------------------------------------------ 静默阈值（等人停下再写）
 
-    async def _run_main_with_silence_wait(self) -> None:
+    async def _run_main_with_silence_wait(
+        self,
+        date_str: str = "",
+        due_at: datetime.datetime | None = None,
+    ) -> None:
         """主触发入口：先按静默阈值等人停下，等满上限就照常生成（**不丢天优先**）。
 
         阈值为 0 时完全等价于旧行为（到点直接写），不发起任何额外消息查询。
+
+        v1.6.0：到点先落一份「待触发标记」（见 :meth:`_write_pending`）。理由是本方法
+        的等待状态原本**只在内存**里，重启后调度器只会算出**明天**的同刻，今天这次
+        触发就永久丢失；而启动补跑刻意不含今天，等于没有任何兜底。
         """
+        date_str = date_str or self._today_str()
+        due = due_at or datetime.datetime.now()
+        if self._sched_busy:
+            self.ctx.logger.info("定时触发跳过：本进程已有一轮定时触发在进行")
+            return
+        self._sched_busy = True
+        try:
+            await self._silence_wait_locked(date_str, due)
+        finally:
+            self._sched_busy = False
+
+    async def _silence_wait_locked(self, date_str: str, due: datetime.datetime) -> None:
         minutes = max(0, int(self.config.schedule.wait_silent_minutes))
         if minutes <= 0:
-            await self._scheduled_run()
-            return
+            # 阈值为 0：到点直接写，**不发起任何额外消息查询**（与旧行为逐字一致）。
+            # 标记仍然写一次：生成过程本身也可能被重启打断，留个记号让下次启动能补。
+            self._write_pending(date_str, due, 0)
+            return await self._finish_scheduled(date_str)
         hours = max(0, int(self.config.schedule.max_wait_hours))
         deadline = (
-            datetime.datetime.now() + datetime.timedelta(hours=hours)
+            due + datetime.timedelta(hours=hours)
             if hours > 0
             else datetime.datetime.min  # 0 = 不等，第一次发现没静默就直接写
         )
         attempt = 0
+        self._write_pending(date_str, due, attempt)
         while True:
             if await self._chat_is_quiet(minutes):
                 if attempt:
-                    self.ctx.logger.info("聊天已静默超过 %d 分钟，开始生成今日日记", minutes)
-                await self._scheduled_run()
-                return
+                    self.ctx.logger.info("聊天已静默超过 %d 分钟，开始生成 %s 日记", minutes, date_str)
+                return await self._finish_scheduled(date_str)
             attempt += 1
-            if datetime.datetime.now() >= deadline:
-                self.ctx.logger.warning(
-                    "等待静默超时（已等 %d 次，上限 %d 小时），照常生成今日日记（不丢天优先）",
-                    attempt, hours,
+            if datetime.datetime.now() < deadline:
+                self._write_pending(date_str, due, attempt)
+                interval = max(1, int(self.config.schedule.retry_interval_minutes))
+                self.ctx.logger.info(
+                    "最近 %d 分钟内还有新消息，%d 分钟后再看（第 %d 次等待）", minutes, interval, attempt
                 )
-                await self._scheduled_run()
+                await asyncio.sleep(interval * 60)
+                continue
+            if hours > 0:
+                self.ctx.logger.warning(
+                    "等待静默超时（已等 %d 次，上限 %d 小时），照常生成 %s 日记（不丢天优先）",
+                    attempt, hours, date_str,
+                )
+            else:
+                self.ctx.logger.info(
+                    "未设等待上限（max_wait_hours=0），不再等静默，直接生成 %s 日记", date_str
+                )
+            return await self._finish_scheduled(date_str)
+
+    async def _finish_scheduled(self, date_str: str) -> None:
+        """跑完一次定时生成，并**无论成败**清掉待触发标记。
+
+        失败也要清：不清的话每次启动都会再补一次，而「当天确实没写成」这件事已经由
+        启动补偿（无标记路径）按「今天无成品」重新判定了，不需要靠残留标记提醒。
+        """
+        try:
+            await self._scheduled_run(date_str)
+        finally:
+            self._clear_pending(date_str)
+
+    # ------------------------------------------------------------ 待触发标记（跨重启不丢天）
+
+    # 落在宿主分配的 data 目录：整目录替换部署不会带走它，重启后还能读到
+    _PENDING_NAME = "scheduled_pending.json"
+    # 启动后先让宿主/适配器就绪，再判定要不要补今天的定时日记
+    _RESUME_DELAY_SEC = 20
+
+    def _pending_path(self) -> Path:
+        return self._data_dir() / self._PENDING_NAME
+
+    def _load_pending(self) -> dict[str, Any]:
+        """读「已到点但还没写成」的标记。坏文件/过期结构按**无标记**处理并留 ERROR。
+
+        为什么不能静默判空：解析失败返回 ``{}`` 会让启动补偿以为「今天压根没到点」，
+        于是当天日记悄无声息地丢掉 —— 正是这次要修的那个失败模式。
+        """
+        path = self._pending_path()
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (json.JSONDecodeError, OSError) as exc:
+            self._log_error("待触发标记读取失败（按无标记处理，改走启动补偿判定）: %s", exc, exc_info=True)
+            return {}
+        if not isinstance(data, dict):
+            self._log_error("待触发标记结构异常（顶层 %s），按无标记处理", type(data).__name__)
+            return {}
+        date_str = str(data.get("date") or "").strip()
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
+            self._log_error("待触发标记的日期非法（%r），按无标记处理", date_str)
+            return {}
+        try:
+            attempt = max(0, int(data.get("attempt") or 0))
+        except (TypeError, ValueError):
+            attempt = 0
+        return {"date": date_str, "due_at": str(data.get("due_at") or ""), "attempt": attempt}
+
+    def _write_pending(self, date_str: str, due_at: datetime.datetime, attempt: int) -> None:
+        path = self._pending_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "date": date_str,
+                "due_at": due_at.strftime("%Y-%m-%d %H:%M:%S"),
+                "attempt": max(0, int(attempt)),
+            }
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(path)  # 原子替换
+        except OSError as exc:
+            self._log_warning("待触发标记写入失败（重启后只能靠启动补偿兜底）: %s", exc)
+
+    def _clear_pending(self, date_str: str = "") -> None:
+        """清标记。给了 ``date_str`` 时只清**同一天**的，避免抹掉新一轮刚写下的标记。"""
+        path = self._pending_path()
+        if date_str:
+            current = self._load_pending()
+            if current and current.get("date") != date_str:
                 return
-            interval = max(1, int(self.config.schedule.retry_interval_minutes))
-            self.ctx.logger.info(
-                "最近 %d 分钟内还有新消息，%d 分钟后再看（第 %d 次等待）", minutes, interval, attempt
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError as exc:
+            self._log_warning("待触发标记清理失败（下次启动可能多补一次；已有成品时会自动跳过）: %s", exc)
+
+    @staticmethod
+    def _parse_pending_due(raw: str) -> datetime.datetime | None:
+        try:
+            return datetime.datetime.strptime(str(raw or "").strip(), "%Y-%m-%d %H:%M:%S")
+        except (ValueError, TypeError):
+            return None
+
+    def _has_diary(self, date_str: str) -> bool:
+        entry = self._load_diaries().get(date_str)
+        return bool(isinstance(entry, dict) and str(entry.get("content") or "").strip())
+
+    # ------------------------------------------------------------ 启动补偿（重启不丢今天）
+
+    def _start_resume(self) -> None:
+        """启动一次「重启补偿」检查（后台 task，绝不阻塞 on_load）。"""
+        if not self.config.schedule.enabled:
+            return
+        self._resume_task = asyncio.create_task(self._resume_after_restart())
+
+    async def _resume_after_restart(self) -> None:
+        """补上被重启打断掉的「今天那次定时触发」。
+
+        两条路径，都走**会发布**的主流程（今天的日记本来就该发）：
+
+        1. **有标记**：上次已经到点、正等静默（或正在生成）时进程没了。按标记里记的
+           **首次到点时刻**续算剩余等待上限 —— 用当前时刻当起点会把窗口整段往后推，
+           本来 02:30 该写成的会被推到 05:30。
+           标记指向的日期不是今天（等待跨了零点）时改走补写：**只存档不发布**。
+        2. **无标记**：进程在到点之前就没运行（关机 / 崩溃 / 整目录替换后没起来），
+           这次触发压根没发生过。判定「今天主时间已过 且 今天还没有成品」就补一次。
+           这一条同时兜住标记文件丢失或没写出来的情形。
+        """
+        try:
+            await asyncio.sleep(self._RESUME_DELAY_SEC)
+            if self._sched_busy or self._generating:
+                return  # 常规调度/命令已经在跑，交给它们
+            today = self._today_str()
+            pending = self._load_pending()
+            if pending:
+                date_str = str(pending.get("date") or "")
+                due_at = self._parse_pending_due(pending.get("due_at"))
+                if date_str == today:
+                    self.ctx.logger.warning(
+                        "检测到未完成的定时触发（%s，原到点 %s，已等 %d 次），重启后续等",
+                        date_str, pending.get("due_at") or "?", int(pending.get("attempt") or 0),
+                    )
+                    await self._run_main_with_silence_wait(date_str=date_str, due_at=due_at)
+                else:
+                    self.ctx.logger.warning(
+                        "待触发标记指向 %s（等待跨天，今天已是 %s），按补写处理：只存档不发布",
+                        date_str, today,
+                    )
+                    try:
+                        await self._scheduled_run(date_str)
+                    finally:
+                        self._clear_pending(date_str)
+                return
+            parsed = self._parse_hhmm(self.config.schedule.time)
+            if parsed is None:
+                return  # 主时间没配/非法：无标记路径无从判定，交回常规调度
+            now = datetime.datetime.now()
+            main_at = now.replace(hour=parsed[0], minute=parsed[1], second=0, microsecond=0)
+            if now < main_at:
+                return  # 还没到点，常规调度会正常触发
+            if self._has_diary(today):
+                return
+            self.ctx.logger.warning(
+                "今天 %s 的定时触发未执行（重启时已过点且当天无成品），启动补偿补写一次",
+                self.config.schedule.time,
             )
-            await asyncio.sleep(interval * 60)
+            await self._run_main_with_silence_wait(date_str=today, due_at=main_at)
+        except asyncio.CancelledError:
+            raise  # 卸载：必须让取消照常传播
+        except Exception as exc:
+            # 补偿失败绝不能影响后续定时：只记日志
+            self._log_error("重启补偿失败（不影响后续定时）: %s", exc, exc_info=True)
 
     async def _silence_scope_messages(self, start_ts: float, end_ts: float) -> list[dict[str, Any]]:
         """按**取材范围**取最近消息，供静默检查用（v1.4.2）。
@@ -1526,32 +1755,44 @@ class BetterDiaryPlugin(MaiBotPlugin):
             "补跑结束：尝试 %d 天，成功 %d 天（%s）", len(results), len(done), "、".join(done) or "无"
         )
 
-    async def _scheduled_run(self) -> None:
+    async def _scheduled_run(self, date_str: str = "") -> None:
+        """跑一次定时生成。``date_str`` 留空 = 今天。
+
+        只有**今天**才会发布到 QQ 空间；补写过去的日期一律只存档 —— 公开空间
+        不该冒出一条「昨天」的历史说说（这条约定不变，v1.6.0 只是让「今天」在
+        重启补偿这条路上也能照常发布）。
+        """
         if self._generating:
             self.ctx.logger.warning("定时日记跳过：已有生成任务在进行（次日兜底会补写）")
             return
-        date_str = self._today_str()
-        # 当天已有成品就什么都不做：
+        date_str = date_str or self._today_str()
+        is_today = date_str == self._today_str()
+        label = "今日" if is_today else f"{date_str} "
+        # 已有成品就什么都不做：
         #  - 已发布过 → 重启 / 改时间 / 同一天第二次触发都会重发一条一样的公开说说；
-        #  - 发布未启用 → 再写一遍只是白烧一次 LLM（内容完全相同），没有任何收益。
-        # 两种情况都靠归档里的 content 判定；确需重写走管理员手写的
+        #  - 发布未启用 → 再写一遍只是白烧一次 LLM（内容完全相同），没有任何收益；
+        #  - 补写日 → 只存档，重生成没有额外收益。
+        # 三种情况都靠归档里的 content 判定；确需重写走管理员手写的
         # `/日记 <日期> 重写`，那条路径刻意不受此限制。
-        today_entry = self._load_diaries().get(date_str)
-        has_content = bool(str((today_entry or {}).get("content") or "").strip()) if isinstance(today_entry, dict) else False
-        if has_content and (self._already_published(date_str) or not self.config.qzone.enabled):
-            self.ctx.logger.info(
-                "定时日记跳过：%s 已有成品（%s）",
-                date_str,
-                "已发布过QQ空间" if self._already_published(date_str) else "空间发布未启用，重复成文无收益",
+        entry = self._load_diaries().get(date_str)
+        has_content = bool(str((entry or {}).get("content") or "").strip()) if isinstance(entry, dict) else False
+        if has_content and (self._already_published(date_str) or not self.config.qzone.enabled or not is_today):
+            reason = (
+                "已发布过QQ空间" if self._already_published(date_str)
+                else ("补写日已有存档，不重发" if not is_today else "空间发布未启用，重复成文无收益")
             )
+            self.ctx.logger.info("定时日记跳过：%s 已有成品（%s）", date_str, reason)
             return
         ok, result = await self._generate_for_date(date_str)
         if not ok:
             self.ctx.logger.warning("定时日记生成失败 %s: %s", date_str, result)
-            await self._notify_chats(f"今日日记没写成：{result}")
+            await self._notify_chats(f"{label}日记没写成：{result}")
             return
         if not self.config.qzone.enabled:
             self.ctx.logger.info("定时日记已生成并存档（%d 字）；QQ空间发布未启用", len(result))
+            return
+        if not is_today:
+            self.ctx.logger.info("定时日记已生成并存档（%d 字）；补写日不发布", len(result))
             return
         pub_ok, pub_msg = await self._publish_to_qzone(result)
         if pub_ok:
@@ -1695,7 +1936,7 @@ class BetterDiaryPlugin(MaiBotPlugin):
         用户只看到「当天消息太少（0 条）」，完全指不到配置问题上）。
 
         v1.3.7：主接口返回 None 时**自动降级**再找两次 —— 真机实录
-        `group:967779035` 走主接口拿到 `None`（宿主没返回该群的流），
+        `group:123456789` 走主接口拿到 `None`（宿主没返回该群的流），
         于是三天日记全空。现在会依次尝试：
         ① ``chat.get_stream_by_group_id``（原路）
         ② ``chat.get_group_streams`` 列表里按 group_id 自己找
@@ -1859,7 +2100,7 @@ class BetterDiaryPlugin(MaiBotPlugin):
             if self._unresolved_targets:
                 # 兼容期保护：解析失败的目标不能只留一行 WARNING。
                 # 存量配置里很可能躺着一个「旧版 filter_mode=all 时写了但从未生效」的
-                # target_chats（真机实录：group:967779035），新版默认 whitelist 后它
+                # target_chats（真机实录：group:123456789），新版默认 whitelist 后它
                 # 突然开始生效却解析不出来 → 0 条素材 → 只报「消息太少」，指不到配置上。
                 self.ctx.logger.warning(
                     "取材范围 %d/%d 个目标解析失败（原因：%s）",
@@ -1982,24 +2223,139 @@ class BetterDiaryPlugin(MaiBotPlugin):
             self.ctx.logger.debug("读取 Host 人设失败: %s", exc)
         return "是个爱聊天、心比较软的机器人。"
 
+    # ------------------------------------------------------- max_tokens 能力探针
+
+    def _get_probe_lock(self) -> asyncio.Lock:
+        lock = getattr(self, "_mt_probe_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._mt_probe_lock = lock
+        return lock
+
+    async def _ensure_max_tokens_probed(self) -> None:
+        """确保「Host 接不接受 max_tokens」已经有个答案（全局只探测一次）。
+
+        三块选材是并发首发的，没有这把锁会同时点起三个探针。
+        """
+        if getattr(self, "_mt_probe_done", False):
+            return
+        async with self._get_probe_lock():
+            if getattr(self, "_mt_probe_done", False):
+                return
+            # 不打算传就不必探测（少烧一次调用）；关掉探测则按「支持」处理
+            if self.config.llm.probe_max_tokens and self._wants_max_tokens():
+                await self._run_max_tokens_probe()
+            else:
+                self._mt_supported = True
+            self._mt_probe_done = True
+
+    async def _run_max_tokens_probe(self) -> None:
+        """用一次真实调用判定 max_tokens 是否真的生效（不靠猜）。
+
+        判定不了就按「不支持」处理，并在日志里写明该去哪里改 ——
+        「传了但没生效」是比「不传」更隐蔽的假象。
+        """
+        # 刻意不传 temperature：探针只该测 max_tokens 这一个变量。
+        # 带上 temperature=0 反而可能撞上「思考型模型不接受 temperature」的 Provider，
+        # 那会变成「因为温度而误判 max_tokens 不支持」。
+        payload = {
+            "prompt": _PROBE_PROMPT,
+            "model": "",
+            "task_name": self.config.llm.task_name,
+            "max_tokens": _PROBE_TOKENS,
+        }
+        try:
+            result = await self._raw_llm_result(payload, timeout_seconds=_PROBE_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 探针失败一律保守处理
+            self._mt_supported = False
+            self.ctx.logger.warning(
+                "max_tokens 探针调用失败（判定 Host 不接受该参数，插件改用宿主配置）: %s", exc,
+            )
+            return
+        text = str(result.get("response") or result.get("content") or "")
+        length = len(text.strip())
+        if length <= _PROBE_TRUNCATED_MAX:
+            self._mt_supported = True
+            self.ctx.logger.info(
+                "max_tokens 探针：Host 接受并应用了该参数（限 %d tokens，实际只回 %d 字）",
+                _PROBE_TOKENS, length,
+            )
+        else:
+            self._mt_supported = False
+            self.ctx.logger.warning(
+                "max_tokens 探针：Host 未应用该参数（限 %d tokens 仍返回 %d 字）。"
+                "插件将不再传 max_tokens；要给思考型模型留够输出空间，请在宿主「模型配置」里"
+                "给对应模型单独设 max_tokens（模型级设置会覆盖任务级 4096）",
+                _PROBE_TOKENS, length,
+            )
+
+    def _wants_max_tokens(self) -> bool:
+        """配置上想不想覆盖宿主的输出额度。"""
+        return max(0, int(self.config.llm.max_tokens or 0)) > 0
+
+    def _max_tokens_arg(self) -> dict[str, Any]:
+        """本次调用要不要带 max_tokens：按配置 + 探针结果决定。"""
+        if not self._wants_max_tokens():
+            return {}
+        if getattr(self, "_mt_supported", None) is False:
+            return {}
+        return {"max_tokens": max(0, int(self.config.llm.max_tokens or 0))}
+
+    async def _raw_llm_result(self, payload: Mapping[str, Any], *, timeout_seconds: int | None = None) -> dict[str, Any]:
+        """发一次 llm.generate，**原样返回结果 dict**（失败抛异常）。
+
+        与 :meth:`_call_llm` 分开有两个原因：
+        1. 探针要自己拼 payload（硬编码 ``max_tokens``，不能走 :meth:`_max_tokens_arg`
+           的探针结果判定），还要自己取正文；
+        2. 空正文诊断需要看到 ``reasoning`` 字段 —— 只拿到字符串就分不清
+           「思维链吃光额度」和「调用层面失败」。
+        """
+        seconds = self.config.llm.timeout_seconds if timeout_seconds is None else timeout_seconds
+        timeout_ms = max(30, int(seconds)) * 1000
+        call_capability = getattr(self.ctx, "call_capability", None)
+        if callable(call_capability):
+            result = await call_capability("llm.generate", timeout_ms=timeout_ms, **dict(payload))
+        else:  # 老 SDK 兜底
+            result = await self.ctx.llm.generate(**dict(payload))
+        if not isinstance(result, dict) or not result.get("success", True):
+            err = result.get("error", "未知错误") if isinstance(result, dict) else type(result).__name__
+            raise RuntimeError(f"LLM 调用失败: {err}")
+        return result
+
+    def _note_empty_llm_result(self, result: Mapping[str, Any], payload: Mapping[str, Any]) -> None:
+        """拿到空正文时留痕：把「思维链吃光额度」和「调用层面失败」分开。
+
+        Host 的 llm.generate 会返回 ``reasoning`` 字段（思考型模型的思维链）。
+        空正文 + 长思维链 = 额度被思考阶段耗光（真机 2026-10-20 正是这一型）；
+        空正文 + 空思维链 = 调用层面就没拿到东西，得往 Provider 那边查。
+        没有这条日志时，日志里只有一句「输出为空」，根本排不动。
+
+        只记**字段名清单与思维链长度**，绝不记内容 —— 与「日志不落逐字原话」同纪律。
+        """
+        reasoning = str(result.get("reasoning") or "")
+        keys = ", ".join(sorted(str(k) for k in result.keys())) or "无"
+        self.ctx.logger.warning(
+            "LLM 返回空正文（结果字段: %s；推理内容 %d 字；本次 max_tokens=%s）",
+            keys, len(reasoning), payload.get("max_tokens") or "宿主默认",
+        )
+
     async def _call_llm(self, prompt: str, temperature: float) -> str:
         """LLM 调用：显式绕过 ctx.llm.generate 的 30s RPC 默认超时。"""
-        timeout_ms = max(30, int(self.config.llm.timeout_seconds)) * 1000
-        call_capability = getattr(self.ctx, "call_capability", None)
+        await self._ensure_max_tokens_probed()
         payload = {
             "prompt": prompt,
             "model": "",
             "task_name": self.config.llm.task_name,
             "temperature": temperature,
         }
-        if callable(call_capability):
-            result = await call_capability("llm.generate", timeout_ms=timeout_ms, **payload)
-        else:  # 老 SDK 兜底
-            result = await self.ctx.llm.generate(**payload)
-        if not isinstance(result, dict) or not result.get("success", True):
-            err = result.get("error", "未知错误") if isinstance(result, dict) else type(result).__name__
-            raise RuntimeError(f"LLM 调用失败: {err}")
-        return str(result.get("response") or result.get("content") or "")
+        payload.update(self._max_tokens_arg())
+        result = await self._raw_llm_result(payload)
+        text = str(result.get("response") or result.get("content") or "")
+        if not text.strip():
+            self._note_empty_llm_result(result, payload)
+        return text
 
     async def _call_llm_with_retry(self, prompt: str, temperature: float, *, stage: str) -> str:
         """成文阶段专用：对**超时 / 宿主瞬时 I/O 故障**做有限重试。
@@ -2034,51 +2390,130 @@ class BetterDiaryPlugin(MaiBotPlugin):
                     await asyncio.sleep(backoff)
         raise RuntimeError(f"{stage}调用失败")  # pragma: no cover - 循环必然 return 或 raise
 
+    async def _call_llm_nonempty(self, prompt: str, temperature: float, *, stage: str) -> str:
+        """在超时重试之上，再叠一层「空输出重试」。
+
+        为什么空输出值得重试：MiniMax-M3 这类模型是**自适应思考**的 —— 同一份 prompt
+        这一轮决定先想再答（然后被 token 上限截断，正文为空），下一轮可能直接作答。
+        证据就是真机 2026-10-20 选材 3 块里 2 块一次就成、只有 1 块空 —— 空不是必然，
+        是抽样。而在此之前，空输出不属于「可重试」范围（``_is_retryable_llm_error``
+        只认超时与瞬时 I/O），一次截断就直接判当天失败。
+
+        注意：本方法**不**重试「拒答」「残句」—— 那两类发生在成文之后，
+        由 :func:`diary_output_problem` 判，重跑只是烧钱。
+        """
+        attempts = max(0, int(self.config.llm.empty_retry)) + 1
+        backoff = max(0, int(self.config.llm.retry_backoff_seconds))
+        raw = ""
+        for attempt in range(1, attempts + 1):
+            raw = await self._call_llm_with_retry(prompt, temperature, stage=stage)
+            if raw.strip():
+                return raw
+            self._log_warning(
+                "%s 第 %d/%d 次返回空输出（模型可能把输出额度用在了思考上）",
+                stage, attempt, attempts,
+            )
+            if attempt < attempts and backoff:
+                await asyncio.sleep(backoff)
+        return raw
+
+    async def _extract_one_chunk(
+        self,
+        chunk: str,
+        date_str: str,
+        single: bool,
+        sem: asyncio.Semaphore | None = None,
+    ) -> Tuple[list[dict[str, Any]], str, bool]:
+        """跑一块选材，返回 ``(事件列表, 空块原因, 输出是否为空串)``。
+
+        第三个返回值是 v1.7.0 新加的：``note`` 只能说明"这块空了"，分不出
+        「模型确实说这块没事」和「模型一个字都没吐」。后者可重试，前者不该重试 ——
+        把「确实无事」的 ``[]`` 拿去重跑，纯属烧钱还改变结果。
+        """
+        prompt = build_extract_prompt(date_str, chunk)
+        temp = self.config.llm.extract_temperature
+
+        async def body() -> Tuple[list[dict[str, Any]], str, bool]:
+            try:
+                if single:
+                    raw = await self._call_llm_nonempty(prompt, temp, stage="选材")
+                else:
+                    raw = await self._call_llm(prompt, temp)
+            except Exception as exc:
+                # 区分超时与其它失败：超时通常意味着「模型池整体不可用」，
+                # 成文阶段会因此降级失败，日志上看得出因果才排得动
+                kind = "超时" if self._is_timeout_error(exc) else "失败"
+                self.ctx.logger.warning("选材分块%s（跳过本块）: %s", kind, exc)
+                return [], f"调用{kind}: {exc}", False
+            events, note = parse_events_detailed(raw)
+            if not events:
+                return [], note, not raw.strip()
+            return events, "ok", False
+
+        if sem is not None:
+            async with sem:
+                return await body()
+        return await body()
+
+    async def _rerun_empty_chunks(
+        self,
+        chunks: list[str],
+        results: list[Tuple[list[dict[str, Any]], str, bool]],
+        date_str: str,
+        *,
+        enabled: bool,
+    ) -> list[Tuple[list[dict[str, Any]], str, bool]]:
+        """对「模型一个字没吐」的选材块**串行**补跑。
+
+        单块时不进这里：单块走的是 :meth:`_call_llm_nonempty`，空输出已经在里面重跑过了，
+        再来一轮就是重复烧钱。
+        多块时也必须串行 —— 并发补跑会让整轮成文耗时失控（原设计刻意不给多块加重试）。
+        """
+        if not enabled:
+            return list(results)
+        rounds = max(0, int(self.config.llm.empty_retry))
+        out = [list(r) for r in results]  # type: ignore[misc]
+        for rd in range(1, rounds + 1):
+            targets = [i for i, r in enumerate(out) if r[2] and not r[0]]
+            if not targets:
+                break
+            for i in targets:
+                self.ctx.logger.info("选材块%d 空输出，第 %d/%d 次补跑", i + 1, rd, rounds)
+                out[i] = list(await self._extract_one_chunk(chunks[i], date_str, False))
+        return [cast(Tuple[list[dict[str, Any]], str, bool], tuple(r)) for r in out]
+
     async def _extract_events(self, timeline: str, date_str: str) -> list[dict[str, Any]]:
         """阶段一：分块选材 + 打分 + 合并排序。
 
         v1.4.0：**单块时**也走 :meth:`_call_llm_with_retry`（此前 `write_retry`
         只作用于成文，选材阶段完全没有重试 —— 真机实录里因此白废了整块选材）。
-        多块时**刻意不重试**：块之间本来就是"某块失败就跳过、用其余块"的降级设计
+        多块时**刻意不重试超时**：块之间本来就是"某块失败就跳过、用其余块"的降级设计
         （见下方 `run_one`），而且并发块逐个重试会让整轮成文的耗时失控。
+
+        v1.7.0：**空输出块**是例外，走**串行**补跑（见 :meth:`_rerun_empty_chunks`）。
+        真机 2026-10-20 里 3 块选材空了 1 块，那一块的素材就这么丢了；
+        空输出是自适应思考的抽样结果，不是这块"确实无事"，补跑有真实概率救回来。
         """
         chunks = chunk_text(timeline, self.config.diary.chunk_chars, self.config.diary.max_chunks)
         if not chunks:
             return []
+        # v1.5.2：分块保真度告警。`chunk_text` 到 max_chunks 就 break，尾部整段不进选材；
+        # 没有这条日志时，日志里只看到「选材完成: N 件」，看不出素材已被截过。
+        self._warn_if_chunks_truncated(timeline, chunks)
         sem = asyncio.Semaphore(3)
         single_chunk = len(chunks) == 1
 
-        async def run_one(chunk: str) -> Tuple[list[dict[str, Any]], str]:
-            """返回 (本块事件列表, 空块原因)。有事件时原因恒为 ``ok``。"""
-            async with sem:
-                try:
-                    if single_chunk:
-                        raw = await self._call_llm_with_retry(
-                            build_extract_prompt(date_str, chunk),
-                            self.config.llm.extract_temperature,
-                            stage="选材",
-                        )
-                    else:
-                        raw = await self._call_llm(
-                            build_extract_prompt(date_str, chunk),
-                            self.config.llm.extract_temperature,
-                        )
-                    events, note = parse_events_detailed(raw)
-                    if not events:
-                        return [], note
-                    return events, "ok"
-                except Exception as exc:
-                    # 区分超时与其它失败：超时通常意味着「模型池整体不可用」，
-                    # 成文阶段会因此降级失败，日志上看得出因果才排得动
-                    kind = "超时" if self._is_timeout_error(exc) else "失败"
-                    self.ctx.logger.warning("选材分块%s（跳过本块）: %s", kind, exc)
-                    return [], f"调用{kind}: {exc}"
-
-        results = await asyncio.gather(*(run_one(c) for c in chunks))
-        merged: list[dict[str, Any]] = [e for chunk_events, _ in results for e in chunk_events]
+        results = await asyncio.gather(
+            *(self._extract_one_chunk(c, date_str, single_chunk, sem) for c in chunks)
+        )
+        results = await self._rerun_empty_chunks(
+            chunks, list(results), date_str, enabled=not single_chunk,
+        )
+        merged: list[dict[str, Any]] = [e for chunk_events, _, _ in results for e in chunk_events]
         # 空块原因留痕：把「确实无事」和「解析失败」分开 —— 旧版统一打
         # 「选材为空（解析失败或确实无事）」，真机上完全分不清（2026-10-07 卡住的正是这个）。
-        _empty_notes = [(i, note) for i, (_, note) in enumerate(results, 1) if note != "ok"]
+        # 放在**补跑之后**：补跑救回来的块不该再报一次空。
+        _empty_notes = [(i, note) for i, (_, note, _) in enumerate(results, 1) if note != "ok"]
         if _empty_notes:
             self.ctx.logger.warning(
                 "选材空块: %s",
@@ -2143,7 +2578,6 @@ class BetterDiaryPlugin(MaiBotPlugin):
             "时间线构建完成: 消息 %d 条（bot %d / 用户 %d），时间线 %d 字符",
             stats["total"], stats["bot"], stats["user"], len(timeline),
         )
-
         # 阶段一：选材；失败或为空则降级用时间线末尾
         events = await self._extract_events(timeline, date_display(date_str))
         # 作者本人的称呼：素材渲染靠它把"别人说的"与"我自己的话"分开（先于成文解析）
@@ -2195,6 +2629,11 @@ class BetterDiaryPlugin(MaiBotPlugin):
             "篇幅档位: %s（目标 %d，区间 %d~%d，依据：%s）",
             _budget["tier"], _budget["target"], _budget["lo"], _budget["hi"], _budget["reason"],
         )
+        # 天气线索：素材里有人真的提过天气就用素材的，不再让模型凭氛围猜（v1.6.0）。
+        # 真机 2026-10-18 素材写着「下大雨 / 学校被淹了 / 鞋湿了」，日记却写「全天阴天」。
+        _weather = weather_hint(timeline)
+        if _weather:
+            self.ctx.logger.info("天气线索（来自当天素材）: %s", _weather)
         prompt = build_write_prompt(
             date_str=date_display(date_str),
             events_text=events_text,
@@ -2207,11 +2646,22 @@ class BetterDiaryPlugin(MaiBotPlugin):
             # 补写过去的日期必须声明相对时间的基准，否则模型会按「真正的今天」解读素材里的「昨天」
             temporal_anchor="" if is_today else date_display(date_str),
             continuity_text=build_continuity_line(continuity),
+            weather_hint_text=_weather,
         )
-        raw = await self._call_llm_with_retry(prompt, self.config.llm.temperature, stage="日记成文")
+        raw = await self._call_llm_nonempty(prompt, self.config.llm.temperature, stage="日记成文")
         stripped = strip_diary_output(raw)
         # 结构化 META 永远不进正文（split_meta 会先切掉，即使解析失败也不泄漏）
         body, meta = split_meta(stripped)
+        # META 反幻觉（v1.6.0）：它不进正文、不发布，但会写进 continuity.json 并经
+        # get_day_digest 交给别的插件 —— 编错的术语会**每天在错的基础上继续累积**。
+        # 真机 2026-10-18 的 13 条里 12 条是幻觉，所以这里用素材做确定性回校。
+        meta, _meta_dropped = filter_meta_against_evidence(meta, timeline)
+        if _meta_dropped:
+            # 抑制分支必须留痕：否则「清洗太狠」会变成另一种看不见的静默
+            self.ctx.logger.warning(
+                "META 剔除 %d 条当天素材里找不到依据的术语（不进连续性）: %s",
+                len(_meta_dropped), "、".join(_meta_dropped[:6]),
+            )
         # 发布前的语义闸：拒答 / 空输出 / 残句一律判失败，本日不存档也不发布。
         # 日记成品会公开出现在 QQ 空间，绝不能把「抱歉，作为一个人工智能…」发出去。
         problem = diary_output_problem(body)
@@ -2255,8 +2705,10 @@ class BetterDiaryPlugin(MaiBotPlugin):
             )
         # 引用体检（非阻断，只留痕）。
         # ①「素材原话」类的判据只有选材成文时才查得动 —— 降级路径没有事件可比。
+        _attr_risk = ""
         if used_events:
             risk = quote_attribution_risk(content, [e.get("quote", "") for e in used_events])
+            _attr_risk = risk
             if risk:
                 # 只记「有几条、哪些事件」——聊天的逐字原话不再写进日志文件。
                 # 需要看原文用 /日记来源 <日期>（管理员命令，正文与证据链都在存档里）。
@@ -2405,6 +2857,34 @@ class BetterDiaryPlugin(MaiBotPlugin):
 
     def _store_path(self) -> Path:
         return self._data_dir() / "diaries.json"
+
+    def _warn_if_chunks_truncated(self, timeline: str, chunks: list[str]) -> None:
+        """分块把尾部丢掉时打一条 WARNING（v1.5.2）。
+
+        ``chunk_text`` 达到 ``max_chunks`` 即 ``break``，之后的行**不进任何分块** ——
+        单日聊天量大时，最晚那几场对话会静默消失，而选材日志只显示「N 件入选」，
+        看不出素材已被截断。真机 2026-10-17 那份日记「内容有错」的排查结论之一正是这个。
+
+        只打**计数**（块数 / 丢失行数与字数），不打原文 —— 与 v1.4.x「日志不落逐字原话」一致。
+        插件不再保留时间线原文，想确认丢了什么只能调大 ``max_chunks`` 重新生成一次。
+        """
+        coverage = chunk_coverage(timeline, chunks)
+        if coverage["identical"]:
+            return
+        cfg = self.config.diary
+        limit = max(1, int(cfg.max_chunks))
+        if len(chunks) >= limit:
+            self.ctx.logger.warning(
+                "时间线被分块上限截断：%d/%d 块，尾部 %d 行 / %d 字未进入选材"
+                "（chunk_chars=%d，max_chunks=%d）。调大 max_chunks 可收全",
+                len(chunks), limit, coverage["lost_lines"], coverage["lost_chars"],
+                int(cfg.chunk_chars), limit,
+            )
+        else:  # 没触上限却对不上 —— 属切分异常，单独一条便于区分
+            self.ctx.logger.warning(
+                "分块拼回与原文不一致（未触上限）：丢失 %d 行 / %d 字，属切分异常",
+                coverage["lost_lines"], coverage["lost_chars"],
+            )
 
     def _store_backup_path(self) -> Path:
         """固定名的「上一份好存档」。
@@ -2615,7 +3095,7 @@ def _split_targets(targets: list[str]) -> tuple[set[str], set[str]]:
     """把 target_chats 切成 (群号集合, 用户号集合)，并把 QQ 号归一化成纯数字。
 
     归一化很重要：群里成员的 ``user_id`` 在不同适配器下可能是
-    ``o02472005478`` / ``2472005478`` / ``qq:2472005478`` 等形态，
+    ``o01234567890`` / ``1234567890`` / ``qq:1234567890`` 等形态，
     直接字符串比大小会漏配（这是兜底过滤必须做对的一步）。
     """
     groups: set[str] = set()
@@ -2634,7 +3114,7 @@ def _split_targets(targets: list[str]) -> tuple[set[str], set[str]]:
 def _digits_only(value: Any) -> str:
     """QQ 号归一化，与项目其他模块的约定保持一致。
 
-    Qzone 侧的 UIN 是 ``o02472005478`` 形态（``bd_qzone`` / ``bd_cookie`` 都用
+    Qzone 侧的 UIN 是 ``o01234567890`` 形态（``bd_qzone`` / ``bd_cookie`` 都用
     ``lstrip("o0")`` 处理），群里消息的 ``user_id`` 可能是 ``o0…`` 也可能是裸数字，
     所以要**先剥 o 前缀、再去前导 0**，否则同一个人的两种写法会被当成两个人
     （兜底过滤会漏配）。

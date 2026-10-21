@@ -287,7 +287,7 @@ print("NOHTTPX-LOAD-OK")
         _saved = _bdq.HTTPX_AVAILABLE
         _bdq.HTTPX_AVAILABLE = False
         try:
-            _p = _bdq.QzonePublisher({"uin": "o0247200547", "p_skey": "pskey"})
+            _p = _bdq.QzonePublisher({"uin": "o0987654321", "p_skey": "pskey"})
             try:
                 asyncio.run(_p.publish_text("测试"))
                 _raised = ""
@@ -384,12 +384,12 @@ print("NOHTTPX-LOAD-OK")
         {
             "plugin": {"config_version": "1.0.0"},
             "security": {"admin_ids": ["999"]},
-            "qzone": {"uin": "2472005478"},
+            "qzone": {"uin": "1234567890"},
             "diary": {"word_target": "abc"},  # 故意写坏一个字段，逼走兜底路径
         }
     )
     check("兜底后保留用户 admin_ids", _p_keep.config.security.admin_ids == ["999"], str(_p_keep.config.security.admin_ids))
-    check("兜底后保留用户 uin", _p_keep.config.qzone.uin == "2472005478", _p_keep.config.qzone.uin)
+    check("兜底后保留用户 uin", _p_keep.config.qzone.uin == "1234567890", _p_keep.config.qzone.uin)
     check("兜底逐字段修复（word_target 回到默认值）",
           _p_keep.config.diary.word_target == plugin_mod.BetterDiaryConfig().diary.word_target,
           str(_p_keep.config.diary.word_target))
@@ -422,7 +422,8 @@ print("NOHTTPX-LOAD-OK")
         info = getattr(plugin_mod.BetterDiaryPlugin, attr).__dict__.get("__maibot_component_info__") if isinstance(getattr(plugin_mod.BetterDiaryPlugin, attr, None), (classmethod, staticmethod)) else getattr(getattr(plugin_mod.BetterDiaryPlugin, attr, None), "__maibot_component_info__", None)
         if info is not None and getattr(info, "component_type", getattr(info, "type", "")) in ("command",) or (info is not None and hasattr(info, "command_pattern")):
             commands[info.name] = info
-    check("共 6 个命令组件", len(commands) == 6, f"实际 {list(commands)}")
+    check("共 6 个命令组件（v1.6.0 移除 /日记趋势）", len(commands) == 6, f"实际 {list(commands)}")
+    check("diary_trend 已移除", "diary_trend" not in commands, str(list(commands)))
     import re as _re
 
     p_diary = commands.get("diary")
@@ -461,7 +462,7 @@ print("NOHTTPX-LOAD-OK")
     print("\n[3b] 成文 prompt 契约（引号归属）")
     wp = bd.build_write_prompt(
         date_str="2026年9月27日 星期日",
-        events_text="- 甲：提了《无名策》（原话：「来首无名策岂不美哉」）",
+        events_text="- 甲：提了《晚风》（原话：「来首晚风岂不美哉」）",
         name="鸣澜", persona="是只爱聊天的 bot",
     )
     # 元凶：prompt 曾用「」当占位符（写「<日期>，X。」），教模型把「」当"待填框"
@@ -489,10 +490,10 @@ print("NOHTTPX-LOAD-OK")
     check("瘦身没带走事实纪律与硬契约", "事实纪律" in wp and "不得制造" in wp and "不要标题" in wp)
 
     # 引用体检（非阻断）
-    q_ok = "他说「来首无名策岂不美哉」，我回了句安排上了，好听。"
-    q_bad = "回了句「来首无名策岂不美哉 安排上了，好听」。"
+    q_ok = "他说「来首晚风岂不美哉」，我回了句安排上了，好听。"
+    q_bad = "回了句「来首晚风岂不美哉 安排上了，好听」。"
     check("原样引用了素材原话 → 无告警",
-          bd.quote_attribution_risk(q_ok, ["来首无名策岂不美哉"]) == "")
+          bd.quote_attribution_risk(q_ok, ["来首晚风岂不美哉"]) == "")
     check("引号里没出现任何素材原话 → 告警",
           bd.quote_attribution_risk(q_bad, ["奇妙的另一句原话"]) != "")
     check("没有「」 → 不告警",
@@ -637,6 +638,52 @@ print("NOHTTPX-LOAD-OK")
             check("命中项只是标签、不含原文",
                   all("明天" not in h and "充实" not in h for h in _tone_entry["ai_tone_hits"]),
                   str(_tone_entry["ai_tone_hits"]))
+
+        # 接线验证：分块触顶时那条 WARNING 必须真的出现在日志里（单测只证明了方法本身）
+        _caught: list[str] = []
+
+        class _Collect(logging.Handler):
+            def emit(self, record):
+                try:
+                    _caught.append(record.getMessage())
+                except Exception:
+                    pass
+
+        _log = logging.getLogger("fakectx")
+        _h = _Collect()
+        _old_level = _log.level
+        _log.addHandler(_h)
+        _log.setLevel(logging.INFO)
+        try:
+            with tempfile.TemporaryDirectory() as td_cap:
+                cap_dir = Path(td_cap)
+                ctx_cap = FakeCtx(cap_dir / "data", make_messages(1789507200.0), fake_llm)
+                p_cap = plugin_mod.create_plugin()
+                try:
+                    p_cap.ctx = ctx_cap
+                except AttributeError:
+                    p_cap._ctx = ctx_cap
+                p_cap.set_plugin_config(
+                    {
+                        "plugin": {"enabled": True, "config_version": "1.0.0"},
+                        "diary": {
+                            "min_messages": 2,
+                            "filter_mode": "all",
+                            "chunk_chars": 20,
+                            "max_chunks": 1,
+                        },
+                        "schedule": {"enabled": False},
+                        "security": {"admin_ids": []},
+                    }
+                )
+                asyncio.run(p_cap._generate_for_date("2026-09-26"))
+        finally:
+            _log.removeHandler(_h)
+            _log.setLevel(_old_level)
+        check("分块触顶时打出告警", any("被分块上限截断" in m for m in _caught),
+              str(_caught[-3:]))
+        check("告警只出计数、不含聊天原文",
+              all(": " not in m.split("（")[0] for m in _caught if "被分块上限截断" in m))
 
         print("\n[5] 消息过少拒写")
         plugin2 = plugin_mod.create_plugin()
@@ -883,7 +930,7 @@ print("NOHTTPX-LOAD-OK")
     code = bdq.extract_code('frameElement.callback({"code":0,"tid":"abc"});')
     check("extract_code 剥回调噪声", code == 0)
 
-    cookies = {"uin": "o0247200547", "p_skey": "abcd1234", "skey": "@xxx"}
+    cookies = {"uin": "o0987654321", "p_skey": "abcd1234", "skey": "@xxx"}
 
     def _mk_transport(handler):
         return _httpx.MockTransport(handler)
@@ -948,7 +995,7 @@ print("NOHTTPX-LOAD-OK")
                                request=request)
 
     pub_redir = bdq.QzonePublisher(
-        {"uin": "o02472005478", "p_skey": "PSKEY_SECRET_VALUE"},
+        {"uin": "o01234567890", "p_skey": "PSKEY_SECRET_VALUE"},
         transport=_httpx.MockTransport(redirect_handler),
     )
     r_redir = asyncio.run(pub_redir.publish_text("hello", timeout=5))
@@ -1104,9 +1151,9 @@ print("NOHTTPX-LOAD-OK")
     bdc = sys.modules["bd_cookie"]
     import httpx as _httpx
 
-    ok_cookie_str = "uin=o0247200547; p_skey=pskey123; skey=@skey456"
+    ok_cookie_str = "uin=o0987654321; p_skey=pskey123; skey=@skey456"
     parsed = bdc.parse_cookie_string(ok_cookie_str)
-    check("cookie 串解析", parsed.get("uin") == "o0247200547" and parsed.get("p_skey") == "pskey123")
+    check("cookie 串解析", parsed.get("uin") == "o0987654321" and parsed.get("p_skey") == "pskey123")
 
     with tempfile.TemporaryDirectory() as td2:
         cookie_dir = Path(td2)
@@ -1170,7 +1217,7 @@ print("NOHTTPX-LOAD-OK")
         check("来源1优先、来源2按需降级（计数正确）", calls["adapter"] == 2 and calls["http"] == 1, f"adapter {calls['adapter']} http {calls['http']}")
         check("节流期内不再调用远端", ra2 == ra1)
         check("force 绕过节流重取", ra3 is not None)
-        check("adapter 挂掉降级 NapCat HTTP 成功", rb is not None and rb["uin"] == "o0247200547", str(rb))
+        check("adapter 挂掉降级 NapCat HTTP 成功", rb is not None and rb["uin"] == "o0987654321", str(rb))
         check("HTTP 请求带 domain 参数", calls["http"] >= 1)
         check("全来源失败返回缓存兜底（无缓存则 None）", rc is None)
         check("cookie 落盘（可重启恢复）", (cookie_dir / "a" / "cookies.json").exists())
@@ -1204,8 +1251,11 @@ print("NOHTTPX-LOAD-OK")
         check("平铺加载也可用（插件目录在 sys.path）", False, str(exc))
 
     print("\n[10] 插件目录无残留")
+    # v1.6.0 起追踪采集整块移除，断言收紧回「data/ 里什么都不许有」：
+    # 拦的是真正的坏味道 —— 插件把 diaries.json / cookies.json 之类运行态写进源码目录。
     residue = PLUGIN_DIR / "data"
-    check("插件目录无 data/ 残留", not residue.exists())
+    extra = sorted(p.name for p in residue.iterdir()) if residue.is_dir() else []
+    check("插件目录 data/ 下无残留", not extra, str(extra))
 
     print("\n[11] 不丢天：补跑缺档（只存档、不发布）")
     with tempfile.TemporaryDirectory() as td_catch:
@@ -1377,7 +1427,7 @@ print("NOHTTPX-LOAD-OK")
 
         runs: list[int] = []
 
-        async def record_run():
+        async def record_run(date_str: str = ""):
             runs.append(1)
 
         pq._scheduled_run = record_run  # type: ignore[assignment]
@@ -1584,31 +1634,31 @@ print("NOHTTPX-LOAD-OK")
           str(_rule_nums))
 
     print("\n[18] 引号归属：素材不制造歧义 + 引号越界体检（真机 2026-10-07 实录）")
-    _q_line = "烧退了 鼻子还是堵的 先补个觉"
-    # 真机第三段：一对「」焊了两个人的话（Bravocat 的原话 + bot 自己的回复）
-    _merged = f"晚上台长说「{_q_line} 我也鼻子堵」，听着就难受。"
+    _q_line = "稿子改完了 眼睛有点酸 先躺一会儿"
+    # 真机第三段：一对「」焊了两个人的话（阿岚 的原话 + bot 自己的回复）
+    _merged = f"晚上老张说「{_q_line} 我也困得慌」，听着就难受。"
     _risk = bd.quote_attribution_risk(_merged, [_q_line])
     check("引号越界（跨说话人）被体检抓住", "引号越界" in _risk, repr(_risk))
-    # 真机第一段形态：引号里 = 被引用原文 + 我的回复（「喔喔喔」重复）
-    _echo = "回了句「喔喔喔———— 喔喔喔———— 守夜频段交班，早班就位」"
+    # 真机第一段形态：引号里 = 被引用原文 + 我的回复（「交班啦」重复）
+    _echo = "回了句「交班啦———— 交班啦———— 夜班签退，白班就位」"
     check("引用后回复导致的越界也被抓住",
           "引号越界" in bd.quote_attribution_risk(
-              _echo, ["喔喔喔———— 守夜频段交班，早班就位"]), "")
+              _echo, ["交班啦———— 夜班签退，白班就位"]), "")
     # 边界正确 → 不误报
-    _clean = f"晚上台长说「{_q_line}」，我说我也鼻子堵。"
+    _clean = f"晚上老张说「{_q_line}」，我说我也困得慌。"
     check("边界正确的引用不报越界", bd.quote_attribution_risk(_clean, [_q_line]) == "", "")
     # 「我」自己的话不再被渲染成「原话」（素材与规则不能再打架）
     _mat = bd.events_to_text(
         [
-            {"who": "我", "what": "接力交班", "quote": "喔喔喔———— 守夜频段交班，早班就位"},
-            {"who": "Bravocat", "what": "感冒了", "quote": _q_line},
+            {"who": "我", "what": "接力交班", "quote": "交班啦———— 夜班签退，白班就位"},
+            {"who": "阿岚", "what": "加班了", "quote": _q_line},
         ],
         self_labels={"我", "鸣澜"},
     )
     check("「我」的原话不再标成「原话」",
-          "- 我：接力交班（我自己的话" in _mat and "（原话：「喔喔喔" not in _mat, repr(_mat))
+          "- 我：接力交班（我自己的话" in _mat and "（原话：「交班啦" not in _mat, repr(_mat))
     check("别人的原话照旧标「原话」", f"（原话：「{_q_line}」）" in _mat, repr(_mat))
-    _mat2 = bd.events_to_text([{"who": "鸣澜", "what": "接力", "quote": "守夜频段交班"}],
+    _mat2 = bd.events_to_text([{"who": "鸣澜", "what": "接力", "quote": "夜班签退"}],
                               self_labels={"我", "鸣澜"})
     check("昵称形态的「我」也被识别", "我自己的话" in _mat2, repr(_mat2))
     # prompt 侧：阶段一 quote 硬约束 + 阶段二「一对引号只装一个人」
@@ -1623,34 +1673,137 @@ print("NOHTTPX-LOAD-OK")
     # 靠「自己的话被装进「」」这条判据兜住。
     check("「」里装了自己的话会被抓住（真机第三段，原话带 emoji）",
           "自己说过的话" in bd.self_quote_in_brackets(
-              f"晚上台长说「{_q_line} 我也鼻子堵」，听着就难受。", ["我也鼻子堵😭"]), "")
+              f"晚上老张说「{_q_line} 我也困得慌」，听着就难受。", ["我也困得慌😭"]), "")
     check("「」整段都是自己的回复也会抓住（真机第一段）",
           "自己说过的话" in bd.self_quote_in_brackets(
-              "回了句「喔喔喔———— 喔喔喔———— 守夜频段交班，早班就位」",
-              ["喔喔喔———— 守夜频段交班，早班就位"]), "")
+              "回了句「交班啦———— 交班啦———— 夜班签退，白班就位」",
+              ["交班啦———— 夜班签退，白班就位"]), "")
     check("「」里只有别人的话不报",
-          bd.self_quote_in_brackets(f"台长说「{_q_line}」，我说我也鼻子堵。",
-                                    ["我也鼻子堵😭"]) == "", "")
-    _tl = "【晚上21点】\nBravocat: 烧退了\n我: 我也鼻子堵\n"
+          bd.self_quote_in_brackets(f"老张说「{_q_line}」，我说我也困得慌。",
+                                    ["我也困得慌😭"]) == "", "")
+    _tl = "【晚上21点】\n阿岚: 稿子改完了\n我: 我也困得慌\n"
     check("时间线能拆出说话人（时段标记被跳过）",
-          bd.timeline_speaker_lines(_tl) == [("Bravocat", "烧退了"), ("我", "我也鼻子堵")],
+          bd.timeline_speaker_lines(_tl) == [("阿岚", "稿子改完了"), ("我", "我也困得慌")],
           str(bd.timeline_speaker_lines(_tl)))
     _fb = bd.build_timeline_fallback_text(_tl)
     check("降级素材带格式说明（点明「我」是谁）",
-          "格式说明" in _fb and "「我」= 你自己说过的话" in _fb and "Bravocat: 烧退了" in _fb, "")
+          "格式说明" in _fb and "「我」= 你自己说过的话" in _fb and "阿岚: 稿子改完了" in _fb, "")
     # 真机 2026-10-08：模型把日期行又写了一遍在结尾（天气还不一致）
     _dup_tail = bd.ensure_date_line(
-        "2026年10月8日 星期四，阴。\n烧退了，鼻子还是有点堵。\n2026年10月8日 星期四，晴",
+        "2026年10月8日 星期四，阴。\n稿子改完了，眼睛还是有点酸。\n2026年10月8日 星期四，晴",
         "2026年10月8日 星期四",
     )
     check("结尾的重复日期行被删掉", _dup_tail.count("2026年10月8日") == 1, repr(_dup_tail))
     check("保留首行天气、不采用结尾那行的", "阴" in _dup_tail and "晴" not in _dup_tail, repr(_dup_tail))
     _only_tail = bd.ensure_date_line(
-        "烧退了，今天终于有精力翻聊天记录。\n2026年10月8日 星期四，晴",
+        "稿子改完了，今天终于有力气干点别的。\n2026年10月8日 星期四，晴",
         "2026年10月8日 星期四",
     )
     check("日期行只写在结尾时搬上去并沿用天气",
           _only_tail.split("\n")[0] == "2026年10月8日 星期四，晴。", repr(_only_tail))
+
+    print("\n[19] v1.6.0 事实纪律：天气线索 + META 反幻觉")
+    # 真机 2026-10-18：素材写着「下大雨 / 学校被淹了 / 鞋湿了」，日记却写「全天阴天」。
+    _rainy = "【下午12点】\n依见如故: 下大雨☔️\n秋枫叶语Acer: 学校被淹了……\n秋枫叶语Acer: 漂亮，鞋湿了。\n"
+    _wh = bd.weather_hint(_rainy)
+    check("素材提到下雨时给出雨的线索", "雨" in _wh and "下大雨" in _wh, _wh)
+    check("无线索时返回空串（仍按氛围选）", bd.weather_hint("【晚上】\n甲: 睡了\n") == "", "")
+    check("空输入不炸", bd.weather_hint("") == "", "")
+    _wprompt = bd.build_write_prompt(
+        date_str="2026年10月18日", events_text="x", name="鸣澜", persona="是个DJ",
+        weather_hint_text=_wh,
+    )
+    check("有线索时 prompt 把天气钉死", "不许凭感觉改成别的天气" in _wprompt)
+    check("无线索时保持旧规则", "选一个贴合今天聊天氛围的" in bd.build_write_prompt(
+        date_str="2026年10月18日", events_text="x", name="鸣澜", persona="是个DJ"))
+
+    # 真机 2026-10-18 那份 META：13 条里 12 条是幻觉
+    _evidence = _rainy + "【下午15点】\nkugurija: 能不能让鸣澜包养我\n秋枫叶语Acer: 为什么周日会有课啊!\n"
+    _bad_meta = {
+        "topics": ["秋枫叶语Acer周日上课吐槽与鞋湿", "全员复读猫猫梗"],
+        "people": ["秋枫叶语Acer", "kugirija"],  # 拼错：正确拼写是 kugurija
+        "projects": ["FMInfinity共鸣电台", "新歌命名"],
+        "unresolved": ["台长精神状态", "看板娘归属权争议", "项圈牵绳排队"],
+    }
+    _clean, _dropped = bd.filter_meta_against_evidence(_bad_meta, _evidence)
+    check("有据的 topic 保留", "秋枫叶语Acer周日上课吐槽与鞋湿" in _clean.get("topics", []), str(_clean))
+    check("拼错的人名被剔掉（实体名逐字比对）",
+          _clean.get("people") == ["秋枫叶语Acer"], str(_clean.get("people")))
+    check("编造的 projects 全灭", "projects" not in _clean, str(_clean))
+    check("编造的 unresolved 全灭", "unresolved" not in _clean, str(_clean))
+    check("被剔除的术语全部回给调用方记日志", len(_dropped) == 7, str(_dropped))
+    check("无证据文本时不清洗（避免误杀）",
+          bd.filter_meta_against_evidence(_bad_meta, "")[0] == _bad_meta)
+
+    print("\n[20] v1.6.0 不丢天：定时触发跨重启续等")
+    with tempfile.TemporaryDirectory() as td_pend:
+        pend_dir = Path(td_pend)
+        pp = plugin_mod.create_plugin()
+        try:
+            pp.ctx = ctx
+        except AttributeError:
+            pp._ctx = ctx
+        pp._data_dir = lambda: pend_dir  # type: ignore[assignment]
+        pp.set_plugin_config({"plugin": {"enabled": True, "config_version": "1.0.0"},
+                              "schedule": {"enabled": True, "time": "00:00",
+                                           "wait_silent_minutes": 0}})
+
+        # 标记读写往返
+        _now = _dt.datetime.now()
+        pp._write_pending("2026-10-18", _now, 2)
+        _back = pp._load_pending()
+        check("标记能落盘并读回", _back.get("date") == "2026-10-18" and _back.get("attempt") == 2, str(_back))
+        pp._clear_pending("2026-10-19")  # 日期不同 → 不该删
+        check("清标记时日期不同则不删", pp._load_pending().get("date") == "2026-10-18")
+        pp._clear_pending("2026-10-18")
+        check("日期相同才清掉", pp._load_pending() == {})
+        # 坏文件按「无标记」处理且必须留痕，绝不静默判空
+        (pend_dir / "scheduled_pending.json").write_text("{not json", encoding="utf-8")
+        check("坏标记文件按无标记处理", pp._load_pending() == {})
+        (pend_dir / "scheduled_pending.json").unlink()
+
+        # 启动补偿：有标记 → 续等（走会发布的主流程）
+        pp._RESUME_DELAY_SEC = 0  # type: ignore[assignment]
+        _calls: list[str] = []
+
+        async def fake_run(date_str: str = ""):
+            _calls.append(date_str or "today")
+            return None
+
+        pp._scheduled_run = fake_run  # type: ignore[assignment]
+        _today = _dt.date.today().strftime("%Y-%m-%d")
+        pp._write_pending(_today, _now - _dt.timedelta(hours=5), 3)
+        asyncio.run(pp._resume_after_restart())
+        check("有标记 → 重启后续跑今天的定时生成", _calls == [_today], str(_calls))
+        check("跑完清掉标记（不会每次重启都补）", pp._load_pending() == {})
+
+        # 启动补偿：标记指向过去某天 → 走补写（只存档、不发布）
+        _calls.clear()
+        pp._write_pending("2026-10-18", _now - _dt.timedelta(hours=30), 1)
+        asyncio.run(pp._resume_after_restart())
+        check("标记跨天 → 按补写跑那一天", _calls == ["2026-10-18"], str(_calls))
+
+        # 启动补偿：无标记 + 今天主时间已过 + 今天没成品 → 补一次
+        _calls.clear()
+        asyncio.run(pp._resume_after_restart())
+        check("无标记但已过点且当天无成品 → 补一次", _calls == [_today], str(_calls))
+
+        # 幂等：当天已有成品就不再补（避免重启一次烧一次 LLM）
+        _calls.clear()
+        (pend_dir / "diaries.json").write_text(
+            json.dumps({_today: {"content": "今天写了点东西。", "word_count": 8}}, ensure_ascii=False),
+            encoding="utf-8")
+        asyncio.run(pp._resume_after_restart())
+        check("当天已有成品 → 不重复补", _calls == [], str(_calls))
+
+        # 主时间还没到 → 交回常规调度，绝不提前写
+        _calls.clear()
+        (pend_dir / "diaries.json").unlink()
+        pp.set_plugin_config({"plugin": {"enabled": True, "config_version": "1.0.0"},
+                              "schedule": {"enabled": True, "time": "23:59",
+                                           "wait_silent_minutes": 0}})
+        asyncio.run(pp._resume_after_restart())
+        check("主时间未到 → 不动（交给常规调度）", _calls == [], str(_calls))
 
     print(f"\n===== 冒烟结果: PASS {len(PASS)} / FAIL {len(FAIL)} =====")
     if FAIL:

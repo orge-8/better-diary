@@ -4,7 +4,7 @@
 写进 reply 段，而 Host ``process_reply_component`` 分支①把它**不加前缀**直接拼进
 ``processed_plain_text`` —— 「被引原文 + 我的回复」无缝黏在一条消息里，说话人却记成
 回复者本人。真机那次（回查成功）日记写成
-``台长…说「烧退了 鼻子还是堵的 先补个觉 我也鼻子堵」``：一对「」里焊了两个人的话。
+``老张…说「稿子改完了 眼睛有点酸 先躺一会儿 我也困得慌」``：一对「」里焊了两个人的话。
 """
 
 from __future__ import annotations
@@ -36,8 +36,8 @@ MOD = load_plugin_module(str(PLUGIN_DIR), module_name="better_diary_reply_split_
 BD = importlib.import_module("better_diary_reply_split_test.bd_prompts")
 
 DAY_TS = 1789507200.0  # 2026-09-26 16:00 UTC+8 附近，具体时刻不影响断言
-QUOTED = "烧退了 鼻子还是堵的 先补个觉"
-MY_REPLY = "我也鼻子堵😭"
+QUOTED = "稿子改完了 眼睛有点酸 先躺一会儿"
+MY_REPLY = "我也困得慌😭"
 
 
 def _reply_msg(
@@ -70,7 +70,7 @@ def _reply_msg(
                     "target_message_id": "90001",
                     "target_message_content": quoted,
                     "target_message_sender_id": (quoted_sender or {}).get("id", "111"),
-                    "target_message_sender_nickname": (quoted_sender or {}).get("nick", "Bravocat"),
+                    "target_message_sender_nickname": (quoted_sender or {}).get("nick", "阿岚"),
                     "target_message_sender_cardname": (quoted_sender or {}).get("card"),
                 },
             },
@@ -94,7 +94,7 @@ def _normal_msg(uid: str, nick: str, text: str, ts: float = DAY_TS - 60) -> dict
 def test_quoted_reply_is_split_into_two_lines():
     """回查成功的引用回复：被引原文独立成行归真说话人，我的回复归「我」。"""
     timeline, stats = BD.build_timeline([_reply_msg()], bot_qq="10000")
-    assert f"Bravocat: {QUOTED}" in timeline, timeline
+    assert f"阿岚: {QUOTED}" in timeline, timeline
     assert f"我: {MY_REPLY}" in timeline, timeline
     # 黏连形态不许再出现
     assert f"{QUOTED}{MY_REPLY}" not in timeline.replace("\n", ""), timeline
@@ -105,7 +105,7 @@ def test_quoted_reply_is_split_into_two_lines():
 def test_quoted_line_not_duplicated_when_original_already_in_timeline():
     """被引消息本身就在当天记录里：只剥离、不重复插行。"""
     messages = [
-        _normal_msg("111", "Bravocat", QUOTED),
+        _normal_msg("111", "阿岚", QUOTED),
         _reply_msg(),
     ]
     timeline, stats = BD.build_timeline(messages, bot_qq="10000")
@@ -116,9 +116,9 @@ def test_quoted_line_not_duplicated_when_original_already_in_timeline():
 
 def test_group_cardname_wins_over_nickname():
     """群里优先用群名片（cardname）—— 昵称和名片不一致时以名片为准。"""
-    msg = _reply_msg(quoted_sender={"id": "111", "nick": "Bravocat", "card": "台长"})
+    msg = _reply_msg(quoted_sender={"id": "111", "nick": "阿岚", "card": "老张"})
     timeline, _ = BD.build_timeline([msg], bot_qq="10000")
-    assert f"台长: {QUOTED}" in timeline, timeline
+    assert f"老张: {QUOTED}" in timeline, timeline
 
 
 def test_quoted_from_self_is_attributed_to_me():
@@ -161,14 +161,14 @@ def test_strip_failure_falls_back_conservatively():
 def test_time_ordering_of_split_lines():
     """被引行插在回复行之前 —— 被引必然早于回复，时序成立。"""
     timeline, _ = BD.build_timeline([_reply_msg()], bot_qq="10000")
-    assert timeline.index(f"Bravocat: {QUOTED}") < timeline.index(f"我: {MY_REPLY}")
+    assert timeline.index(f"阿岚: {QUOTED}") < timeline.index(f"我: {MY_REPLY}")
 
 
 def test_reply_only_message_has_no_empty_line():
     """纯引用无正文（QQ 允许）：只出被引行，不出空「我: 」行。"""
     msg = _reply_msg(body=QUOTED)
     timeline, stats = BD.build_timeline([msg], bot_qq="10000")
-    assert f"Bravocat: {QUOTED}" in timeline
+    assert f"阿岚: {QUOTED}" in timeline
     assert "我: \n" not in timeline and not timeline.rstrip().endswith("我:"), timeline
     assert stats["reply_split"] == 1
 
@@ -177,11 +177,11 @@ def test_self_quote_check_benefits_from_split():
     """拆分后 ``self_quote_in_brackets`` 不再把别人的原话当成我的话。
 
     旧形态下被引原文黏在「我:」行里 → 体检把 QUOTED 认成我说的 →
-    模型若照素材写「QUOTED 我也鼻子堵」进引号，体检反而失明。
+    模型若照素材写「QUOTED 我也困得慌」进引号，体检反而失明。
     """
     timeline, _ = BD.build_timeline([_reply_msg()], bot_qq="10000")
     self_lines = [t for who, t in BD.timeline_speaker_lines(timeline) if who == "我"]
     assert self_lines == [MY_REPLY], self_lines
     # 模型把被引原文错装进引号的形态，现在能被精确抓住
-    risk = BD.self_quote_in_brackets(f"台长说「{QUOTED}」，我说我也鼻子堵。", self_lines)
+    risk = BD.self_quote_in_brackets(f"老张说「{QUOTED}」，我说我也困得慌。", self_lines)
     assert risk == "", risk

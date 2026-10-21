@@ -10,7 +10,7 @@ import datetime
 import hashlib
 import json
 import re
-from typing import Any, Dict, Iterable, List, Mapping, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 # 单条消息在时间线里的最大文本长度（过长消息截断，保 token 预算）
 _MSG_TEXT_LIMIT = 80
@@ -94,7 +94,7 @@ def quote_attribution_risk(content: str, given_quotes: list[str]) -> str:
 
     真机反馈过两类缺陷：
 
-    1. 模型把「」当成"待填占位"用，写出 ``「来首无名策岂不美哉 安排上了，好听」``
+    1. 模型把「」当成"待填占位"用，写出 ``「来首晚风岂不美哉 安排上了，好听」``
        —— 别人的原话和自己的回复挤在同一对引号里。**归属错了，等于替别人说话。**
     2. 真机 2026-10-07：一对「」里焊进了**两个不同人**的话
        （被引用人的原话 + 作者自己的回复），整句却归给了被引用人。
@@ -139,8 +139,8 @@ def self_quote_in_brackets(content: str, self_lines: list[str], min_len: int = 5
     """日记里的「」装进了**作者自己说过的话** → 归属错（把自己的话当别人的引用）。
 
     真机 2026-10-07 的两处都属这一类：
-    - ``台长…说「烧退了 鼻子还是堵的 先补个觉 我也鼻子堵」`` —— 后半句是我自己的回复；
-    - ``回了句「喔喔喔———— 守夜频段交班，早班就位」`` —— 整段都是我自己的回复。
+    - ``老张…说「稿子改完了 眼睛有点酸 先躺一会儿 我也困得慌」`` —— 后半句是我自己的回复；
+    - ``回了句「交班啦———— 夜班签退，白班就位」`` —— 整段都是我自己的回复。
 
     比"引号越界"更直接：越界要靠"素材原话被包含"来推断，而这条拿**作者本人说过的话**
     直接比对，不依赖素材里有没有抽到原话 —— 所以**降级路径（timeline_tail）也能查**。
@@ -247,7 +247,7 @@ def _reply_info_from_segments(
     逻辑同源）会把引用目标回查成 ``target_message_content`` + 真实说话人写进 reply 段，
     而 Host 的 ``process_reply_component`` 分支①把它**不加前缀**直接拼进
     ``processed_plain_text`` —— 于是「被引原文 + 我的回复」无缝黏在一条消息里，
-    说话人却记成了回复者。真机 2026-10-07「烧退了…先补个觉 我也鼻子堵」的归属错，
+    说话人却记成了回复者。真机 2026-10-07「稿子改完了…先躺一会儿 我也困得慌」的归属错，
     根子就在这一层。
 
     本函数只认**回查成功**的 reply 段（有 ``target_message_content``）；
@@ -393,13 +393,18 @@ def build_extract_prompt(date_str: str, timeline_chunk: str) -> str:
     """阶段一：从时间线分块中提取值得写进日记的事件。"""
     return f"""你是日记素材编辑。下面是 {date_str} 的一段聊天记录（时间线格式，"我"指日记作者本人）。
 
-从记录里挑出 0-4 件「值得写进睡前日记的事」，优先级从高到低：
+从记录里挑出 0-6 件「值得写进睡前日记的事」（**多给几件没关系的，宁可多给也别漏** ——
+候选少了后面就没得挑，真机 2026-10-18 只给了 2 件，结果当天最浓的一段整个没进日记）。
+优先级从高到低：
+- 有人**直接对"我"**说的话（尤其是带 @我 的）：被表白、被安慰、被逗、被托付，这类必须优先选
 - 有人分享了自己的经历、作品或情绪波动（被安慰、被夸、闹笑话都算）
+- 有人**做成了某件事**（卖了多少、拿到了什么反馈、被谁认可了）—— 有结果的比纯玩梗更值得记
 - 群里真实聊开了的话题（有人接话、有来回的才算）
 - "我"本人参与并有来有回的有趣互动
 - 纯情绪反应（全场爆笑、集体哀嚎、齐刷刷刷同一句话）若是当天最有记忆点的，也算值得记的事
 - 忽略：纯表情或"哈哈"刷屏、无实质内容的水群、命令与系统消息、冷场单条发言
 - 必须忠实于记录，宁可漏掉也不许脑补细节
+- 每条的"who"必须是记录里**逐字**出现的昵称，不许改写、简写、拼错
 
 只输出 JSON 数组，不要输出任何其他文字。格式：
 [{{"who": "人物昵称", "what": "发生了什么，40字以内", "quote": "聊天记录里最有味道的一句原话，没有就填空字符串", "score": 1到5的整数}}]
@@ -525,6 +530,172 @@ META_MARKER = "===META==="
 
 # META 里只取这几个键，其余忽略（防模型乱塞东西）
 _META_KEYS = ("topics", "people", "projects", "unresolved")
+
+
+def chunk_coverage(timeline: str, chunks: List[str]) -> Dict[str, Any]:
+    """分块的保真度：拼回后与原文差多少（**只出计数，不含任何正文**）。
+
+    为什么需要它：``chunk_text`` 在 ``len(chunks) >= max_chunks`` 时直接 ``break``，
+    之后的行**不进任何分块** —— 单日聊天量大时，晚间对话会整段从选材里消失，
+    而日志里只看得到「选材完成: N 件」，看不出素材已经被截过。这条计数把那种
+    **静默**损失变成一条可回读的告警（真机 2026-10-17 那份日记"内容有错"
+    的排查结论之一就是这个）。
+
+    实现说明：``chunk_text`` 按行切分、用 ``\\n`` 拼回，所以拼回结果要么与原文逐字节
+    相同，要么是原文的一个**前缀**。用最长公共前缀定位丢失去向即可，不必做 diff。
+
+    Returns:
+        ``{"identical", "lost_lines", "lost_chars", "total_lines"}``——
+        全部是计数，可直接进日志（不涉聊天原文，符合脱敏约定）。
+    """
+    text = str(timeline or "")
+    joined = "\n".join(str(c) for c in (chunks or []))
+    before = text.split("\n")
+    after = joined.split("\n")
+    same = 0
+    while same < len(before) and same < len(after) and before[same] == after[same]:
+        same += 1
+    return {
+        "identical": joined == text,
+        "lost_lines": len(before) - same,
+        "lost_chars": len(text) - len(joined),
+        "total_lines": len(before),
+    }
+
+
+# 天气线索词（**按信号强度排序**：越靠前越能直接确定天气）
+# 只做「素材里有没有提到天气」这一件事 —— 不猜、不推算、不做情感隐喻映射。
+_WEATHER_STRONG = ("下大雨", "大雨", "暴雨", "下雨", "下雨了", "雨好大", "被淹", "积水", "鞋湿", "淋湿")
+_WEATHER_WEAK = ("雨", "雪", "阴天", "出太阳", "太阳", "好晒", "刮风", "好冷", "好热", "闷")
+_WEATHER_MAP = {
+    "雨": "雨", "雪": "雪", "阴天": "阴", "出太阳": "晴", "太阳": "晴",
+    "好晒": "晴", "刮风": "多云", "好冷": "多云", "好热": "晴", "闷": "多云",
+}
+
+
+def weather_hint(timeline: str, max_samples: int = 3) -> str:
+    """从当天时间线里抽「有人真的提到过天气」的证据（v1.6.0）。
+
+    为什么需要它：v1.0 起天气是**交给模型随文生成**的（替代早期的关键词计数猜测），
+    好处是不再机械，代价是模型会凭氛围臆造 —— 真机 2026-10-18 素材里写着
+    「下大雨☔️ / 学校被淹了 / 鞋湿了 / 好像可以划船了」，日记却写成「今天全天阴天」，
+    与当天所有人共同经历的那场雨直接矛盾。
+
+    这里只认**字面证据**，不做任何推断：命中强信号（下雨/淹/湿）就认定「有雨」，
+    命中弱信号（太阳/雪/闷…）按词映射；都没命中返回空串，交由模型按氛围选。
+
+    Returns:
+        可直接插进写作 prompt 的一段话；空串表示「素材里没有天气线索」。
+    """
+    text = str(timeline or "")
+    if not text.strip():
+        return ""
+    hits: List[str] = []
+    for word in _WEATHER_STRONG:
+        if word in text:
+            hits.append(word)
+    if hits:
+        samples = "、".join(f"「{w}」" for w in hits[:max_samples])
+        return f"当天明显有雨（素材里出现了 {samples}）。"
+    weak_word = ""
+    for word in _WEATHER_WEAK:
+        if word in text:
+            weak_word = word
+            break
+    if weak_word:
+        return f"素材里提到了天气（「{weak_word}」），按这个线索来写。"
+    return ""
+
+
+def _evidence_coverage(term: str, evidence: str) -> tuple[int, float]:
+    """术语在证据文本里的「最长命中片段长度」与「字符覆盖率」。
+
+    为什么不用「整条术语必须出现」：``topics`` / ``unresolved`` 是模型**概括**出来的
+    短语（如「全员复读猫猫梗」），逐字出现是不可能的，一刀切会把所有正常条目全杀掉
+    —— 误杀比漏杀更容易摧毁这项校验的可信度。
+    改用两条**可解释**的判据（满足其一即可）：
+    * 至少有一段连续 **5 字以上**逐字对得上 —— 5 字以上的巧合基本不可能，
+      长昵称 + 中文概括（如「秋枫叶语Acer周日上课吐槽与鞋湿」）就是靠这条留下的；
+    * 或：至少有一段 **3 字以上**对得上，**且**覆盖过半。
+    """
+    t = str(term or "").strip()
+    if not t or not evidence:
+        return 0, 0.0
+    longest = 0
+    covered = [False] * len(t)
+    for size in range(len(t), 2, -1):  # 只认 3 字及以上的片段，2 字太容易撞巧合
+        for i in range(0, len(t) - size + 1):
+            piece = t[i : i + size]
+            if piece in evidence:
+                if size > longest:
+                    longest = size
+                for k in range(i, i + size):
+                    covered[k] = True
+    ratio = sum(covered) / len(t)
+    return longest, ratio
+
+
+# META 里**实体类**的键：人名/项目名是专有名词，素材里怎么写就得怎么写，
+# 一个字母的漂移（真机 2026-10-18 把 kugurija 写成 kugirija）就是幻觉，必须逐字命中。
+_META_STRICT_KEYS = ("people", "projects")
+
+
+def filter_meta_against_evidence(
+    meta: Mapping[str, Any], evidence: str
+) -> tuple[Dict[str, Any], List[str]]:
+    """把 META 里**当天素材中找不到依据**的术语剔掉（v1.6.0）。
+
+    为什么必须有这道确定性校验：META 不进正文、也不发布，但它会写进
+    ``continuity.json``，并经由 ``get_day_digest`` 交给别的插件 —— 真机 2026-10-18
+    那份 META 的 13 个术语里 **12 个是幻觉**（``FMInfinity共鸣电台``、``新歌命名``、
+    ``看板娘归属权争议``、``项圈牵绳排队``…，素材里一个字都没有）。正文发完就过去了，
+    META 的错却会**每天在错的基础上继续累积**。
+
+    判据（两条都要满足，宁可漏也不可错）：
+    * 至少有一段 **3 字以上**的连续片段在素材里逐字出现；
+    * 术语被素材覆盖的字符 **过半**。
+
+    Returns:
+        ``(清洗后的 meta, 被丢弃的术语列表)``。丢弃列表交给调用方记日志 ——
+        **抑制分支必须可见**，否则误杀会变成另一种静默。
+    """
+    text = str(evidence or "")
+    cleaned: Dict[str, Any] = {}
+    dropped: List[str] = []
+    if not text.strip():
+        return dict(meta or {}), []
+    for key, values in (meta or {}).items():
+        if not isinstance(values, list):
+            continue
+        strict = key in _META_STRICT_KEYS
+        kept: List[str] = []
+        for value in values:
+            term = str(value or "").strip()
+            if not term:
+                continue
+            if strict:
+                # 实体名：整条必须逐字出现在素材里，差一个字母都不行
+                if term in text:
+                    kept.append(term)
+                else:
+                    dropped.append(f"{key}:{term}（实体名在素材里逐字未命中）")
+                continue
+            if len(term) < 3:
+                # 术语本身不足 3 字：整条逐字命中才算有据。
+                # 这里若跟着放宽，单字/双字会放进大量噪音（中文里两字撞车太容易）。
+                if term in text:
+                    kept.append(term)
+                else:
+                    dropped.append(f"{key}:{term}（短词在素材里逐字未命中）")
+                continue
+            longest, ratio = _evidence_coverage(term, text)
+            if longest >= 5 or (longest >= 3 and ratio >= 0.5):
+                kept.append(term)
+            else:
+                dropped.append(f"{key}:{term}（最长片段 {longest} 字 / 覆盖 {ratio:.0%}）")
+        if kept:
+            cleaned[key] = kept
+    return cleaned, dropped
 
 
 def split_meta(content: str) -> Tuple[str, Dict[str, Any]]:
@@ -810,6 +981,7 @@ def build_write_prompt(
     max_events: int = 3,
     temporal_anchor: str = "",
     continuity_text: str = "",
+    weather_hint_text: str = "",
 ) -> str:
     """阶段二：基于精选素材写日记（v1.5.0「去 AI 味」改写）。
 
@@ -828,6 +1000,9 @@ def build_write_prompt(
             素材里「今天/昨天/前天」的相对时间基准，否则模型会以真正的今天来解读。
         continuity_text: 跨天连续性线索（见 :func:`build_continuity_line`），
             只用于引出回顾与延续，不能当作「今天发生了什么」的依据。
+        weather_hint_text: 当天天气的**字面证据**（见 :func:`weather_hint`）。
+            非空时规则 1 会把天气钉死在这个线索上；空串表示素材里没提天气，
+            仍按旧行为让模型选一个贴合氛围的。
     """
     name_line = f"我的名字是{name}。" if name else ""
     persona_line = persona or "是一个爱聊天的机器人。"
@@ -849,9 +1024,24 @@ def build_write_prompt(
     # v1.4.3 治过的三种病（空转动作 / 复述自己 / 每段感受收尾）并成规则 4 的一句话。
     # ⚠️ 编号**动态生成**：曾两次因为改规则数把 style_extra 的编号算错（撞号会让
     # 模型把两条规则读成一条），交给 enumerate 就再也不会错。
+    # 天气：v1.6.0 起**优先采信素材里的字面证据**，不再交给模型凭氛围猜。
+    # 真机 2026-10-18 素材写着「下大雨 / 学校被淹了 / 鞋湿了」，日记却写「全天阴天」，
+    # 与当天所有人共同经历的那场雨直接对不上。有线索就钉死，没线索才允许按氛围选。
+    if weather_hint_text.strip():
+        weather_rule = (
+            f"第一行固定为 {date_str}，X。\n"
+            f"   ⚠️ 当天的天气**已经有据可查**：{weather_hint_text.strip()}\n"
+            "   必须照这个写（线索说有雨就写 雨），不许凭感觉改成别的天气；"
+            "正文里若提到天气，也必须与第一行一致。\n"
+            "   只选一个字（晴/多云/阴/雨/雪），都不许多。"
+        )
+    else:
+        weather_rule = (
+            f"第一行固定为 {date_str}，X。其中 X 从 晴/多云/阴/雨 里选一个贴合今天聊天氛围的，"
+            "只选一个字都不许多。"
+        )
     rules = [
-        f"第一行固定为 {date_str}，X。其中 X 从 晴/多云/阴/雨 里选一个贴合今天聊天氛围的，"
-        "只选一个字都不许多。",
+        weather_rule,
         f"只写上面你真想写的事，最多写 {max_events} 件，可以只写一两件。"
         "没劲的一天就写短点，三五句也行，绝不硬凑字数。",
         # 引用降级：素材给了原话就顺口引一句，没给就不引 —— "每篇必须抄一句别人原话"
@@ -859,11 +1049,11 @@ def build_write_prompt(
         # **边界约束一条不留全部保留**，只是不再下达"必须引用"的指标。
         "素材给了聊天原话就顺口引一句放进「」里，没给就不引 —— 不必为了引用而引用。\n"
         "   「」里面只能放**别人说过的原话、一字不改**；我自己的话一律写在引号**外面**。\n"
-        "   错误写法：回了句「来首无名策岂不美哉 安排上了，好听」（把自己的回复也塞进了引号，"
+        "   错误写法：回了句「来首晚风岂不美哉 安排上了，好听」（把自己的回复也塞进了引号，"
         "读起来像整句都是我说的）\n"
-        "   正确写法：有人提了《无名策》，回了句「来首无名策岂不美哉」，我说安排上了，好听。\n"
+        "   正确写法：有人提了《晚风》，回了句「来首晚风岂不美哉」，我说安排上了，好听。\n"
         "   **一对「」只装一个人的一句话**，绝不能把两个人的话焊在同一对引号里。\n"
-        "   反例：「烧退了 鼻子还是堵的 先补个觉 我也鼻子堵」—— 前半句是别人说的、后半句是"
+        "   反例：「稿子改完了 眼睛有点酸 先躺一会儿 我也困得慌」—— 前半句是别人说的、后半句是"
         "我说的，这等于替别人发言；正确写法是别人说的进「」，我说的写引号外。\n"
         "   聊天记录里若是**「引用后回复」**（先引了别人的话、再紧跟我的回复），"
         "只引用**被引的那一句**，我的回复写在引号外面。\n"
@@ -880,7 +1070,13 @@ def build_write_prompt(
         "（这正是上面说的\"只有动作没内容\"）。缺转场就直接写结果（「她还没给新歌取名。」），"
         "比编一个动作再让它落空强。\n"
         "   上面的跨天线索（若有）只能用来引出想法、疑问、期待，或带原日期的回顾；"
-        "它**不能单独证明今天发生了什么**，今天的事必须有上面的素材作依据。",
+        "它**不能单独证明今天发生了什么**，今天的事必须有上面的素材作依据。\n"
+        "   三条真机踩过的坑，一条都不许再犯：\n"
+        "   ⚠️ **不许搬动时间**：素材里是下午发生的事就别写成「早上」，没写时段就别写时段。\n"
+        "   ⚠️ **不许改写我自己的行为**：素材里我回了几次就是几次，"
+        "不许写「我没再接茬」这种和素材相反的说法 —— 那等于凭空改掉事实。\n"
+        "   ⚠️ **人名必须逐字照抄**素材里的写法：不许简写、音译、美化或拼错一个字母"
+        "（真机把 kugurija 写成 kugirija，整段就成了在说一个不存在的人）。",
         "禁止出现：开头问候语；结尾总结或展望（如\"明天也要加油\"\"真是充实的一天\"）；"
         "\"我意识到/我明白了/我突然发现\"句式；连续感叹号；排比句。",
         f"篇幅：{lo}~{hi} 字，{target} 字上下最舒服。**字数是给你留的余地，不是任务** ——\n"
@@ -908,6 +1104,11 @@ def build_write_prompt(
 日记正文写完后，另起一段只输出下面这两行（用于归档，**不会被发表**）：
 {META_MARKER}
 {{"topics": ["话题"], "people": ["提到的人"], "projects": ["手头的事"], "unresolved": ["还没个结果的"]}}
+
+META 的硬要求（它会跨天累积，写错会一直错下去）：
+- 四个字段**只允许填当天素材里出现过的词**；想不到就留空数组 []，绝不许为了填满而编。
+- people / projects 必须是素材里**逐字**出现的名字，一个字母都不许改。
+- unresolved 只填**真的还没个结果**的事，已经收尾的不要写进来。
 
 日记正文："""
 

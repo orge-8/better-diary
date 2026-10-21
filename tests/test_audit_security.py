@@ -230,7 +230,7 @@ def test_publish_client_uses_domain_scoped_cookies():
         return httpx.Response(200, text='{"code":0,"tid":"t1"}', request=request)
 
     pub = QZONE.QzonePublisher(
-        {"uin": "o02472005478", "p_skey": "PSKEY_SECRET_VALUE", "skey": "S"},
+        {"uin": "o01234567890", "p_skey": "PSKEY_SECRET_VALUE", "skey": "S"},
         transport=httpx.MockTransport(handler),
     )
     ok, msg = asyncio.run(pub.publish_text("hello", timeout=5))
@@ -256,7 +256,7 @@ def test_publish_does_not_follow_redirect():
         )
 
     pub = QZONE.QzonePublisher(
-        {"uin": "o02472005478", "p_skey": "PSKEY_SECRET_VALUE"},
+        {"uin": "o01234567890", "p_skey": "PSKEY_SECRET_VALUE"},
         transport=httpx.MockTransport(handler),
     )
     ok, msg = asyncio.run(pub.publish_text("hello", timeout=5))
@@ -316,7 +316,7 @@ def test_adapter_exception_does_not_leak_cookie_into_logs():
 
     async def boom(name: str, params: dict):
         raise RuntimeError(
-            "adapter error: cookies=uin=o02472005478; p_skey=PSKEY_SECRET_VALUE; skey=SECRET2"
+            "adapter error: cookies=uin=o01234567890; p_skey=PSKEY_SECRET_VALUE; skey=SECRET2"
         )
 
     store = COOKIE.CookieStore("/tmp/bd-audit-log", api_call=boom, logger=CapLog())
@@ -606,7 +606,7 @@ def test_filter_scope_is_fail_closed_by_default(tmp_path):
 def test_unresolvable_whitelist_target_is_diagnosed(tmp_path):
     """兼容期保护（v1.3.6）：target_chats 解析不出 stream_id 时必须给出可执行提示。
 
-    真机实录（2026-09-30 07:24）：存量 config 里躺着一个 `group:967779035` ——
+    真机实录（2026-09-30 07:24）：存量 config 里躺着一个 `group:123456789` ——
     它在旧版 `filter_mode = "all"` 下写了但**从未生效**（all 模式不看 target_chats）；
     新版默认 whitelist 后它突然生效却解析不出 stream_id，结果只报
     「当天消息太少（0 条，需要 20 条）」，完全指不到配置问题上。
@@ -623,15 +623,15 @@ def test_unresolvable_whitelist_target_is_diagnosed(tmp_path):
     plugin._data_dir = lambda: tmp_path  # type: ignore[assignment]
     cfg = get_default_config(MOD.BetterDiaryConfig)
     cfg["diary"]["filter_mode"] = "whitelist"
-    cfg["diary"]["target_chats"] = ["group:967779035"]
+    cfg["diary"]["target_chats"] = ["group:123456789"]
     cfg["schedule"]["enabled"] = False
     plugin.set_plugin_config(cfg)
 
     assert asyncio.run(plugin._fetch_messages(0.0, 1e12)) == []
 
     # 原因必须被记录下来，且描述的是「三次尝试都没解析出会话」而不是笼统的失败
-    assert "group:967779035" in plugin._unresolved_targets
-    why = plugin._unresolved_targets["group:967779035"]
+    assert "group:123456789" in plugin._unresolved_targets
+    why = plugin._unresolved_targets["group:123456789"]
     assert "都没解析出会话" in why, why
     assert "unexpected_key" in why, why           # 保留了宿主返回的结构（只是键名）
     assert "不活跃" in why, why                    # 并把最可能的原因说清楚
@@ -640,13 +640,13 @@ def test_unresolvable_whitelist_target_is_diagnosed(tmp_path):
     assert diag is not None
     condition, config_bits, reasons = diag
     assert "解析不出" in condition
-    assert any("967779035" in b for b in config_bits)
+    assert any("123456789" in b for b in config_bits)
     assert reasons and "都没解析出会话" in reasons[0]
 
     # 报错文本必须给出两条可执行出路，而不是「消息太少」
     ok, why_msg = asyncio.run(plugin._generate_for_date("2026-09-26"))
     assert ok is False
-    assert "967779035" in why_msg, why_msg
+    assert "123456789" in why_msg, why_msg
     assert "聊天流 ID" in why_msg, why_msg
     assert 'filter_mode = "all"' in why_msg, why_msg
     assert "太少" not in why_msg, why_msg
@@ -666,7 +666,7 @@ def test_unresolvable_whitelist_target_is_diagnosed(tmp_path):
 def test_group_id_fallback_resolution():
     """主接口返回 None 时按 group_id 自己找（v1.3.7）。
 
-    真机实录：`get_stream_by_group_id('967779035')` 返回 **None**
+    真机实录：`get_stream_by_group_id('123456789')` 返回 **None**
     （SDK 会把 RPC 结果的 `stream` 字段取出来，None = 宿主没返回该群的流），
     导致三天日记全空。降级到 `chat.get_group_streams` / `chat.get_all_streams`
     按 group_id 自己找一遍就能兜住。
@@ -686,11 +686,11 @@ def test_group_id_fallback_resolution():
         async def get_group_streams(self, platform="qq"):
             return {"success": True, "streams": [
                 {"group_id": "111", "stream_id": "s_other"},
-                {"group_id": "967779035", "stream_id": "s_target"},
+                {"group_id": "123456789", "stream_id": "s_target"},
             ]}
 
     plugin.ctx.chat = _Chat()
-    assert asyncio.run(plugin._resolve_stream_id("group:967779035")) == "s_target"
+    assert asyncio.run(plugin._resolve_stream_id("group:123456789")) == "s_target"
     assert plugin._unresolved_targets == {}, plugin._unresolved_targets
 
     # 群流列表也空 → 再退到 get_all_streams
@@ -702,13 +702,13 @@ def test_group_id_fallback_resolution():
             return []
 
         async def get_all_streams(self, platform="qq"):
-            return [{"chat": {"group_id": "967779035"}, "stream_id": "s_deep"}]
+            return [{"chat": {"group_id": "123456789"}, "stream_id": "s_deep"}]
 
     plugin.ctx.chat = _Chat2()
     plugin._unresolved_targets = {}
-    assert asyncio.run(plugin._resolve_stream_id("group:967779035")) == "s_deep"
+    assert asyncio.run(plugin._resolve_stream_id("group:123456789")) == "s_deep"
 
-    # 三条路都没有 → 记原因、不误认（不能把 111 当成 967779035）
+    # 三条路都没有 → 记原因、不误认（不能把 111 当成 123456789）
     class _Chat3:
         async def get_stream_by_group_id(self, group_id, platform="qq"):
             return None
@@ -721,9 +721,9 @@ def test_group_id_fallback_resolution():
 
     plugin.ctx.chat = _Chat3()
     plugin._unresolved_targets = {}
-    assert asyncio.run(plugin._resolve_stream_id("group:967779035")) == ""
-    assert "group:967779035" in plugin._unresolved_targets
-    assert "不活跃" in plugin._unresolved_targets["group:967779035"]
+    assert asyncio.run(plugin._resolve_stream_id("group:123456789")) == ""
+    assert "group:123456789" in plugin._unresolved_targets
+    assert "不活跃" in plugin._unresolved_targets["group:123456789"]
 
     # 裸 stream ID 不经过任何解析，永不受影响
     plugin._unresolved_targets = {}
@@ -792,7 +792,7 @@ def test_whitelist_falls_back_without_chat_capabilities(tmp_path):
     # 全库当天记录：一个目标群 + 一个无关群 + 一个私聊
     day_msgs = [
         {"timestamp": "1759100000", "processed_plain_text": "目标群的话",
-         "message_info": {"group_info": {"group_id": "967779035"},
+         "message_info": {"group_info": {"group_id": "123456789"},
                           "user_info": {"user_id": "1", "user_nickname": "A"}}},
         {"timestamp": "1759100001", "processed_plain_text": "无关群的话",
          "message_info": {"group_info": {"group_id": "111111"},
@@ -815,7 +815,7 @@ def test_whitelist_falls_back_without_chat_capabilities(tmp_path):
 
     cfg = get_default_config(MOD.BetterDiaryConfig)
     cfg["diary"]["filter_mode"] = "whitelist"
-    cfg["diary"]["target_chats"] = ["group:967779035"]
+    cfg["diary"]["target_chats"] = ["group:123456789"]
     cfg["schedule"]["enabled"] = False
     plugin.set_plugin_config(cfg)
 
@@ -834,8 +834,8 @@ def test_whitelist_falls_back_without_chat_capabilities(tmp_path):
         get_by_time=_empty, get_by_time_in_chat=lambda *a, **k: _empty())
     plugin._unresolved_targets = {}
     assert asyncio.run(plugin._fetch_messages(0.0, 1e12)) == []
-    assert "group:967779035" in plugin._unresolved_targets, plugin._unresolved_targets
-    assert "兜底" in plugin._unresolved_targets["group:967779035"], plugin._unresolved_targets
+    assert "group:123456789" in plugin._unresolved_targets, plugin._unresolved_targets
+    assert "兜底" in plugin._unresolved_targets["group:123456789"], plugin._unresolved_targets
     assert plugin._filter_diagnostic(0, 20) is not None
 
 
@@ -848,10 +848,10 @@ def test_fallback_filter_does_not_leak_group_talk_into_private_target():
     """
     W = MOD._split_targets
     in_group = {"message_info": {"group_info": {"group_id": "111"},
-                                 "user_info": {"user_id": "o02472005478"}}}
-    private = {"message_info": {"user_info": {"user_id": "2472005478"}}}
+                                 "user_info": {"user_id": "o01234567890"}}}
+    private = {"message_info": {"user_info": {"user_id": "1234567890"}}}
 
-    groups, users = W(["private:2472005478"])
+    groups, users = W(["private:1234567890"])
     assert MOD._match_filter_target(in_group, groups, users) is False   # 群里的话不算私聊
     assert MOD._match_filter_target(private, groups, users) is True
 
@@ -869,9 +869,9 @@ def test_fallback_filter_does_not_leak_group_talk_into_private_target():
 
 def test_qq_id_normalization_for_filtering():
     """QQ 号归一化：群里 user_id 可能是 o0 前缀形态，直接字符串比会漏配/误配。"""
-    assert MOD._digits_only("o02472005478") == "2472005478"
-    assert MOD._digits_only("qq:2472005478") == "2472005478"
-    assert MOD._digits_only(" 2472005478 ") == "2472005478"
+    assert MOD._digits_only("o01234567890") == "1234567890"
+    assert MOD._digits_only("qq:1234567890") == "1234567890"
+    assert MOD._digits_only(" 1234567890 ") == "1234567890"
     assert MOD._digits_only(None) == ""
     # group:o111 也要能对上 group_id=111 的消息
     groups, users = MOD._split_targets(["group:o111"])
@@ -1052,12 +1052,16 @@ def test_continuity_accumulates_and_injects(tmp_path):
 
 
 def test_meta_never_leaks_into_published_content(tmp_path):
-    """模型若在正文后附了 META 块，发布内容里绝不能出现标记或 JSON。"""
+    """模型若在正文后附了 META 块，发布内容里绝不能出现标记或 JSON。
+
+    v1.6.0：META 里的术语必须是**当天素材里真有依据**的，所以这里用素材里
+    确实出现的「闲聊 / 用户1」—— 换成编的词会被反幻觉校验剔掉（见下一条用例）。
+    """
     plugin = build_plugin(
         "2026年9月27日 星期日，晴。\n"
         "今天聊了歌，挺开心。\n"
         "===META===\n"
-        '{"topics":["歌"],"people":["甲"],"projects":[],"unresolved":[]}',
+        '{"topics":["闲聊"],"people":["用户1"],"projects":[],"unresolved":[]}',
         make_messages(40),
     )
     plugin._data_dir = lambda: tmp_path  # type: ignore[assignment]
@@ -1067,7 +1071,35 @@ def test_meta_never_leaks_into_published_content(tmp_path):
     assert ok
     for marker in ("META", "===", '"topics"', "{"):
         assert marker not in content, f"发布内容泄漏了归档元数据：{content!r}"
-    assert plugin._load_diaries()["2026-09-27"]["meta"].get("topics") == ["歌"]
+    assert plugin._load_diaries()["2026-09-27"]["meta"].get("topics") == ["闲聊"]
+
+
+def test_meta_hallucination_is_dropped_and_never_published(tmp_path):
+    """v1.6.0：META 里当天素材查无实据的术语必须被剔掉（真机 12/13 条是幻觉）。
+
+    这些术语不进正文、不发布，但会写进 continuity.json 并经 get_day_digest 外流，
+    错了会**每天在错的基础上继续累积**，所以这里用确定性校验兜底。
+    """
+    plugin = build_plugin(
+        "2026年9月27日 星期日，晴。\n"
+        "今天聊了歌，挺开心。\n"
+        "===META===\n"
+        '{"topics":["闲聊"],"people":["甲"],"projects":["子虚乌有电台"],'
+        '"unresolved":["看板娘归属权争议"]}',
+        make_messages(40),
+    )
+    plugin._data_dir = lambda: tmp_path  # type: ignore[assignment]
+
+    ok, content = asyncio.run(plugin._generate_for_date("2026-09-27"))
+    assert ok
+    saved_meta = plugin._load_diaries()["2026-09-27"]["meta"]
+    assert saved_meta.get("topics") == ["闲聊"], str(saved_meta)
+    # 「甲」「子虚乌有电台」「看板娘归属权争议」素材里一个字都没有 → 全灭
+    assert "people" not in saved_meta, str(saved_meta)
+    assert "projects" not in saved_meta, str(saved_meta)
+    assert "unresolved" not in saved_meta, str(saved_meta)
+    for marker in ("子虚乌有", "看板娘"):
+        assert marker not in content
 
 
 # ---------------------------------------------------------------- v1.3.1：静默阈值
@@ -1096,7 +1128,7 @@ def _cfg_plugin(tmp_path, *, msgs=None, llm=None, **schedule):
 def _record_run(plugin):
     calls: list[int] = []
 
-    async def fake_run():
+    async def fake_run(date_str: str = ""):
         calls.append(1)
 
     plugin._scheduled_run = fake_run  # type: ignore[assignment]
@@ -1412,7 +1444,7 @@ def test_silence_check_is_scoped_to_filter_range(tmp_path):
     plugin._set_context(ctx)
     plugin._data_dir = lambda: tmp_path  # type: ignore[assignment]
 
-    target_group = "967779035"
+    target_group = "123456789"
     other_group = "111111"
 
     def mk(ts, text, gid):

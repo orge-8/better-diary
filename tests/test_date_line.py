@@ -242,8 +242,8 @@ def test_trailing_duplicate_date_line_is_removed():
     """真机 2026-10-08：模型在结尾又写了一遍日期行（天气还和首行不一致）。"""
     body = (
         "2026年10月8日 星期四，阴。\n"
-        "烧退了，鼻子还是有点堵，但整个人活过来了。\n"
-        "Rana 昨天发的图还没细看，等明天精神再好一点补上。\n"
+        "稿子改完了，眼睛还是有点酸，但整个人清醒过来了。\n"
+        "小北 昨天发的图还没细看，等明天精神再好一点补上。\n"
         "2026年10月8日 星期四，晴"
     )
     out = BD.ensure_date_line(body, "2026年10月8日 星期四")
@@ -257,12 +257,12 @@ def test_trailing_duplicate_date_line_is_removed():
 def test_date_line_only_at_the_end_is_moved_to_the_top():
     """模型把日期行只写在结尾时：搬上去，并**沿用它的天气**（别浪费）。"""
     out = BD.ensure_date_line(
-        "烧退了，今天终于有精力翻聊天记录。\n2026年10月8日 星期四，晴",
+        "稿子改完了，今天终于有力气干点别的。\n2026年10月8日 星期四，晴",
         "2026年10月8日 星期四",
     )
     assert out.split("\n")[0] == "2026年10月8日 星期四，晴。", out
     assert "晴" in out and "多云" not in out, out
-    assert "烧退了，今天终于有精力翻聊天记录。" in out
+    assert "稿子改完了，今天终于有力气干点别的。" in out
 
 
 def test_trailing_weather_not_used_when_head_has_one():
