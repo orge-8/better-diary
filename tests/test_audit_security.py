@@ -33,7 +33,6 @@ _DEVKIT_CANDIDATES = [
     os.environ.get("MAIBOT_DEVKIT_DIR", ""),
     str(PLUGIN_DIR.parent / "tools" / "maibot-devkit"),
     str(PLUGIN_DIR / "maibot-devkit"),
-    r"C:\Users\38160\Desktop\tools\maibot-devkit",
 ]
 for _cand in _DEVKIT_CANDIDATES:
     if _cand and (Path(_cand) / "fakehost.py").is_file():
@@ -1271,8 +1270,8 @@ def test_transient_host_io_error_is_retryable(tmp_path):
         if len(calls) == 1:
             raise OSError(
                 "[WinError 5] 拒绝访问。: "
-                "'E:\\mai\\maibot\\logs\\maisaka_prompt\\llm_error\\system\\x.json.tmp' -> "
-                "'E:\\mai\\maibot\\logs\\maisaka_prompt\\llm_error\\system\\x.json'"
+                "'X:\\maibot-test\\logs\\maisaka_prompt\\llm_error\\system\\x.json.tmp' -> "
+                "'X:\\maibot-test\\logs\\maisaka_prompt\\llm_error\\system\\x.json'"
             )
         return "正文"
 

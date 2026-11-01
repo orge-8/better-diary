@@ -40,9 +40,14 @@ if __package__:  # 包式加载（Runner 真机：插件目录作为包，不在
         diary_output_problem,
         ensure_date_line,
         event_id,
+        event_material_chars,
         events_to_text,
+        filter_continuity_by_evidence,
+        limit_event_quotes,
         parse_events_detailed,
         quote_attribution_risk,
+        redact_sensitive_events,
+        select_events_for_write,
         self_quote_in_brackets,
         split_meta,
         strip_diary_output,
@@ -70,9 +75,14 @@ else:  # 平铺兜底（脚本直跑 / 旧测试夹具）
         diary_output_problem,
         ensure_date_line,
         event_id,
+        event_material_chars,
         events_to_text,
+        filter_continuity_by_evidence,
+        limit_event_quotes,
         parse_events_detailed,
         quote_attribution_risk,
+        redact_sensitive_events,
+        select_events_for_write,
         self_quote_in_brackets,
         split_meta,
         strip_diary_output,
@@ -2592,24 +2602,45 @@ class BetterDiaryPlugin(MaiBotPlugin):
         self_labels = {"我", self_name}
         used_events: list[dict[str, Any]] = []
         if events:
-            events = events[: max(1, self.config.diary.max_events)]
-            used_events = events
-            events_text = events_to_text(events, self_labels=self_labels)
-            self.ctx.logger.info("选材完成: %d 件入选", len(events))
+            # 内容优先：达到分数门槛的才写，最多 max_events 件，不强制写满。
+            selected = select_events_for_write(
+                events, max_events=max(1, self.config.diary.max_events),
+            )
+            # 敏感事件在进入 prompt 前匿名化：不点名、不引用、不把原话写进公开成品。
+            # 昵称全集取自当天时间线 —— 敏感摘要里可能提到未被选中的第三人。
+            _known_names = {who for who, _ in timeline_speaker_lines(timeline)}
+            used_events, _redacted = redact_sensitive_events(
+                selected, known_names=_known_names,
+            )
+            if _redacted:
+                self.ctx.logger.info(
+                    "敏感事件匿名化: %d 件（昵称与原话不进入成文 prompt）", _redacted,
+                )
+            # 全篇最多一条别人的原话，其余 quote 在素材侧清掉。
+            used_events, _quotes_removed = limit_event_quotes(
+                used_events, limit=1, self_labels=self_labels,
+            )
+            if _quotes_removed:
+                self.ctx.logger.info("引用限额: 移除 %d 条多余原话，全篇最多保留 1 处", _quotes_removed)
+            events_text = events_to_text(used_events, self_labels=self_labels)
+            self.ctx.logger.info(
+                "选材完成: %d 件入选（候选 %d 件，按分数取，不强制写满）",
+                len(used_events), len(events),
+            )
             # 素材留痕（**隐私安全版**）：只记条数 / 事件 ID / 自身原话件数，
             # 绝不把聊天原话写进日志 —— 与 v1.3.4 起「引用体检告警只打事件 ID」同一条约定。
             # 「自身原话 > 0」是「阶段一抓了作者自己的话」的直接信号（归属错的常见上游）；
             # 要看素材原话原文，用 /日记来源。
             _self_quotes = sum(
                 1
-                for e in events
+                for e in used_events
                 if e.get("quote") and str(e.get("who") or "").strip() in self_labels
             )
             self.ctx.logger.info(
                 "选材素材: %d 件（自身原话 %d 件）[%s]",
-                len(events),
+                len(used_events),
                 _self_quotes,
-                ", ".join(event_id(date_str, e) for e in events),
+                ", ".join(event_id(date_str, e) for e in used_events),
             )
         else:
             # 具体原因已在上方「选材空块」日志里按块列出（确实无事 / 解析失败 / 调用失败）；
@@ -2621,16 +2652,32 @@ class BetterDiaryPlugin(MaiBotPlugin):
         persona = await self._resolve_persona()
         name = self_name
         is_today = date_str == self._today_str()
-        # 跨天连续性：只用于引出回顾与延续，**不能当作「今天发生了什么」的依据**（纪律写进 prompt）
-        continuity = self._load_continuity()
-        # 篇幅三档：素材少就短写、素材多才摊开，避免每天都被要求写到同一个长度
-        # （固定长度会逼模型凑字，凑出来的多半就是空转动作/复述自己/感受收尾那三样）。
-        # 档位由素材丰富度**确定性**决定，日志可回读。
+        # 跨天连续性：只有当天入选素材确实提到同一件事时才注入。
+        # 旧版把整份 continuity.json 原样塞进 prompt，导致「新歌命名」连续四天
+        # 成为固定尾巴；v1.8.0 改成按当天证据做确定性匹配，匹配不到就不注入。
+        _continuity_all = self._load_continuity()
+        continuity = filter_continuity_by_evidence(
+            _continuity_all, events_text if used_events else "",
+        )
+        if _continuity_all:
+            _kept = sum(
+                len(v) if isinstance(v, list) else 1
+                for v in continuity.values()
+            )
+            if _kept:
+                self.ctx.logger.info(
+                    "连续性线索: 匹配 %d 项（只在当天素材有新进展时注入）", _kept,
+                )
+            else:
+                self.ctx.logger.info("连续性线索: 当天素材没有新证据，全部不注入")
+        # 篇幅三档：按**素材信息量**选档，不再「写了几件事 → 必然多长」。
+        # 三个短事可以写短，一件有细节的事也可以写长；档位由素材字符量确定性决定。
         _budget = choose_word_budget(
             max(80, self.config.diary.word_target),
             max(0, self.config.diary.word_tolerance),
             event_count=len(used_events),
             material_mode="events" if used_events else "timeline_tail",
+            material_chars=event_material_chars(used_events) if used_events else None,
         )
         self.ctx.logger.info(
             "篇幅档位: %s（目标 %d，区间 %d~%d，依据：%s）",
@@ -2757,7 +2804,7 @@ class BetterDiaryPlugin(MaiBotPlugin):
         # 累积跨天连续性（纯累积 + 保序去重，不再额外调 LLM）
         if used_events or meta:
             try:
-                self._save_continuity(update_continuity(continuity, used_events, meta))
+                self._save_continuity(update_continuity(_continuity_all, used_events, meta))
             except Exception as exc:  # noqa: BLE001 - 连续性失败不影响成品
                 self.ctx.logger.warning("连续性状态更新失败（不影响本次日记）: %s", exc)
         return True, content

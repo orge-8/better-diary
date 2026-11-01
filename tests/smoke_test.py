@@ -563,8 +563,8 @@ print("NOHTTPX-LOAD-OK")
             _write_prompt = next((p for p in _prompts if "睡前随手记一下" in p), "")
             check("成文 prompt 用的是**新视角**", "睡前随手记一下" in _write_prompt, _write_prompt[:80])
             check("成文 prompt 带开场 hint", "开场：" in _write_prompt)
-            check("2 件 → 中档 245 字（140~350）",
-                  "篇幅：140~350 字，245 字上下" in _write_prompt, "档位没接上 choose_word_budget")
+            check("2 件但素材摘要很短 → 短档 140 字（65~215）",
+                  "篇幅：65~215 字，140 字上下" in _write_prompt, "档位没接上 choose_word_budget")
             _saved_hr = json.loads((hr_dir / "diaries.json").read_text(encoding="utf-8"))
             _entry = _saved_hr.get("2026-09-27", {})
             check("存档带 ai_tone_hits 字段（空列表 = 没命中）",

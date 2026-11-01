@@ -17,7 +17,6 @@ _DEVKIT_CANDIDATES = [
     os.environ.get("MAIBOT_DEVKIT_DIR", ""),
     str(PLUGIN_DIR.parent / "tools" / "maibot-devkit"),
     str(PLUGIN_DIR / "maibot-devkit"),
-    r"C:\Users\38160\Desktop\tools\maibot-devkit",
 ]
 for _cand in _DEVKIT_CANDIDATES:
     if _cand and (Path(_cand) / "fakehost.py").is_file():

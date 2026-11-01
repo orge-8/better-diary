@@ -19,7 +19,7 @@ _MSG_TEXT_LIMIT = 80
 # 下限取 20 是为了拦住空输出/残句，同时绝不会误伤「今天没劲，写短点」。
 MIN_DIARY_CHARS = 20
 
-WEATHER_CHOICES = ["晴", "多云", "阴", "雨"]
+WEATHER_CHOICES = ["晴", "多云", "阴", "雨", "雪"]
 
 # 昵称 / 人物名里的结构噪声字符：花括号会污染 prompt 占位、方括号会与时段
 # 标记 `【…】` 混同、换行/制表符会打乱时间线行结构。
@@ -523,6 +523,154 @@ def events_to_text(events: List[Dict[str, Any]], self_labels: Iterable[str] = ()
     return "\n".join(lines)
 
 
+# ------------------------------------------------------------------ 写前素材治理
+#
+# 这三步都在**素材进入成文 prompt 之前**完成，属于代码层纪律，不依赖模型自觉：
+#   1. 入选事件按内容质量取 1~3 件，而不是无条件写满；
+#   2. 敏感事件匿名概括，昵称与原话一律不进入公开 prompt / 存档事件；
+#   3. 全篇最多留一条可引用原话，拆掉「逐段引用」的结构定式。
+
+# 敏感主题只认**明确信号**，避免把普通吐槽误判。命中后保留事件，但去掉可识别信息。
+_SENSITIVE_PATTERNS: Tuple[Tuple[str, re.Pattern[str]], ...] = (
+    ("self_harm", re.compile(
+        r"自杀|轻生|自残|割腕|跳楼|不想活|活着也行.{0,8}死了|结束生命|想死"
+    )),
+    ("health", re.compile(
+        r"癌|化疗|放疗|确诊|抑郁症?|焦虑症?|精神病|住院|手术|"
+        r"流产|堕胎|怀孕|(?:家里|把孩子).{0,6}打掉"
+    )),
+    ("family", re.compile(
+        r"家暴|赶出家门|父母(?:离异|离婚)|亲人(?:去世|过世)|葬礼|丧事|"
+        r"家(?:里|中)出了?事"
+    )),
+)
+
+_SENSITIVE_FALLBACK = "对方提到一件涉及隐私的事，不便在公开日记里展开。"
+
+
+def is_sensitive_event(event: Mapping[str, Any]) -> bool:
+    """事件是否触及需要匿名处理的隐私主题（只做判定，不改内容）。"""
+    text = f"{event.get('what') or ''}\n{event.get('quote') or ''}"
+    return any(pattern.search(text) for _, pattern in _SENSITIVE_PATTERNS)
+
+
+def redact_sensitive_events(
+    events: List[Dict[str, Any]],
+    *,
+    known_names: Iterable[str] = (),
+) -> Tuple[List[Dict[str, Any]], int]:
+    """把敏感事件改成**匿名概括**：换掉昵称、清空原话、抹掉事件摘要里的点名。
+
+    为什么必须在代码层做：公开成品会发到 QQ 空间，prompt 里的「不要点名」
+    只是软约束；只要素材里还带着昵称和原话，模型就有机会照抄。
+    事件本身保留（当天确实发生了），但所有可识别信息不进入下游。
+
+    Args:
+        known_names: 当天时间线里出现过的全部昵称。只扫事件列表是不够的：
+            敏感摘要里可能提到一个**没有被选中**的第三人（如「A 说 B 家里…」），
+            只按入选事件的 ``who`` 替换会把 B 的名字漏出去。
+
+    Returns:
+        ``(处理后的事件列表, 被匿名化的事件数)``。计数可进日志，事件内容不可。
+    """
+    all_names = {
+        str(e.get("who") or "").strip()
+        for e in (events or [])
+    } | {str(n or "").strip() for n in (known_names or ())}
+    aliases: set[str] = set()
+    for name in all_names:
+        if len(name) < 2 or name in {"我", "一位群友"}:
+            continue
+        aliases.add(name)
+        # 群名片常带后缀（「某人（心理委员）」），正文可能只写前半段；
+        # 敏感事件里两种写法都要抹掉。
+        base = re.sub(r"[（(【\[].*?[）)】\]]", "", name).strip()
+        if len(base) >= 2:
+            aliases.add(base)
+    names = sorted(aliases, key=len, reverse=True)
+    out: List[Dict[str, Any]] = []
+    redacted = 0
+    for event in events or []:
+        item = dict(event)
+        if not is_sensitive_event(item):
+            out.append(item)
+            continue
+        redacted += 1
+        who = str(item.get("who") or "").strip()
+        text = str(item.get("what") or "")
+        text = re.sub(r"@\S+\s*", "", text)
+        text = re.sub(r"https?://\S+", "", text)
+        for name in names:
+            if name and name != who:
+                text = text.replace(name, "对方")
+        if who:
+            text = text.replace(who, "对方")
+        text = re.sub(r"\s+", " ", text).strip(" ，,。；;：:")
+        item["who"] = "一位群友"
+        item["what"] = text if len(text) >= 4 else _SENSITIVE_FALLBACK
+        item["quote"] = ""
+        out.append(item)
+    return out, redacted
+
+
+def select_events_for_write(
+    events: List[Dict[str, Any]],
+    *,
+    max_events: int = 3,
+    min_score: int = 4,
+) -> List[Dict[str, Any]]:
+    """按内容质量挑 1~3 件，不强制写满。
+
+    旧实现直接 ``events[:max_events]``，只要当天有 3 条候选就必然写 3 件；
+    七天真机数据里 7/7 都是三件，结构自然趋同。这里改成「达到分数门槛才算」，
+    候选不足时宁可只写一两件；一件都不达标时仍保留最高分那条，避免空日记。
+    """
+    ranked = sorted(
+        [dict(e) for e in (events or []) if str(e.get("what") or "").strip()],
+        key=lambda e: int(e.get("score") or 0),
+        reverse=True,
+    )
+    if not ranked:
+        return []
+    cap = max(1, int(max_events))
+    strong = [e for e in ranked if int(e.get("score") or 0) >= int(min_score)]
+    return (strong or ranked[:1])[:cap]
+
+
+def limit_event_quotes(
+    events: List[Dict[str, Any]],
+    *,
+    limit: int = 1,
+    self_labels: Iterable[str] = (),
+) -> Tuple[List[Dict[str, Any]], int]:
+    """全篇只保留最多 ``limit`` 条**别人的**原话，其余从素材里清空。
+
+    「给了原话就引一句」在素材每件都带 quote 时，会退化成每段都引——
+    这正是七天成品最稳定的 AI 定式之一。限制放在素材侧，不靠模型数数。
+    """
+    remaining = max(0, int(limit))
+    labels = {str(x).strip() for x in (self_labels or ()) if str(x).strip()}
+    out: List[Dict[str, Any]] = []
+    removed = 0
+    for event in events or []:
+        item = dict(event)
+        quote = str(item.get("quote") or "").strip()
+        who = str(item.get("who") or "").strip()
+        if quote and who not in labels and who != "我":
+            if remaining > 0:
+                remaining -= 1
+            else:
+                item["quote"] = ""
+                removed += 1
+        out.append(item)
+    return out, removed
+
+
+def event_material_chars(events: List[Dict[str, Any]]) -> int:
+    """入选事件摘要的总字符数，供篇幅档位判断（不含聊天原文）。"""
+    return sum(len(str(e.get("what") or "")) for e in (events or []))
+
+
 # 结构化 META 块的分隔标记。模型在日记正文之后另起一段输出紧凑 JSON，
 # 供「证据链 + 跨天连续性」落盘用。**带标记之后的内容一律不进正文**——
 # 也就永远不会发布到 QQ 空间（解析失败也一样先切掉再解析）。
@@ -563,14 +711,24 @@ def chunk_coverage(timeline: str, chunks: List[str]) -> Dict[str, Any]:
     }
 
 
-# 天气线索词（**按信号强度排序**：越靠前越能直接确定天气）
-# 只做「素材里有没有提到天气」这一件事 —— 不猜、不推算、不做情感隐喻映射。
-_WEATHER_STRONG = ("下大雨", "大雨", "暴雨", "下雨", "下雨了", "雨好大", "被淹", "积水", "鞋湿", "淋湿")
-_WEATHER_WEAK = ("雨", "雪", "阴天", "出太阳", "太阳", "好晒", "刮风", "好冷", "好热", "闷")
-_WEATHER_MAP = {
-    "雨": "雨", "雪": "雪", "阴天": "阴", "出太阳": "晴", "太阳": "晴",
-    "好晒": "晴", "刮风": "多云", "好冷": "多云", "好热": "晴", "闷": "多云",
-}
+# 天气线索词。只认**明确的天气说法**，不再把单字「雨 / 雪」当证据。
+#
+# 真机 2026-10-27 / 10-31 两天的「雪」都是误判：
+#   - 「棠梨蘸雪」是歌名；
+#   - 「我就是从雪花换过来的」说的是输入法皮肤。
+# 旧表把单字「雪」列为弱信号，直接把这两句钉成雪天，随后日期解析器又不认
+# 「雪」，最终成品出现「首行多云 + 第二行雪」的自相矛盾。
+# 因此这里只保留带语境的天气表达；宁可退回「按氛围选」，也不拿歌名当天气。
+_WEATHER_STRONG = (
+    ("下大雨", "雨"), ("大雨", "雨"), ("暴雨", "雨"), ("下雨", "雨"),
+    ("雨好大", "雨"), ("被淹", "雨"), ("积水", "雨"), ("鞋湿", "雨"), ("淋湿", "雨"),
+    ("下雪", "雪"), ("大雪", "雪"), ("暴雪", "雪"), ("积雪", "雪"),
+    ("飘雪", "雪"), ("雪天", "雪"), ("雪地", "雪"),
+)
+_WEATHER_WEAK = (
+    ("阴天", "阴"), ("出太阳", "晴"), ("好晒", "晴"), ("刮风", "多云"),
+    ("好冷", "多云"), ("好热", "晴"), ("闷", "多云"),
+)
 
 
 def weather_hint(timeline: str, max_samples: int = 3) -> str:
@@ -581,8 +739,10 @@ def weather_hint(timeline: str, max_samples: int = 3) -> str:
     「下大雨☔️ / 学校被淹了 / 鞋湿了 / 好像可以划船了」，日记却写成「今天全天阴天」，
     与当天所有人共同经历的那场雨直接矛盾。
 
-    这里只认**字面证据**，不做任何推断：命中强信号（下雨/淹/湿）就认定「有雨」，
-    命中弱信号（太阳/雪/闷…）按词映射；都没命中返回空串，交由模型按氛围选。
+    这里只认**带语境的字面证据**，不做任何推断：命中强信号（下雨/下雪/淹/湿…）
+    就按对应天气钉死；命中弱信号（阴天/出太阳/闷…）按词映射。单字「雨/雪」
+    不再算证据，避免歌名、输入法皮肤、比喻把天气带偏。都没命中返回空串，
+    交由模型按氛围选（v1.8.0 保留这一行为）。
 
     Returns:
         可直接插进写作 prompt 的一段话；空串表示「素材里没有天气线索」。
@@ -590,20 +750,17 @@ def weather_hint(timeline: str, max_samples: int = 3) -> str:
     text = str(timeline or "")
     if not text.strip():
         return ""
-    hits: List[str] = []
-    for word in _WEATHER_STRONG:
+    hits: List[tuple[str, str]] = []
+    for word, label in _WEATHER_STRONG:
         if word in text:
-            hits.append(word)
+            hits.append((word, label))
     if hits:
-        samples = "、".join(f"「{w}」" for w in hits[:max_samples])
-        return f"当天明显有雨（素材里出现了 {samples}）。"
-    weak_word = ""
-    for word in _WEATHER_WEAK:
+        label = hits[0][1]
+        samples = "、".join(f"「{w}」" for w, _ in hits[:max_samples])
+        return f"当天明显有{label}（素材里出现了 {samples}）。"
+    for word, label in _WEATHER_WEAK:
         if word in text:
-            weak_word = word
-            break
-    if weak_word:
-        return f"素材里提到了天气（「{weak_word}」），按这个线索来写。"
+            return f"素材里提到了天气（「{word}」，对应「{label}」），按这个线索来写。"
     return ""
 
 
@@ -756,6 +913,92 @@ def build_continuity_line(continuity: Mapping[str, Any]) -> str:
     return "前几篇日记留下的线索（仅供参考）：\n" + "\n".join(lines)
 
 
+# 连续性匹配时的常见虚词二元组。它们在任何一天的聊天里都可能出现，
+# 拿它们当「今天又有进展」的证据，会让旧尾巴永远甩不掉。
+_CONTINUITY_STOP_BIGRAMS = frozenset({
+    "今天", "昨天", "前天", "早上", "晚上", "下午", "时候", "一个", "这个", "那个",
+    "他们", "我们", "你们", "什么", "怎么", "还是", "就是", "已经", "还在", "没有",
+    "不是", "因为", "所以", "但是", "然后", "现在", "自己", "对方", "事情", "结果",
+    "觉得", "感觉", "好像", "应该", "可以", "可能", "真的", "一起", "大家", "群里",
+    "还有", "有点", "一直", "出来", "起来", "过去", "回来", "看到", "听到",
+})
+
+
+def _match_grams(text: str) -> set[str]:
+    """归一化后取二元组，供连续性线索做保守匹配。"""
+    normalized = "".join(
+        ch.lower() for ch in str(text or "") if ch.isalnum()
+    )
+    if len(normalized) < 2:
+        return {normalized} if normalized else set()
+    return {
+        normalized[i : i + 2]
+        for i in range(len(normalized) - 1)
+        if normalized[i : i + 2] not in _CONTINUITY_STOP_BIGRAMS
+    }
+
+
+def _continuity_supported(item: str, evidence: str, evidence_grams: set[str]) -> bool:
+    norm = "".join(ch.lower() for ch in str(item or "") if ch.isalnum())
+    if not norm:
+        return False
+    if len(norm) <= 2:
+        return norm in "".join(ch.lower() for ch in evidence if ch.isalnum())
+    grams = _match_grams(norm)
+    if not grams:
+        return norm in "".join(ch.lower() for ch in evidence if ch.isalnum())
+    hits = grams & evidence_grams
+    # 短线索一个二元组即可；长线索至少两处独立重合，避免「电台」这类泛词带出旧尾巴。
+    need = 1 if len(grams) <= 3 else 2
+    return len(hits) >= need
+
+
+def filter_continuity_by_evidence(
+    continuity: Mapping[str, Any],
+    evidence: str,
+) -> Dict[str, Any]:
+    """只保留**当天素材确有新进展**的跨天线索。
+
+    真机 10-27 至 10-30 连续四天把「新歌命名」写进结尾，30 日还带出了
+    「项圈牵绳排队」；这些线索在前一天就存进 ``continuity.json``，即便当天
+    没人再提，也会被原样注入。旧 prompt 只说「不能当作今天的事实」，
+    阻止不了它变成每天都出现的固定尾巴。
+
+    这里的判据是**确定性**的：线索与当天入选事件（不是全量时间线）要有
+    至少一处（短线索）或两处（长线索）实词二元组重合。匹配不到就丢弃；
+    宁可少一点延续感，也不让旧事伪装成今天的内容。
+    """
+    if not isinstance(continuity, Mapping) or not continuity:
+        return {}
+    ev = str(evidence or "")
+    if not ev.strip():
+        return {}
+    ev_grams = _match_grams(ev)
+    out: Dict[str, Any] = {}
+
+    summary_segments = [
+        seg.strip()
+        for seg in re.split(r"[；;]", str(continuity.get("previous_summary") or ""))
+        if seg.strip()
+    ]
+    kept_summary = [s for s in summary_segments if _continuity_supported(s, ev, ev_grams)]
+    if kept_summary:
+        out["previous_summary"] = "；".join(kept_summary)[:800]
+
+    for src_key in (
+        "ongoing_topics", "ongoing_projects", "unresolved_items", "important_events",
+    ):
+        values = [
+            str(x).strip()
+            for x in (continuity.get(src_key) or [])
+            if str(x).strip()
+        ]
+        kept = [v for v in values if _continuity_supported(v, ev, ev_grams)]
+        if kept:
+            out[src_key] = kept
+    return out
+
+
 def _dedupe(items: List[str], limit: int) -> List[str]:
     """保序去重 + 截断（新的排前面）。"""
     result: List[str] = []
@@ -836,6 +1079,7 @@ def choose_word_budget(
     *,
     event_count: int = 0,
     material_mode: str = "events",
+    material_chars: Optional[int] = None,
 ) -> Dict[str, Any]:
     """按素材丰富度选篇幅档位（**纯函数**，便于单测）。
 
@@ -856,8 +1100,11 @@ def choose_word_budget(
     Args:
         word_target: 配置的字数目标，作为**长档**基准。
         word_tolerance: 配置的容差，同样按比例缩放。
-        event_count: 实际入选事件数。
+        event_count: 实际入选事件数（未提供 material_chars 时的旧判据）。
         material_mode: 素材来源（``events`` / ``timeline_tail``）。
+        material_chars: 入选素材正文总字符数。提供时**按素材信息量选档**，
+            不再用「写了几件事」直接推长度 —— 三件短事和一件长事不该被
+            强行写成同一个篇幅。只统计事件摘要，不含聊天原文。
 
     Returns:
         ``{"tier", "target", "tolerance", "lo", "hi", "reason"}``，
@@ -870,8 +1117,25 @@ def choose_word_budget(
     except (TypeError, ValueError):
         count = 0
     mode = str(material_mode or "").strip()
+
+    chars: Optional[int] = None
+    if material_chars is not None:
+        try:
+            chars = max(0, int(material_chars))
+        except (TypeError, ValueError):
+            chars = None
+
     if mode == "timeline_tail":
         tier, reason = "short", "选材降级"
+    elif chars is not None:
+        # 阈值按七天真机样本标定：入选 3 件时素材摘要约 62~89 字。
+        # 75 / 140 让「三件很短」落短档、「三件有细节」落中档，而不是一律长档。
+        if count <= 0 or chars < 75:
+            tier, reason = "short", f"素材 {chars} 字"
+        elif chars < 140:
+            tier, reason = "mid", f"素材 {chars} 字"
+        else:
+            tier, reason = "long", f"素材 {chars} 字"
     elif count <= 1:
         tier, reason = "short", f"入选 {count} 件"
     elif count == 2:
@@ -1027,11 +1291,13 @@ def build_write_prompt(
     # 天气：v1.6.0 起**优先采信素材里的字面证据**，不再交给模型凭氛围猜。
     # 真机 2026-10-18 素材写着「下大雨 / 学校被淹了 / 鞋湿了」，日记却写「全天阴天」，
     # 与当天所有人共同经历的那场雨直接对不上。有线索就钉死，没线索才允许按氛围选。
+    # v1.8.0：线索只来自**带语境**的天气说法；歌名里的「雪」、输入法里的「雪花」
+    # 不再触发钉死。日期行解析已支持「雪」，不会再拆出「多云 + 雪」两行。
     if weather_hint_text.strip():
         weather_rule = (
             f"第一行固定为 {date_str}，X。\n"
             f"   ⚠️ 当天的天气**已经有据可查**：{weather_hint_text.strip()}\n"
-            "   必须照这个写（线索说有雨就写 雨），不许凭感觉改成别的天气；"
+            "   必须照这个写（线索说有雨就写 雨、说有雪就写 雪），不许凭感觉改成别的天气；"
             "正文里若提到天气，也必须与第一行一致。\n"
             "   只选一个字（晴/多云/阴/雨/雪），都不许多。"
         )
@@ -1042,12 +1308,12 @@ def build_write_prompt(
         )
     rules = [
         weather_rule,
-        f"只写上面你真想写的事，最多写 {max_events} 件，可以只写一两件。"
-        "没劲的一天就写短点，三五句也行，绝不硬凑字数。",
-        # 引用降级：素材给了原话就顺口引一句，没给就不引 —— "每篇必须抄一句别人原话"
-        # 既不真人，又是 v1.2.7 / v1.4.5 那串引号归属病的上游诱因（为了完成指标硬凑引用）。
-        # **边界约束一条不留全部保留**，只是不再下达"必须引用"的指标。
-        "素材给了聊天原话就顺口引一句放进「」里，没给就不引 —— 不必为了引用而引用。\n"
+        f"从上面挑 1~{max_events} 件你真想写的事，**不必全写、也不必一件一段**。"
+        "相关的事可以并成一段；没劲的一天就写短点，三五句也行，绝不硬凑字数。",
+        # 引用降级：素材里最多只留一条别人的原话，从源头拆掉「逐段引用」的定式。
+        # **边界约束一条没松**，只是不再下达"必须引用"的指标。
+        "素材给了聊天原话就顺口引一句放进「」里，没给就不引 —— **全篇最多引一处**，"
+        "不必为了引用而引用。\n"
         "   「」里面只能放**别人说过的原话、一字不改**；我自己的话一律写在引号**外面**。\n"
         "   错误写法：回了句「来首晚风岂不美哉 安排上了，好听」（把自己的回复也塞进了引号，"
         "读起来像整句都是我说的）\n"
@@ -1059,7 +1325,7 @@ def build_write_prompt(
         "只引用**被引的那一句**，我的回复写在引号外面。\n"
         "   另外，凡是引用聊天原话都用「」，不要用 \"\" 或 '' 代替；能顺带点出是谁说的更好。",
         "像睡前随手写的：句子短，允许有点碎，允许口语和自嘲，想到哪写到哪，"
-        "但别写成聊天记录复述。\n"
+        "但别写成聊天记录复述，也别把每一件都写成「事件 + 引用 + 感想」的同一副骨架。\n"
         "   三种啰嗦写法，写完通读一遍就删掉：只有动作没内容的句子；换个说法又说一遍；"
         "每段都拿我的感受收尾。",
         "**事实纪律**：主观感受和情绪可以自由写；但**没有依据就不得制造**人物、地点、对话、"
@@ -1069,6 +1335,8 @@ def build_write_prompt(
         "   ⚠️ 「我问/我说」只能用在**素材真有的互动**上：素材里没写我问过，就不要写我问过"
         "（这正是上面说的\"只有动作没内容\"）。缺转场就直接写结果（「她还没给新歌取名。」），"
         "比编一个动作再让它落空强。\n"
+        "   涉及他人隐私、家庭矛盾、健康困境的，只作匿名概括：不写昵称、不引用原话、"
+        "不补细节。素材里若有「一位群友」，就照这个匿名称呼写。\n"
         "   上面的跨天线索（若有）只能用来引出想法、疑问、期待，或带原日期的回顾；"
         "它**不能单独证明今天发生了什么**，今天的事必须有上面的素材作依据。\n"
         "   三条真机踩过的坑，一条都不许再犯：\n"
@@ -1080,7 +1348,7 @@ def build_write_prompt(
         "禁止出现：开头问候语；结尾总结或展望（如\"明天也要加油\"\"真是充实的一天\"）；"
         "\"我意识到/我明白了/我突然发现\"句式；连续感叹号；排比句。",
         f"篇幅：{lo}~{hi} 字，{target} 字上下最舒服。**字数是给你留的余地，不是任务** ——\n"
-        "   宁可短一点也别硬凑；写完了觉得还差口气，就多补一句感受，别去堆形容词。"
+        "   宁可短一点也别硬凑，写到哪算哪，不补感受、不堆形容词。"
         "除第一行外就是日记正文：不要标题、不要 markdown、不要\"日记\"二字开头、"
         "不要任何前后缀或解释。",
     ]
@@ -1128,7 +1396,9 @@ def strip_diary_output(text: str) -> str:
 
 
 _WEEKDAY_CHARS = "一二三四五六日天"
-_WEATHERS = ("晴", "多云", "阴", "雨")
+# 「雪」必须在这里：weather_hint 可能给出雪线索，日期行解析若不认它，
+# 会把「…，雪。」拆成「…，多云。」+ 正文「雪。」—— 真机 10-27 / 10-31 的形态。
+_WEATHERS = ("晴", "多云", "阴", "雨", "雪")
 
 # 完整的「年月日」才算日期行 —— 只有年月不行（「2026年过得真快」不匹配）
 _FULL_DATE_RE = re.compile(r"^\s*[\[【（(「『]*\s*(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日")
