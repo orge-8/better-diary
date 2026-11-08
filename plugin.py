@@ -280,7 +280,7 @@ class DiarySection(PluginConfigBase):
     # 装在真机上的实例不会跟着改（config.toml 落盘后不回写），要改请在 config.toml 里改。
     word_target: int = Field(default=350, description="日记目标字数（正文）：按素材丰富度分短/中/长三档，这里是**长档**基准（短 0.4 倍 / 中 0.7 倍）。只是最舒服的长度，不是硬指标")
     word_tolerance: int = Field(default=150, description="目标字数的上下浮动（同样按档位缩放）。区间放宽一点，模型写长了不必回头删")
-    max_events: int = Field(default=3, description="日记最多写几件事")
+    max_events: int = Field(default=4, description="日记最多写几件事（同一人最多占 2 件，名额会优先铺给不同人物与不同类型的事）")
     min_messages: int = Field(default=20, description="当天消息少于此数不生成日记")
     chunk_chars: int = Field(default=6000, description="时间线分块字符数")
     max_chunks: int = Field(default=8, description="最多送入选材的分块数")
@@ -1151,7 +1151,7 @@ class BetterDiaryPlugin(MaiBotPlugin):
         - 返回值是纯 dict（bool/int/str/None/list），可直接过 msgpack。
         - **取不到任何一天也不抛异常**：返回 ``days: []`` + ``reason``，由调用方降级。
         - ``date`` 留空 = 存档里最新的一天；``days`` 从那一天起最多往回取几天（1~30）。
-        - ``items`` 至多 ``[diary] max_events`` 条（默认 3），即「当天最值得写的几件」。
+        - ``items`` 至多 ``[diary] max_events`` 条（默认 4），即「当天最值得写的几件」。
           选材降级那天（``material_mode == "timeline_tail"``）``items`` 会是空的，
           此时 ``meta`` 里的话题/人物仍在，调用方自行决定要不要用；
           **不许由调用方臆造**。
@@ -2601,6 +2601,7 @@ class BetterDiaryPlugin(MaiBotPlugin):
         self_name = await self._resolve_nickname()
         self_labels = {"我", self_name}
         used_events: list[dict[str, Any]] = []
+        _material_chars = 0
         if events:
             # 内容优先：达到分数门槛的才写，最多 max_events 件，不强制写满。
             selected = select_events_for_write(
@@ -2616,6 +2617,12 @@ class BetterDiaryPlugin(MaiBotPlugin):
                 self.ctx.logger.info(
                     "敏感事件匿名化: %d 件（昵称与原话不进入成文 prompt）", _redacted,
                 )
+            # 篇幅档位的素材字数**必须在引用限额之前**取快照（v1.9.0）：
+            # event_material_chars 现在把 quote 计入，而 limit_event_quotes 会把多余的
+            # quote 清空 —— 顺序反了的话，「限额清掉 3 条原话」会顺手把档位从长压到短，
+            # 等于让反 AI 腔的约束去惩罚篇幅。素材量衡量的是「今天有多少可写的料」，
+            # 与「允许引用几句」是两件事。
+            _material_chars = event_material_chars(used_events)
             # 全篇最多一条别人的原话，其余 quote 在素材侧清掉。
             used_events, _quotes_removed = limit_event_quotes(
                 used_events, limit=1, self_labels=self_labels,
@@ -2672,12 +2679,14 @@ class BetterDiaryPlugin(MaiBotPlugin):
                 self.ctx.logger.info("连续性线索: 当天素材没有新证据，全部不注入")
         # 篇幅三档：按**素材信息量**选档，不再「写了几件事 → 必然多长」。
         # 三个短事可以写短，一件有细节的事也可以写长；档位由素材字符量确定性决定。
+        # v1.9.0：material_chars 用引用限额**之前**的快照（见上方 _material_chars），
+        # 避免 limit_event_quotes 清掉原话时顺手把档位压低。
         _budget = choose_word_budget(
             max(80, self.config.diary.word_target),
             max(0, self.config.diary.word_tolerance),
             event_count=len(used_events),
             material_mode="events" if used_events else "timeline_tail",
-            material_chars=event_material_chars(used_events) if used_events else None,
+            material_chars=_material_chars if used_events else None,
         )
         self.ctx.logger.info(
             "篇幅档位: %s（目标 %d，区间 %d~%d，依据：%s）",

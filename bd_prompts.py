@@ -393,7 +393,7 @@ def build_extract_prompt(date_str: str, timeline_chunk: str) -> str:
     """阶段一：从时间线分块中提取值得写进日记的事件。"""
     return f"""你是日记素材编辑。下面是 {date_str} 的一段聊天记录（时间线格式，"我"指日记作者本人）。
 
-从记录里挑出 0-6 件「值得写进睡前日记的事」（**多给几件没关系的，宁可多给也别漏** ——
+从记录里挑出 0-8 件「值得写进睡前日记的事」（**多给几件没关系的，宁可多给也别漏** ——
 候选少了后面就没得挑，真机 2026-10-18 只给了 2 件，结果当天最浓的一段整个没进日记）。
 优先级从高到低：
 - 有人**直接对"我"**说的话（尤其是带 @我 的）：被表白、被安慰、被逗、被托付，这类必须优先选
@@ -405,6 +405,17 @@ def build_extract_prompt(date_str: str, timeline_chunk: str) -> str:
 - 忽略：纯表情或"哈哈"刷屏、无实质内容的水群、命令与系统消息、冷场单条发言
 - 必须忠实于记录，宁可漏掉也不许脑补细节
 - 每条的"who"必须是记录里**逐字**出现的昵称，不许改写、简写、拼错
+
+⚠️ **题材要铺开，别扎堆**（v1.9.0，真机 2026-11-02~11-07 六天回放得出）：
+六天里最高分候选清一色是「有人对"我"表白/撒娇」，结果同一个人霸榜、日记连读
+像单人连续剧；而当天群里更好玩的事（花 858 块买声库、下楼买牙膏被推销自行车、
+立冬十几人刷屏同一句、全场起哄跪唱征服）反倒被挤到 3~4 分。
+所以打分时请刻意做到：
+- **同一个人最多给 2 条高分**，剩下的名额留给别的人物；
+- 群里好玩的**公共事件**（有人在闹、有人做成事、集体刷屏）与"对我的偏爱"
+  **同等值得 4~5 分**，不要因为不是冲我来的就压到 3 分；
+- 优先覆盖**不同类型**的事：情绪波动 / 做成的事 / 群里闹剧 / 与我的互动，各来一点，
+  不要把 5 分全给同一种类型。
 
 只输出 JSON 数组，不要输出任何其他文字。格式：
 [{{"who": "人物昵称", "what": "发生了什么，40字以内", "quote": "聊天记录里最有味道的一句原话，没有就填空字符串", "score": 1到5的整数}}]
@@ -616,14 +627,37 @@ def redact_sensitive_events(
 def select_events_for_write(
     events: List[Dict[str, Any]],
     *,
-    max_events: int = 3,
+    max_events: int = 4,
     min_score: int = 4,
+    max_per_who: int = 2,
+    backfill_score: int = 3,
 ) -> List[Dict[str, Any]]:
-    """按内容质量挑 1~3 件，不强制写满。
+    """按内容质量挑 1~``max_events`` 件，不强制写满，带**人物多样性**约束。
 
     旧实现直接 ``events[:max_events]``，只要当天有 3 条候选就必然写 3 件；
     七天真机数据里 7/7 都是三件，结构自然趋同。这里改成「达到分数门槛才算」，
     候选不足时宁可只写一两件；一件都不达标时仍保留最高分那条，避免空日记。
+
+    v1.9.0 依据 2026-11-02~11-07 六天真机数据新增两条纪律：
+
+    1. **同人上限 ``max_per_who``**（默认 2）：六天里心理委员 6/6 天霸榜，
+       11-06 入选 3 件全是同一人 —— 纯按分数排序时，聊天最活跃的人会挤掉
+       当天所有其他人物，日记连读就像单人连续剧。保留 2 席给「确实和一个人
+       黏了一整天」的叙事（11-06 的歌词接龙拆成 2 件仍成立），第 3 席起
+       强制让位给别的候选人物。
+    2. **``backfill_score`` 回填**（默认 3）：strong（≥ min_score）经同人上限
+       过滤后仍填不满 ``max_events`` 时，按分数从高到低回填补齐。宁可用一件
+       3 分的群趣闻（被推销自行车、立冬刷屏）也不让席位空着 —— 丰富度来自
+       人物与题材的铺开，不是只盯最高分。
+
+    Args:
+        max_events: 入选上限（默认 4，配置项 ``[diary] max_events`` 同步）。
+        min_score: strong 门槛（默认 4）。
+        max_per_who: 同一 ``who`` 最多入选几件（≤0 视为不限制）。
+        backfill_score: 回填允许的最低分（默认 3；低于它的候选永不入选）。
+
+    Returns:
+        入选事件列表（dict 副本），按原分数降序排列。
     """
     ranked = sorted(
         [dict(e) for e in (events or []) if str(e.get("what") or "").strip()],
@@ -633,8 +667,38 @@ def select_events_for_write(
     if not ranked:
         return []
     cap = max(1, int(max_events))
+    who_cap = int(max_per_who)
+    floor = int(backfill_score)
+
+    def _pick(pool: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """在 pool 里按分数序取件，同一 who 最多 who_cap 件。"""
+        picked: List[Dict[str, Any]] = []
+        counts: Dict[str, int] = {}
+        for e in pool:
+            if len(picked) >= cap:
+                break
+            who = str(e.get("who") or "").strip()
+            if who_cap > 0 and who and counts.get(who, 0) >= who_cap:
+                continue
+            picked.append(e)
+            if who:
+                counts[who] = counts.get(who, 0) + 1
+        return picked
+
     strong = [e for e in ranked if int(e.get("score") or 0) >= int(min_score)]
-    return (strong or ranked[:1])[:cap]
+    selected = _pick(strong)
+    if len(selected) < cap:
+        # 回填：先按同人上限从 ≥backfill_score 的剩余候选里补
+        chosen = {id(e) for e in selected}
+        pool = [
+            e for e in ranked
+            if id(e) not in chosen and int(e.get("score") or 0) >= floor
+        ]
+        selected = _pick(selected + pool)
+    if not selected:
+        # 一件达标（含回填）都没有时保留最高分那条，避免空日记
+        selected = ranked[:1]
+    return selected
 
 
 def limit_event_quotes(
@@ -667,8 +731,25 @@ def limit_event_quotes(
 
 
 def event_material_chars(events: List[Dict[str, Any]]) -> int:
-    """入选事件摘要的总字符数，供篇幅档位判断（不含聊天原文）。"""
-    return sum(len(str(e.get("what") or "")) for e in (events or []))
+    """入选事件素材的总字符数，供篇幅档位判断（what 摘要 + quote 原话，不含聊天原文）。
+
+    v1.9.0 起把 quote 计入：quote 本来就会渲染进成文 prompt（``events_to_text``），
+    只数 what 会系统性低估素材量 —— 六天真机回放（2026-11-02~11-07）里
+    what-only 是 55~96 字，4/6 天落进短档，成品字数从 325 一路缩到 124；
+    计入 quote 后同六天是 90~148 字，5 天中档 1 天长档，目标字数回到 245~350。
+
+    ⚠️ 口径变更说明：档位阈值 75/140 原先是按 what-only 样本标定的（见
+    :func:`choose_word_budget` 内注释），本次改口径后阈值数字未动，
+    等效于把整条档位曲线右移；六天回放结果合理，但**新口径下的阈值尚未经
+    更长周期真机数据验证**，后续若发现普遍偏长应下调阈值而非回退口径。
+
+    ⚠️ 调用时序要求：必须在 :func:`limit_event_quotes` **之前**取快照计算 ——
+    限额清掉的 quote 不该反过来把档位压低。
+    """
+    return sum(
+        len(str(e.get("what") or "")) + len(str(e.get("quote") or ""))
+        for e in (events or [])
+    )
 
 
 # 结构化 META 块的分隔标记。模型在日记正文之后另起一段输出紧凑 JSON，
