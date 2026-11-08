@@ -11,7 +11,7 @@
 
 | 版本 | 主题 | 一句话 |
 |---|---|---|
-| 1.9.0 | 丰富度提升 | 依据 2026-11-02~07 六天真机 trace：选材人物去霸榜 + 3 分群趣闻回填、素材字数计入 quote 修短档误判、max_events 3→4；host 实测放宽到 1.4.2 |
+| 1.9.0 | 丰富度提升 | 依据 2026-11-02~07 六天真机 trace：选材人物去霸榜 + 3 分群趣闻回填、素材字数计入 quote 修短档误判、max_events 3→4；host 1.4.2 实测通过，max_version 放宽到 1.4.99 |
 | 1.8.0 | 真机结构治理 | 天气误判、旧线索尾巴、敏感事件点名、逐段引用与固定三件事，均改为写前确定性治理 |
 | 1.7.1 | 能力声明修复 | 补上漏声明的 `chat.get_group_streams` / `chat.get_all_streams`——这两条降级路径此前从未生效；`max_version` 收到有据的 1.3.99 |
 | 1.7.0 | 输出额度 | 给思考型模型留够输出空间（按请求覆盖 max_tokens）；空输出按抽样故障重试，不再一枪打死 |
@@ -71,8 +71,9 @@
 ### 官方最新版本实测（2026-11-08）
 
 - **宿主**：MaiBot v1.4.2（2026-11-07 release）源码 worktree，`PluginLoader` 加载探针
-  → 加载成功（兼容模式，instance=yes，capabilities=10）。据此把 `host_application.max_version`
-  从 1.3.99 放宽到 **1.4.2**。
+  → 加载成功（instance=yes，capabilities=10）。`host_application.max_version`
+  从 1.3.99 放宽到 **1.4.99**（覆盖整个 1.4.x 线；其中**实测验证的是 1.4.2**，
+  1.4.3+ 为前向兼容声明——1.4.x 属同一 minor 线，插件只用稳定 SDK API，未触碰宿主内部）。
 - **SDK**：maibot-plugin-sdk 2.21.0（PyPI 最新），隔离 venv 全量 `pytest tests/` →
   **241 passed**。
 - 门禁 `gate.sh`：PASS 3 / SKIP 0 / FAIL 0（check_plugin PASS 42 WARN 1、smoke、pytest 241）。
