@@ -398,6 +398,7 @@ print("NOHTTPX-LOAD-OK")
     cfg = plugin_mod.BetterDiaryConfig()
     check("config_version 默认值", cfg.plugin.config_version == "1.0.0")
     check("word_target 默认 350", cfg.diary.word_target == 350)
+    check("每日天气兜底默认 多云", cfg.diary.weather_fallback == "多云")
     check("word_tolerance 默认 150", cfg.diary.word_tolerance == 150)
     check("schedule.time 默认 23:30", cfg.schedule.time == "23:30")
     check("不丢天默认开启", cfg.schedule.catch_up_enabled is True)
@@ -522,6 +523,9 @@ print("NOHTTPX-LOAD-OK")
         ok, content = asyncio.run(plugin._generate_for_date("2026-09-26"))
         check("生成成功", ok, content[:100])
         check("首行是日期行", content.split("\n")[0].startswith("2026年9月26日"))
+        check("无天气证据仍写兜底天气",
+              content.split("\n")[0].rstrip().endswith("，多云。"),
+              content.split("\n")[0])
         check("引用了聊天原话", "「" in content)
         store = data_dir / "diaries.json"
         check("存档写入临时目录", store.exists())

@@ -163,6 +163,35 @@ def test_malformed_json_is_retryable_but_explicit_empty_is_not():
     assert not BD.extraction_note_retryable("模型明确返回空数组（确实无事）", "[]")
 
 
+def test_weather_is_present_every_day_with_evidence_or_fallback():
+    assert BD.weather_label("当天明显有雨（素材里出现了「下雨」）。", "多云") == "雨"
+    assert BD.weather_label("素材里提到了天气（「好冷」，对应「多云」）。", "晴") == "多云"
+    assert BD.weather_label("", "阴") == "阴"
+    prompt = BD.build_write_prompt(
+        date_str="2026年11月14日 星期六",
+        events_text="- 甲：聊了一件小事",
+        name="鸣澜",
+        persona="测试",
+        weather_fallback="阴",
+    )
+    assert "第一行固定为 2026年11月14日 星期六，阴。" in prompt
+    forced = BD.ensure_date_line(
+        "2026年11月14日 星期六，晴。\n今天聊得挺晚。",
+        "2026年11月14日 星期六",
+        weather_override="阴",
+    )
+    assert forced.startswith("2026年11月14日 星期六，阴。")
+    assert "晴。" not in forced.split("\n", 1)[0]
+
+
+def test_invalid_weather_fallback_is_normalized_to_cloudy():
+    cfg = PLUGIN_MOD.BetterDiaryConfig.model_validate({
+        "plugin": {"enabled": True, "config_version": "1.0.0"},
+        "diary": {"weather_fallback": "暴雨"},
+    })
+    assert cfg.diary.weather_fallback == "多云"
+
+
 def test_opening_hint_avoids_recent_two_choices():
     date = "2026-11-13"
     first = BD.opening_hint(date)

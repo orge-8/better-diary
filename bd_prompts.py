@@ -968,6 +968,19 @@ def weather_hint(timeline: str, max_samples: int = 3) -> str:
     return ""
 
 
+def weather_label(hint_text: str, fallback: str = "多云") -> str:
+    """从天气线索文本里取出单字天气；无线索时返回配置的兜底值。
+
+    日期行最终由代码强制写这个值，不再让模型自行改写。顺序按「雪/雨」优先，
+    避免线索样本里偶然出现「晴」「阴」把真正的强天气盖掉。
+    """
+    text = str(hint_text or "")
+    for label in ("雪", "雨", "多云", "晴", "阴"):
+        if label in text:
+            return label
+    return fallback if fallback in _WEATHERS else "多云"
+
+
 def _evidence_coverage(term: str, evidence: str) -> tuple[int, float]:
     """术语在证据文本里的「最长命中片段长度」与「字符覆盖率」。
 
@@ -1457,6 +1470,7 @@ def build_write_prompt(
     temporal_anchor: str = "",
     continuity_text: str = "",
     weather_hint_text: str = "",
+    weather_fallback: str = "",
     recent_openings: Optional[Sequence[str]] = None,
     avoid_opening_hints: Optional[Sequence[str]] = None,
 ) -> str:
@@ -1514,9 +1528,17 @@ def build_write_prompt(
             "正文里若提到天气，也必须与第一行一致。\n"
             "   只选一个字（晴/多云/阴/雨/雪），都不许多。"
         )
+    elif weather_fallback.strip():
+        # v1.10.1：产品要求每日都有天气。没有聊天证据时使用配置的兜底值，
+        # 由代码写死在日期行；不让模型按氛围自选，避免每天随机改天气。
+        fallback = weather_fallback.strip()
+        weather_rule = (
+            f"第一行固定为 {date_str}，{fallback}。"
+            f"当天素材没有明确天气依据，按配置统一写「{fallback}」；"
+            "不要改成别的天气，也不要在正文里虚构与它矛盾的窗外天气。"
+        )
     else:
-        # v1.10.0：没有天气证据就不写天气。让模型「按氛围选」等于鼓励它把
-        # 聊天里的冷、歌名里的雨当成真实天气；宁可日期行少一个字段。
+        # 直接调用本函数的兼容路径：未提供兜底值时维持旧行为。
         weather_rule = (
             f"第一行固定为 {date_str}。当天素材里**没有**明确的天气依据，"
             "不要在日期行写天气，也不要在正文里虚构窗外天气。"
@@ -1783,7 +1805,14 @@ def trailing_date_line(content: str, date_str: str) -> tuple[str, str] | None:
     return weather, "\n".join(lines)
 
 
-def ensure_date_line(content: str, date_str: str, *, allow_weather: bool = True) -> str:
+def ensure_date_line(
+    content: str,
+    date_str: str,
+    *,
+    allow_weather: bool = True,
+    default_weather: str = DEFAULT_WEATHER,
+    weather_override: str = "",
+) -> str:
     """保证第一行是日期行，并把它**规范成** ``<日期>，<天气>。``。
 
     五种输入都能正确处理：
@@ -1801,6 +1830,10 @@ def ensure_date_line(content: str, date_str: str, *, allow_weather: bool = True)
     v1.10.0 新增 ``allow_weather=False``：当天素材没有天气依据时，只保留
     ``<日期>。``，不补默认「多云」，也不采用模型自行编造的天气。
 
+    v1.10.1 新增 ``default_weather`` / ``weather_override``：插件要求每日都有天气时，
+    传入配置兜底值或证据解析出的单字天气，日期行会**强制**写成该值；模型在正文首行
+    自行改写天气也会被统一掉。
+
     「模型写错了日期」这件事不再靠人眼看日志发现：调用方用 :func:`date_line_overridden`
     取到被替换掉的那一行，落进存档字段 ``model_date_line``（见 plugin `_save_diary`）。
 
@@ -1808,9 +1841,13 @@ def ensure_date_line(content: str, date_str: str, *, allow_weather: bool = True)
     它是给「聊天里回看」兜底用的展示文案，**不是可发布的日记**。
     发布前必须先用 :func:`diary_output_problem` 判定，否则占位文本会被当成成品发出去。
     """
+    forced = str(weather_override or "").strip()
+    fallback = str(default_weather or DEFAULT_WEATHER).strip() or DEFAULT_WEATHER
+
     def _head(weather: str) -> str:
         if allow_weather:
-            return f"{date_str}，{weather or DEFAULT_WEATHER}。"
+            chosen = forced or weather or fallback
+            return f"{date_str}，{chosen}。"
         return f"{date_str}。"
 
     if not content:

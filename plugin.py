@@ -6,7 +6,7 @@
 2. 反 AI 腔：规则从 10 条压到 6 条、开场骨架按日期轮换、篇幅按素材丰富度分三档，
    引用也不再是硬性指标（素材给了原话才顺口引一句）—— 结构定式是最容易被认出来的 AI tell；
 3. 字数软控制（模型侧遵守），不做硬截断砍句子；
-4. 天气/心情由模型随文生成，替代关键词计数猜测。
+4. 天气由当天证据优先确定，缺失时用配置兜底值；日期行每日都有天气且由代码统一。
 """
 
 import asyncio
@@ -56,6 +56,7 @@ if __package__:  # 包式加载（Runner 真机：插件目录作为包，不在
         trailing_date_line,
         update_continuity,
         weather_hint,
+        weather_label,
         filter_meta_against_evidence,
     )
     from .bd_scene import (
@@ -164,6 +165,14 @@ def _as_str_list(value: Any) -> Any:
 
 # 素材过滤只认这三种模式；其余一律按最保守的 whitelist 处理
 _FILTER_MODES = ("all", "whitelist", "blacklist")
+
+# 日期行允许的天气值。配置兜底值不合法时回退「多云」，保证每日都有天气。
+_WEATHER_FALLBACKS = ("晴", "多云", "阴", "雨", "雪")
+
+
+def _norm_weather_fallback(value: Any) -> str:
+    text = str(value or "").strip()
+    return text if text in _WEATHER_FALLBACKS else "多云"
 
 
 def _find_by_value(node: Any, wanted: str, id_keys: tuple[str, ...], depth: int = 0) -> Any:
@@ -302,11 +311,13 @@ class DiarySection(PluginConfigBase):
     max_chunks: int = Field(default=8, description="最多送入选材的分块数")
     persona_override: str = Field(default="", description="覆盖 Host 人设；留空则读取主程序人设")
     style_extra: str = Field(default="", description="追加到写作规则后的额外风格要求")
+    weather_fallback: str = Field(default="多云", description="当天聊天没有明确天气证据时使用的兜底天气（晴/多云/阴/雨/雪）。日期行每天都会写天气")
     filter_mode: str = Field(default="whitelist", description="聊天过滤：all（全库，跨群+私聊）/ whitelist（只取 target_chats 指定的会话，**默认**）/ blacklist")
     target_chats: list[str] = Field(default_factory=list, description='过滤目标列表，格式 "group:群号" 或 "private:QQ号"。filter_mode 为 whitelist 时**必须**填，否则不生成（默认不把全库素材喂进去）')
 
     _norm_filter_mode = field_validator("filter_mode", mode="before")(_norm_filter_mode)
     _norm_target_chats = field_validator("target_chats", mode="before")(_as_str_list)
+    _norm_weather_fallback = field_validator("weather_fallback", mode="before")(_norm_weather_fallback)
 
 
 class ScheduleSection(PluginConfigBase):
@@ -2771,11 +2782,20 @@ class BetterDiaryPlugin(MaiBotPlugin):
         )
         # 天气线索：素材里有人真的提过天气就用素材的，不再让模型凭氛围猜（v1.6.0）。
         # 真机 2026-10-18 素材写着「下大雨 / 学校被淹了 / 鞋湿了」，日记却写「全天阴天」。
-        _weather = weather_hint(timeline)
-        if _weather:
-            self.ctx.logger.info("天气线索（来自当天素材）: %s", _weather)
+        _weather_evidence = weather_hint(timeline)
+        _weather_fallback = _norm_weather_fallback(self.config.diary.weather_fallback)
+        _weather_label = weather_label(_weather_evidence, _weather_fallback)
+        if _weather_evidence:
+            self.ctx.logger.info(
+                "天气线索（来自当天素材）: %s；日期行写 %s",
+                _weather_evidence,
+                _weather_label,
+            )
         else:
-            self.ctx.logger.info("天气线索: 当天素材没有明确依据，日期行不写天气")
+            self.ctx.logger.info(
+                "天气线索: 当天素材没有明确依据，使用配置兜底天气 %s",
+                _weather_label,
+            )
         _recent_openings = list(_recent.get("openings") or [])
         _avoid_hints = list(_recent.get("opening_hints") or [])
         _opening_hint = opening_hint(date_display(date_str), avoid=_avoid_hints)
@@ -2791,7 +2811,8 @@ class BetterDiaryPlugin(MaiBotPlugin):
             # 补写过去的日期必须声明相对时间的基准，否则模型会按「真正的今天」解读素材里的「昨天」
             temporal_anchor="" if is_today else date_display(date_str),
             continuity_text=build_continuity_line(continuity),
-            weather_hint_text=_weather,
+            weather_hint_text=_weather_evidence,
+            weather_fallback="" if _weather_evidence else _weather_fallback,
             recent_openings=_recent_openings,
             avoid_opening_hints=_avoid_hints,
         )
@@ -2813,7 +2834,13 @@ class BetterDiaryPlugin(MaiBotPlugin):
             )
             return False, f"模型没写出可用的日记（{problem}），本日不生成"
         display_date = date_display(date_str)
-        content = ensure_date_line(body, display_date, allow_weather=bool(_weather))
+        content = ensure_date_line(
+            body,
+            display_date,
+            allow_weather=True,
+            default_weather=_weather_fallback,
+            weather_override=_weather_label,
+        )
         _fact_risks = diary_fact_risks(content, timeline)
         _style_risks = style_repeat_reasons(content, _recent_openings)
         if _fact_risks or _style_risks:
@@ -2841,7 +2868,11 @@ class BetterDiaryPlugin(MaiBotPlugin):
             retry_problem = diary_output_problem(retry_body)
             if not retry_problem:
                 retry_content = ensure_date_line(
-                    retry_body, display_date, allow_weather=bool(_weather),
+                    retry_body,
+                    display_date,
+                    allow_weather=True,
+                    default_weather=_weather_fallback,
+                    weather_override=_weather_label,
                 )
                 retry_fact = diary_fact_risks(retry_content, timeline)
                 if retry_fact:
