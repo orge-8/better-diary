@@ -1471,6 +1471,7 @@ def build_write_prompt(
     continuity_text: str = "",
     weather_hint_text: str = "",
     weather_fallback: str = "",
+    weather_is_real: bool = False,
     recent_openings: Optional[Sequence[str]] = None,
     avoid_opening_hints: Optional[Sequence[str]] = None,
 ) -> str:
@@ -1491,9 +1492,12 @@ def build_write_prompt(
             素材里「今天/昨天/前天」的相对时间基准，否则模型会以真正的今天来解读。
         continuity_text: 跨天连续性线索（见 :func:`build_continuity_line`），
             只用于引出回顾与延续，不能当作「今天发生了什么」的依据。
-        weather_hint_text: 当天天气的**字面证据**（见 :func:`weather_hint`）。
-            非空时规则 1 会把天气钉死在这个线索上；空串表示素材里没提天气，
-            仍按旧行为让模型选一个贴合氛围的。
+        weather_hint_text: 当天天气的**字面证据**（见 :func:`weather_hint`），
+            或 v1.11.0 起按城市查到的当日真实天气说明。非空时规则 1 会把天气
+            钉死在它上面；空串表示既无聊天证据也无气象数据，用兜底值。
+        weather_is_real: ``weather_hint_text`` 是否来自**气象数据**而非聊天记录。
+            只影响措辞：真实天气要说明「没人聊到天气也可以照实写」，
+            但不能诱导模型去编造「谁说了下雨」这种聊天事实。
     """
     name_line = f"我的名字是{name}。" if name else ""
     persona_line = persona or "是一个爱聊天的机器人。"
@@ -1520,7 +1524,18 @@ def build_write_prompt(
     # 与当天所有人共同经历的那场雨直接对不上。有线索就钉死，没线索才允许按氛围选。
     # v1.8.0：线索只来自**带语境**的天气说法；歌名里的「雪」、输入法里的「雪花」
     # 不再触发钉死。日期行解析已支持「雪」，不会再拆出「多云 + 雪」两行。
-    if weather_hint_text.strip():
+    if weather_hint_text.strip() and weather_is_real:
+        # v1.11.0：来自气象数据。它是**当天的客观事实**，但**不是聊天里发生过的事** ——
+        # 措辞必须把这两件事分开，否则模型会顺手编出「群里有人说下雨了」。
+        weather_rule = (
+            f"第一行固定为 {date_str}，X。\n"
+            f"   ⚠️ 当天的真实天气**已经查实**：{weather_hint_text.strip()}\n"
+            "   日期行必须写这个天气，不许凭感觉改；正文提到天气时也要与第一行一致。\n"
+            "   这是气象数据，不是聊天记录：**没人聊过天气也可以照常写天气**，"
+            "但绝不能编造「谁说了下雨」这类没发生过的对话。\n"
+            "   只选一个字（晴/多云/阴/雨/雪），都不许多。"
+        )
+    elif weather_hint_text.strip():
         weather_rule = (
             f"第一行固定为 {date_str}，X。\n"
             f"   ⚠️ 当天的天气**已经有据可查**：{weather_hint_text.strip()}\n"

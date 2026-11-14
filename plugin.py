@@ -6,7 +6,8 @@
 2. 反 AI 腔：规则从 10 条压到 6 条、开场骨架按日期轮换、篇幅按素材丰富度分三档，
    引用也不再是硬性指标（素材给了原话才顺口引一句）—— 结构定式是最容易被认出来的 AI tell；
 3. 字数软控制（模型侧遵守），不做硬截断砍句子；
-4. 天气由当天证据优先确定，缺失时用配置兜底值；日期行每日都有天气且由代码统一。
+4. 天气按「当天聊天证据 → 按城市查到的当日真实天气 → 配置兜底」三级确定；
+   日期行每日都有天气且由代码统一，模型不能自行改写。
 """
 
 import asyncio
@@ -68,6 +69,7 @@ if __package__:  # 包式加载（Runner 真机：插件目录作为包，不在
     )
     from .bd_cookie import CookieStore, redact_secrets
     from .bd_search import format_hits, on_this_day, search_diaries
+    from .bd_weather import WeatherStore, normalize_city, parse_coords
 else:  # 平铺兜底（脚本直跑 / 旧测试夹具）
     from bd_prompts import (
         ai_tone_hits,
@@ -111,6 +113,7 @@ else:  # 平铺兜底（脚本直跑 / 旧测试夹具）
     )
     from bd_cookie import CookieStore, redact_secrets
     from bd_search import format_hits, on_this_day, search_diaries
+    from bd_weather import WeatherStore, normalize_city, parse_coords
 
 logger = logging.getLogger("plugin.org.orge-8.better-diary")
 
@@ -311,13 +314,36 @@ class DiarySection(PluginConfigBase):
     max_chunks: int = Field(default=8, description="最多送入选材的分块数")
     persona_override: str = Field(default="", description="覆盖 Host 人设；留空则读取主程序人设")
     style_extra: str = Field(default="", description="追加到写作规则后的额外风格要求")
-    weather_fallback: str = Field(default="多云", description="当天聊天没有明确天气证据时使用的兜底天气（晴/多云/阴/雨/雪）。日期行每天都会写天气")
+    weather_fallback: str = Field(default="多云", description="聊天证据与真实天气都拿不到时使用的兜底天气（晴/多云/阴/雨/雪）。日期行每天都会写天气；真实天气见 [weather] 节")
     filter_mode: str = Field(default="whitelist", description="聊天过滤：all（全库，跨群+私聊）/ whitelist（只取 target_chats 指定的会话，**默认**）/ blacklist")
     target_chats: list[str] = Field(default_factory=list, description='过滤目标列表，格式 "group:群号" 或 "private:QQ号"。filter_mode 为 whitelist 时**必须**填，否则不生成（默认不把全库素材喂进去）')
 
     _norm_filter_mode = field_validator("filter_mode", mode="before")(_norm_filter_mode)
     _norm_target_chats = field_validator("target_chats", mode="before")(_as_str_list)
     _norm_weather_fallback = field_validator("weather_fallback", mode="before")(_norm_weather_fallback)
+
+
+class WeatherSection(PluginConfigBase):
+    """真实天气配置（v1.11.0）。
+
+    天气优先级：**当天聊天里的明确天气证据 → 按城市查到的当日真实天气 →
+    ``[diary].weather_fallback`` 兜底**。聊天证据排第一，是因为它记录的是
+    「大家当天真的经历了什么」；气象数据是补上没人提天气的那些天。
+
+    ⚠️ 默认 ``city`` 为空 = **不联网**。插件不会替用户猜一个城市，也不做
+    IP 定位（那会把 bot 所在机房的位置当成用户所在城市，属于事实错误）。
+    要用真实天气，填城市名或直接填经纬度即可。
+    """
+
+    enabled: bool = Field(default=True, description="是否按城市自动获取当日真实天气。关掉则只用聊天证据与配置兜底（不联网）")
+    city: str = Field(default="", description="城市名（中文或英文，如「杭州」/「Hangzhou」）。留空且不填经纬度 = 不联网取天气，直接用 [diary].weather_fallback")
+    latitude: str = Field(default="", description="纬度（如 30.25）。与 longitude 同时填写时优先于城市名，可消除同名地方歧义")
+    longitude: str = Field(default="", description="经度（如 120.17）。与 latitude 同时填写时优先于城市名")
+    country_code: str = Field(default="CN", description="按城市名解析时限定国家（两位代码，如 CN）。避免「北京」命中重庆的同名村镇；留空则不限国家")
+    timezone: str = Field(default="auto", description="按哪个时区划分「一天」，如 Asia/Shanghai。auto = 由坐标自动判定")
+    timeout_seconds: int = Field(default=10, description="单次天气请求超时（秒）。超时即降级为配置兜底，不影响日记生成")
+
+    _norm_city = field_validator("city", mode="before")(lambda value: normalize_city(value))
 
 
 class ScheduleSection(PluginConfigBase):
@@ -389,6 +415,7 @@ class BetterDiaryConfig(PluginConfigBase):
 
     plugin: PluginSection = Field(default_factory=PluginSection)
     diary: DiarySection = Field(default_factory=DiarySection)
+    weather: WeatherSection = Field(default_factory=WeatherSection)
     schedule: ScheduleSection = Field(default_factory=ScheduleSection)
     qzone: QzoneSection = Field(default_factory=QzoneSection)
     llm: LLMSection = Field(default_factory=LLMSection)
@@ -476,6 +503,7 @@ class BetterDiaryPlugin(MaiBotPlugin):
     # 「本进程正在走一次定时触发（含等静默）」：启动补偿靠它避让，避免与常规调度撞车
     _sched_busy = False
     _cookie_store = None
+    _weather_store = None
     _cfg_fallback_warned = False
     # 每个会话最近一次 /日记 的时间戳（秒），用于命令冷却；不落盘
     _last_gen_ts: dict[str, float] = {}
@@ -844,6 +872,11 @@ class BetterDiaryPlugin(MaiBotPlugin):
             except Exception as exc:  # noqa: BLE001
                 self._cookie_store = None
                 self._log_error("cookie 组件初始化失败（插件仍可加载）：%s", exc, exc_info=True)
+            try:
+                self._weather_store = self._build_weather_store()
+            except Exception as exc:  # noqa: BLE001
+                self._weather_store = None
+                self._log_error("天气组件初始化失败（改用配置兜底，插件仍可加载）：%s", exc, exc_info=True)
             if self.config.schedule.enabled:
                 try:
                     self._start_scheduler()
@@ -905,6 +938,11 @@ class BetterDiaryPlugin(MaiBotPlugin):
             self._cookie_store = self._build_cookie_store()
         except Exception as exc:  # noqa: BLE001
             self._log_error("cookie 组件重建失败：%s", exc, exc_info=True)
+        # 城市/坐标可能变了，重建天气 store（磁盘缓存自动恢复）
+        try:
+            self._weather_store = self._build_weather_store()
+        except Exception as exc:  # noqa: BLE001
+            self._log_error("天气组件重建失败：%s", exc, exc_info=True)
         # 定时设置变更时重启调度器
         if self._sched_task is not None:
             self._sched_task.cancel()
@@ -1868,6 +1906,81 @@ class BetterDiaryPlugin(MaiBotPlugin):
             logger=self.ctx.logger,
         )
 
+    def _build_weather_store(self) -> WeatherStore | None:
+        """构造真实天气组件；未开启或没配定位信息时返回 None（完全不联网）。
+
+        **不做 IP 定位兜底**：bot 跑在机房里，按 IP 猜出来的城市不是用户所在地，
+        写进日记就是事实错误。宁可退回配置兜底，也不猜一个城市。
+        """
+        cfg = self.config.weather
+        if not cfg.enabled:
+            self._log_info("真实天气：已关闭（[weather].enabled = false），只用聊天证据与配置兜底")
+            return None
+        coords = parse_coords(cfg.latitude, cfg.longitude)
+        city = normalize_city(cfg.city)
+        if coords is None and not city:
+            self._log_info(
+                "真实天气：未配置城市（[weather].city 或 latitude/longitude 留空），"
+                "不联网取天气，日期行用 [diary].weather_fallback 兜底"
+            )
+            return None
+        store = WeatherStore(
+            self._data_dir(),
+            city=city,
+            latitude=cfg.latitude if coords else None,
+            longitude=cfg.longitude if coords else None,
+            country_code=cfg.country_code,
+            timezone=cfg.timezone,
+            timeout=float(max(3, int(cfg.timeout_seconds))),
+            logger=self.ctx.logger,
+        )
+        self._log_info("真实天气：已启用（%s）", store.describe_location())
+        return store
+
+    async def _resolve_weather(self, date_str: str, timeline: str) -> tuple[str, str, str]:
+        """定下当天日期行要写的天气，返回 ``(标签, 提示文本, 来源)``。
+
+        优先级（**客观事实必须严格**）：
+        1. 当天聊天里的明确天气证据 —— 那是大家真的经历过的事；
+        2. 按城市查到的**该日期**真实天气 —— 补写历史日期时取的也是那一天；
+        3. ``[diary].weather_fallback`` 配置兜底。
+
+        提示文本会进 prompt 与事实校验：来源 1/2 都属于「有据可查」，正文可以写
+        与之一致的窗外天气；来源 3 是兜底，正文仍不许虚构窗外天气。
+        """
+        fallback = _norm_weather_fallback(self.config.diary.weather_fallback)
+        evidence = weather_hint(timeline)
+        if evidence:
+            label = weather_label(evidence, fallback)
+            self.ctx.logger.info("天气（来自当天素材）: %s；日期行写 %s", evidence, label)
+            return label, evidence, "chat"
+        if self._weather_store is not None:
+            try:
+                real = await self._weather_store.get_weather(date_str)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - 天气失败绝不能拖垮日记
+                real = None
+                self.ctx.logger.warning("真实天气获取异常（改用配置兜底）: %s", type(exc).__name__)
+            if isinstance(real, dict) and real.get("label"):
+                label = str(real["label"])
+                place = str(real.get("city") or self._weather_store.describe_location())
+                source = str(real.get("source") or "api")
+                # 措辞要同时满足两处消费方：prompt 读它知道写什么天气；
+                # diary_fact_risks 读它判断「正文写窗外天气」有没有依据 ——
+                # 后者的判据是「下雨/下雪」这类词，所以这里必须用完整说法，
+                # 只写单字「雨」会让合法的「外面下着雨」被误判成无据虚构。
+                phrase = {"雨": "下雨", "雪": "下雪"}.get(label, label)
+                hint = (
+                    f"{date_str} {place}当天的真实天气是「{label}」（{phrase}），"
+                    f"来自气象数据（{source}）。"
+                )
+                return label, hint, source
+        self.ctx.logger.info(
+            "天气: 当天素材无明确依据、真实天气未取到，使用配置兜底 %s", fallback,
+        )
+        return fallback, "", "fallback"
+
     async def _adapter_api_call(self, name: str, params: dict) -> Any:
         """napcat-adapter API 调用入口（注入给 CookieStore；1.3.0 无 adapter 时会抛错，由 CookieStore 降级）。"""
         return await self.ctx.api.call(name, params=params)
@@ -2780,22 +2893,19 @@ class BetterDiaryPlugin(MaiBotPlugin):
             "篇幅档位: %s（目标 %d，区间 %d~%d，依据：%s）",
             _budget["tier"], _budget["target"], _budget["lo"], _budget["hi"], _budget["reason"],
         )
-        # 天气线索：素材里有人真的提过天气就用素材的，不再让模型凭氛围猜（v1.6.0）。
-        # 真机 2026-10-18 素材写着「下大雨 / 学校被淹了 / 鞋湿了」，日记却写「全天阴天」。
-        _weather_evidence = weather_hint(timeline)
+        # 天气三级来源（v1.11.0）：当天聊天证据 → 按城市查到的**该日期**真实天气
+        # → 配置兜底。素材证据优先，因为它记的是大家真的经历过的那场雨
+        # （真机 2026-10-18 素材写着「下大雨 / 学校被淹了」，日记却写「全天阴天」）。
         _weather_fallback = _norm_weather_fallback(self.config.diary.weather_fallback)
-        _weather_label = weather_label(_weather_evidence, _weather_fallback)
-        if _weather_evidence:
-            self.ctx.logger.info(
-                "天气线索（来自当天素材）: %s；日期行写 %s",
-                _weather_evidence,
-                _weather_label,
-            )
-        else:
-            self.ctx.logger.info(
-                "天气线索: 当天素材没有明确依据，使用配置兜底天气 %s",
-                _weather_label,
-            )
+        _weather_label, _weather_evidence, _weather_source = await self._resolve_weather(
+            date_str, timeline,
+        )
+        # 真实天气也是**可核验的客观事实**：把它并进事实校验的证据文本，
+        # 正文写「窗外在下雨」才不会被判成无据虚构。兜底来源不并入 —— 那只是
+        # 一个默认值，不构成「当天真的下雨」的依据。
+        _fact_evidence = timeline
+        if _weather_source not in ("chat", "fallback") and _weather_evidence:
+            _fact_evidence = f"{timeline}\n{_weather_evidence}"
         _recent_openings = list(_recent.get("openings") or [])
         _avoid_hints = list(_recent.get("opening_hints") or [])
         _opening_hint = opening_hint(date_display(date_str), avoid=_avoid_hints)
@@ -2813,6 +2923,7 @@ class BetterDiaryPlugin(MaiBotPlugin):
             continuity_text=build_continuity_line(continuity),
             weather_hint_text=_weather_evidence,
             weather_fallback="" if _weather_evidence else _weather_fallback,
+            weather_is_real=(_weather_source not in ("chat", "fallback")),
             recent_openings=_recent_openings,
             avoid_opening_hints=_avoid_hints,
         )
@@ -2841,7 +2952,7 @@ class BetterDiaryPlugin(MaiBotPlugin):
             default_weather=_weather_fallback,
             weather_override=_weather_label,
         )
-        _fact_risks = diary_fact_risks(content, timeline)
+        _fact_risks = diary_fact_risks(content, _fact_evidence)
         _style_risks = style_repeat_reasons(content, _recent_openings)
         if _fact_risks or _style_risks:
             reasons = _fact_risks + _style_risks
@@ -2874,7 +2985,7 @@ class BetterDiaryPlugin(MaiBotPlugin):
                     default_weather=_weather_fallback,
                     weather_override=_weather_label,
                 )
-                retry_fact = diary_fact_risks(retry_content, timeline)
+                retry_fact = diary_fact_risks(retry_content, _fact_evidence)
                 if retry_fact:
                     self.ctx.logger.error(
                         "返工后仍有 %d 项事实无法回查，本日不发布", len(retry_fact),
@@ -2976,6 +3087,7 @@ class BetterDiaryPlugin(MaiBotPlugin):
             events=used_events, material_mode=material_mode, meta=meta,
             model_date_line=model_date_line, tone_hits=_tone,
             opening_hint=_opening_hint,
+            weather={"label": _weather_label, "source": _weather_source},
         )
         # 累积跨天连续性（纯累积 + 保序去重，不再额外调 LLM）
         if used_events or meta:
@@ -3216,6 +3328,7 @@ class BetterDiaryPlugin(MaiBotPlugin):
         model_date_line: str = "",
         tone_hits: list[str] | None = None,
         opening_hint: str = "",
+        weather: dict[str, str] | None = None,
     ) -> None:
         path = self._store_path()
         try:
@@ -3251,6 +3364,12 @@ class BetterDiaryPlugin(MaiBotPlugin):
                 "ai_tone_hits": [str(x) for x in (tone_hits or []) if str(x or "").strip()],
                 # v1.10.0：记录本次实际使用的开场骨架，下一篇选开场时避开最近两次。
                 "opening_hint": str(opening_hint or "")[:120],
+                # v1.11.0：日期行天气的来源（chat / open-meteo / open-meteo-archive /
+                # wttr.in / fallback）。回看「这天的天气是查来的还是兜底的」只看这里。
+                "weather": {
+                    "label": str((weather or {}).get("label") or ""),
+                    "source": str((weather or {}).get("source") or ""),
+                },
             }
             tmp = path.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")

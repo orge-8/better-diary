@@ -399,6 +399,9 @@ print("NOHTTPX-LOAD-OK")
     check("config_version 默认值", cfg.plugin.config_version == "1.0.0")
     check("word_target 默认 350", cfg.diary.word_target == 350)
     check("每日天气兜底默认 多云", cfg.diary.weather_fallback == "多云")
+    check("真实天气默认开启", cfg.weather.enabled is True)
+    check("真实天气默认不配城市（不联网）", cfg.weather.city == "")
+    check("城市解析默认限定 CN", cfg.weather.country_code == "CN")
     check("word_tolerance 默认 150", cfg.diary.word_tolerance == 150)
     check("schedule.time 默认 23:30", cfg.schedule.time == "23:30")
     check("不丢天默认开启", cfg.schedule.catch_up_enabled is True)
@@ -1722,6 +1725,28 @@ print("NOHTTPX-LOAD-OK")
     check("有线索时 prompt 把天气钉死", "不许凭感觉改成别的天气" in _wprompt)
     check("无线索时不猜天气", "不要在日期行写天气" in bd.build_write_prompt(
         date_str="2026年10月18日", events_text="x", name="鸣澜", persona="是个DJ"))
+
+    print("\n[19b] v1.11.0 真实天气：按城市 + 按日期，失败降级")
+    _real_prompt = bd.build_write_prompt(
+        date_str="2026年11月14日", events_text="x", name="鸣澜", persona="是个DJ",
+        weather_hint_text="当天的真实天气是「雨」（下雨），来自气象数据。",
+        weather_is_real=True,
+    )
+    check("气象数据措辞与聊天证据分开", "已经查实" in _real_prompt and "不是聊天记录" in _real_prompt)
+    check("气象数据不得诱导编造对话", "绝不能编造" in _real_prompt)
+    try:
+        _bw = importlib.import_module(f"{plugin_mod.__name__}.bd_weather")
+    except ImportError:
+        _bw = importlib.import_module("bd_weather")
+    check("WMO 代码映射到五个合法标签",
+          all(_bw.wmo_label(c) in _bw.WEATHER_LABELS for c in _bw._WMO_LABELS))
+    check("未知天气代码宁可降级也不猜", _bw.wmo_label(999) == "")
+    check("混合降水按雪记", _bw.wttr_label("Light sleet") == "雪")
+    check("备源只有今天时不冒充历史日期",
+          _bw.pick_wttr_day({"weather": [{"date": "2026-11-14", "hourly": [
+              {"time": "1200", "weatherDesc": [{"value": "Sunny"}]}]}]}, "2026-11-01") == "")
+    check("坐标 0,0 视为未配置", _bw.parse_coords(0, 0) is None)
+    check("城市名挡掉 URL 污染字符", _bw.normalize_city("a?b=1") == "")
 
     # 真机 2026-10-18 那份 META：13 条里 12 条是幻觉
     _evidence = _rainy + "【下午15点】\nkugurija: 能不能让鸣澜包养我\n秋枫叶语Acer: 为什么周日会有课啊!\n"
