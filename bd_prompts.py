@@ -10,7 +10,7 @@ import datetime
 import hashlib
 import json
 import re
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 # 单条消息在时间线里的最大文本长度（过长消息截断，保 token 预算）
 _MSG_TEXT_LIMIT = 80
@@ -420,6 +420,13 @@ def build_extract_prompt(date_str: str, timeline_chunk: str) -> str:
 只输出 JSON 数组，不要输出任何其他文字。格式：
 [{{"who": "人物昵称", "what": "发生了什么，40字以内", "quote": "聊天记录里最有味道的一句原话，没有就填空字符串", "score": 1到5的整数}}]
 
+⚠️ **JSON 格式硬要求**：字符串内部**不要使用英文双引号 `"`**。需要强调词语时直接写词，
+或使用中文引号「」；真机曾因为把「我」写成 `"我"` 导致整块 8 条候选解析失败。
+- `what` 里的**时间、数字、数量必须照原文写**，不许换算、推算或补出原文没有的细节
+  （例如原文只有 23:58 和 00:13，不得写成「关门前 13 秒」）。
+- 不要把两段相隔很久、中间还有别人插话的对话硬拼成一件；同一段连续对话也不要
+  为了凑条数拆成两件。
+
 quote 的三条硬性要求（很重要，写错的话整篇日记会替别人说话）：
 - 只能是**别人（不是"我"）**说的一句原话，**一字不改**照抄；
 - 必须来自**同一个人、同一条消息**，**绝不把两条消息、或两个人说的话拼在一起**；
@@ -482,6 +489,19 @@ def parse_events_detailed(text: str) -> Tuple[List[Dict[str, Any]], str]:
     return valid, "ok"
 
 
+def extraction_note_retryable(note: str, raw_text: str) -> bool:
+    """选材块没有产出事件时，是否值得再跑一次。
+
+    真机 2026-11-09 的失败不是「模型明确说今天没事」，而是 8 条候选的 JSON
+    字符串里用了未转义的英文双引号（``给"我"充电``），整块解析失败；旧逻辑只补跑
+    「空字符串」，于是 4215 字、约 41% 的当天时间线被静默丢掉。
+    """
+    if not str(raw_text or "").strip():
+        return True
+    text = str(note or "")
+    return not text.startswith("模型明确返回空数组")
+
+
 def parse_events(text: str) -> List[Dict[str, Any]]:
     """宽容解析阶段一的 JSON 数组输出。坏输出返回空列表。
 
@@ -508,7 +528,12 @@ def event_id(date_str: str, event: Mapping[str, Any]) -> str:
     return "ev_" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
 
 
-def events_to_text(events: List[Dict[str, Any]], self_labels: Iterable[str] = ()) -> str:
+def events_to_text(
+    events: List[Dict[str, Any]],
+    self_labels: Iterable[str] = (),
+    *,
+    include_evidence: bool = True,
+) -> str:
     """把精选事件列表渲染成阶段二的素材文本。
 
     ``self_labels`` 是**日记作者本人**的称呼集合（"我" + bot 昵称）。命中的事件
@@ -521,9 +546,11 @@ def events_to_text(events: List[Dict[str, Any]], self_labels: Iterable[str] = ()
         return ""
     labels = {str(s).strip() for s in (self_labels or ()) if str(s).strip()}
     lines: List[str] = []
-    for e in events:
+    for index, e in enumerate(events):
         who = str(e.get("who") or "").strip()
-        line = f"- {who}：{e['what']}"
+        time_label = str(e.get("time_label") or "").strip()
+        head = f"- {time_label} " if time_label else "- "
+        line = f"{head}{who}：{e['what']}"
         if e.get("quote"):
             if who in labels or who == "我":
                 # 作者自己的话：信息照留，但**明确禁止**用「」引用它
@@ -531,6 +558,28 @@ def events_to_text(events: List[Dict[str, Any]], self_labels: Iterable[str] = ()
             else:
                 line += f"（原话：「{e['quote']}」）"
         lines.append(line)
+        if not include_evidence:
+            continue
+        # 第一件是主场景，给更完整的现场；支撑场景只保留足以证明互动方向的轮次。
+        turn_limit = 10 if index == 0 else 6
+        char_budget = 1000 if index == 0 else 520
+        turns = [t for t in (e.get("evidence_turns") or []) if isinstance(t, Mapping)]
+        if not turns:
+            continue
+        evidence_lines: List[str] = []
+        used = 0
+        for turn in turns[:turn_limit]:
+            text = str(turn.get("text") or "").strip()
+            if not text:
+                continue
+            if evidence_lines and used + len(text) > char_budget:
+                break
+            speaker = "我" if str(turn.get("who") or "") in labels or turn.get("who") == "我" else str(turn.get("who") or "某人")
+            evidence_lines.append(f"    {speaker}: {text}")
+            used += len(text)
+        if evidence_lines:
+            lines.append("  现场（只按这里写互动，不要补动作或结果）：")
+            lines.extend(evidence_lines)
     return "\n".join(lines)
 
 
@@ -620,8 +669,65 @@ def redact_sensitive_events(
         item["who"] = "一位群友"
         item["what"] = text if len(text) >= 4 else _SENSITIVE_FALLBACK
         item["quote"] = ""
+        # 现场证据同样可能含昵称、健康/家庭细节，匿名化必须一起清掉；
+        # 否则只清了摘要，新的 evidence_turns 又把这些信息带回成文 prompt。
+        for key in ("evidence_turns", "evidence_refs", "my_actions", "anchor_ref"):
+            if key in item:
+                item[key] = []
         out.append(item)
     return out, redacted
+
+
+def _event_bucket_for_selection(event: Mapping[str, Any]) -> str:
+    """与 bd_scene.topic_bucket 同口径的轻量兜底（供纯函数选择器使用）。"""
+    explicit = str(event.get("topic_bucket") or "").strip()
+    if explicit:
+        return explicit
+    text = f"{event.get('what') or ''}\n{event.get('quote') or ''}"
+    if re.search(r"噩梦|没安全感|难过|崩溃|哭|疼|焦虑|害怕|失眠", text):
+        return "mood"
+    if re.search(r"喜欢|爱你|想你|表白|贴贴|抱抱|妹妹|亲亲|520|1314", text):
+        return "affection"
+    if re.search(r"完成|做完|拿到|通过|抽到|发布|终于|涨到|考过", text):
+        return "achievement"
+    if re.search(r"撤回|管理员|警告|吵架|怼|举报|禁言", text):
+        return "conflict"
+    return "daily"
+
+
+def _has_progress_for_selection(event: Mapping[str, Any]) -> bool:
+    text = f"{event.get('what') or ''}\n{event.get('quote') or ''}"
+    return bool(re.search(
+        r"终于|第一次|结果|后来|改成|答应|拒绝|确定|完成|涨到|实现|开始|结束|"
+        r"撤回|道歉|解决|定了|没了|拿到了|做完了|通过了",
+        text,
+    ))
+
+
+def _recent_repeat(event: Mapping[str, Any], recent_events: Iterable[Mapping[str, Any]]) -> bool:
+    """同一人、同一题材、近期写过且没有新进展 → 视为重复。"""
+    who = str(event.get("who") or "").strip()
+    if not who or who == "我" or _has_progress_for_selection(event):
+        return False
+    bucket = _event_bucket_for_selection(event)
+    for old in recent_events or []:
+        if not isinstance(old, Mapping):
+            continue
+        if str(old.get("who") or "").strip() != who:
+            continue
+        if _event_bucket_for_selection(old) != bucket:
+            continue
+        if bucket in {"affection", "mood"}:
+            return True
+        a = set(_norm_for_repeat(str(event.get("what") or "")))
+        b = set(_norm_for_repeat(str(old.get("what") or "")))
+        if a and b and len(a & b) / max(1, min(len(a), len(b))) >= 0.32:
+            return True
+    return False
+
+
+def _norm_for_repeat(text: str) -> str:
+    return re.sub(r"[^\u4e00-\u9fffa-zA-Z0-9]", "", text).lower()
 
 
 def select_events_for_write(
@@ -631,6 +737,7 @@ def select_events_for_write(
     min_score: int = 4,
     max_per_who: int = 2,
     backfill_score: int = 3,
+    recent_events: Optional[Iterable[Mapping[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """按内容质量挑 1~``max_events`` 件，不强制写满，带**人物多样性**约束。
 
@@ -638,66 +745,80 @@ def select_events_for_write(
     七天真机数据里 7/7 都是三件，结构自然趋同。这里改成「达到分数门槛才算」，
     候选不足时宁可只写一两件；一件都不达标时仍保留最高分那条，避免空日记。
 
-    v1.9.0 依据 2026-11-02~11-07 六天真机数据新增两条纪律：
+    v1.10.0 在 v1.9.0 的多样性基础上再改三件事：
 
-    1. **同人上限 ``max_per_who``**（默认 2）：六天里心理委员 6/6 天霸榜，
-       11-06 入选 3 件全是同一人 —— 纯按分数排序时，聊天最活跃的人会挤掉
-       当天所有其他人物，日记连读就像单人连续剧。保留 2 席给「确实和一个人
-       黏了一整天」的叙事（11-06 的歌词接龙拆成 2 件仍成立），第 3 席起
-       强制让位给别的候选人物。
-    2. **``backfill_score`` 回填**（默认 3）：strong（≥ min_score）经同人上限
-       过滤后仍填不满 ``max_events`` 时，按分数从高到低回填补齐。宁可用一件
-       3 分的群趣闻（被推销自行车、立冬刷屏）也不让席位空着 —— 丰富度来自
-       人物与题材的铺开，不是只盯最高分。
+    1. **episode 级完整性优先于 LLM 分数**：现场有原话、有我的回应、轮次完整的
+       候选排在「只有一句摘要」的前面；
+    2. **不再为了填满席位而回填**：高门槛（``min_score``）之后只允许最多一件
+       3 分补充；有 4 分候选时不会再生硬凑第 4 件；
+    3. **同人同题材要看新进展**：近期三天写过同一人的同一类互动、当天又没有
+       「终于 / 结果 / 改成 / 涨到」等推进时，降权跳过，避免连续几天写同一个
+       撒娇—不会接—先搁着的循环。
 
     Args:
         max_events: 入选上限（默认 4，配置项 ``[diary] max_events`` 同步）。
         min_score: strong 门槛（默认 4）。
         max_per_who: 同一 ``who`` 最多入选几件（≤0 视为不限制）。
-        backfill_score: 回填允许的最低分（默认 3；低于它的候选永不入选）。
+        backfill_score: 补充候选的最低分（默认 3；低于它的候选永不入选）。
+        recent_events: 近几天的存档事件，用于跨天重复判定；空则不做跨天过滤。
 
     Returns:
-        入选事件列表（dict 副本），按原分数降序排列。
+        入选事件列表（dict 副本），按质量排序；数量为 1~``max_events``。
     """
-    ranked = sorted(
-        [dict(e) for e in (events or []) if str(e.get("what") or "").strip()],
-        key=lambda e: int(e.get("score") or 0),
-        reverse=True,
-    )
-    if not ranked:
+    pool = [dict(e) for e in (events or []) if str(e.get("what") or "").strip()]
+    if not pool:
         return []
     cap = max(1, int(max_events))
     who_cap = int(max_per_who)
     floor = int(backfill_score)
+    recent = list(recent_events or [])
 
-    def _pick(pool: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """在 pool 里按分数序取件，同一 who 最多 who_cap 件。"""
-        picked: List[Dict[str, Any]] = []
-        counts: Dict[str, int] = {}
-        for e in pool:
-            if len(picked) >= cap:
-                break
-            who = str(e.get("who") or "").strip()
-            if who_cap > 0 and who and counts.get(who, 0) >= who_cap:
+    ranked = sorted(
+        pool,
+        key=lambda e: (
+            int(e.get("score") or 0),
+            1 if e.get("evidence_ok", True) else 0,
+            int(e.get("scene_completeness") or 0),
+            len(e.get("evidence_turns") or []),
+            1 if e.get("quote") else 0,
+        ),
+        reverse=True,
+    )
+    selected: List[Dict[str, Any]] = []
+    counts: Dict[str, int] = {}
+    eligible_seen = False
+    for event in ranked:
+        if len(selected) >= cap:
+            break
+        if not event.get("evidence_ok", True):
+            continue
+        who = str(event.get("who") or "").strip()
+        # 「我播报/我发动态」这类纯自述不占日记主场景席位；有其他候选时跳过，
+        # 只有全场只剩自身事件时才允许作为最低锚点。
+        if who == "我" and len(pool) > 1:
+            continue
+        score = int(event.get("score") or 0)
+        if score < floor:
+            continue
+        eligible_seen = True
+        # 第一件允许是三分的「当天最高分」；一旦已经有高分主场景，
+        # 后续不再用 3 分及以下凑数。
+        if selected and score < int(min_score):
+            if len(selected) >= 2:
                 continue
-            picked.append(e)
-            if who:
-                counts[who] = counts.get(who, 0) + 1
-        return picked
-
-    strong = [e for e in ranked if int(e.get("score") or 0) >= int(min_score)]
-    selected = _pick(strong)
-    if len(selected) < cap:
-        # 回填：先按同人上限从 ≥backfill_score 的剩余候选里补
-        chosen = {id(e) for e in selected}
-        pool = [
-            e for e in ranked
-            if id(e) not in chosen and int(e.get("score") or 0) >= floor
-        ]
-        selected = _pick(selected + pool)
-    if not selected:
-        # 一件达标（含回填）都没有时保留最高分那条，避免空日记
-        selected = ranked[:1]
+        who = str(event.get("who") or "").strip()
+        if who_cap > 0 and who and counts.get(who, 0) >= who_cap:
+            continue
+        if _recent_repeat(event, recent):
+            continue
+        selected.append(event)
+        if who:
+            counts[who] = counts.get(who, 0) + 1
+    if not selected and not eligible_seen:
+        # 全部候选都低于最低分时，保留最高分那条作为「当天确实有事」的最低锚点；
+        # 但它仍然必须通过证据校验。反过来，若候选全被「近期重复」过滤掉，
+        # 返回空让上层 fail-closed，而不是把重复内容硬写回来。
+        selected = [e for e in ranked if e.get("evidence_ok", True)][:1]
     return selected
 
 
@@ -743,8 +864,10 @@ def event_material_chars(events: List[Dict[str, Any]]) -> int:
     等效于把整条档位曲线右移；六天回放结果合理，但**新口径下的阈值尚未经
     更长周期真机数据验证**，后续若发现普遍偏长应下调阈值而非回退口径。
 
-    ⚠️ 调用时序要求：必须在 :func:`limit_event_quotes` **之前**取快照计算 ——
-    限额清掉的 quote 不该反过来把档位压低。
+    ⚠️ v1.10.0 调用时序改为**在 :func:`limit_event_quotes` 之后**计算。
+    v1.9.0 为了「不让反 AI 腔约束惩罚篇幅」曾在限额前取快照，但真机回放显示
+    六天里素材会被 197→87、148→100 这样腰斩，档位按模型看不见的 quote 抬高，
+    成品反而落不到区间。篇幅应当由**实际进入 prompt 的素材**决定。
     """
     return sum(
         len(str(e.get("what") or "")) + len(str(e.get("quote") or ""))
@@ -1255,14 +1378,21 @@ _OPENING_HINTS = (
 )
 
 
-def opening_hint(date_str: str) -> str:
-    """按日期确定性轮换开场骨架。
+def opening_hint(date_str: str, avoid: Iterable[str] = ()) -> str:
+    """按日期确定性轮换开场骨架，并避开最近两篇用过的骨架。
 
-    同一个 ``date_str`` 永远返回同一条；不同日期大体均匀落在 4 种骨架上。
-    日期缺失/异常时返回第 0 条（不抛异常 —— 开场提示不值当让成文失败）。
+    同一个 ``date_str`` 在同样 ``avoid`` 下永远返回同一条；日期缺失/异常时返回
+    第 0 条（不抛异常 —— 开场提示不值当让成文失败）。真机 11-11～11-13 连续
+    三天用「眼皮 / 脑子 / 先记」起手，单靠日期哈希不足以防重复。
     """
     digest = hashlib.sha256(str(date_str or "").encode("utf-8")).hexdigest()
-    return _OPENING_HINTS[int(digest[:8], 16) % len(_OPENING_HINTS)]
+    start = int(digest[:8], 16) % len(_OPENING_HINTS)
+    used = {str(x).strip() for x in avoid or () if str(x).strip()}
+    for offset in range(len(_OPENING_HINTS)):
+        candidate = _OPENING_HINTS[(start + offset) % len(_OPENING_HINTS)]
+        if candidate not in used:
+            return candidate
+    return _OPENING_HINTS[start]
 
 
 # ---------------------------------------------------------------- AI 腔检测
@@ -1327,6 +1457,8 @@ def build_write_prompt(
     temporal_anchor: str = "",
     continuity_text: str = "",
     weather_hint_text: str = "",
+    recent_openings: Optional[Sequence[str]] = None,
+    avoid_opening_hints: Optional[Sequence[str]] = None,
 ) -> str:
     """阶段二：基于精选素材写日记（v1.5.0「去 AI 味」改写）。
 
@@ -1383,9 +1515,11 @@ def build_write_prompt(
             "   只选一个字（晴/多云/阴/雨/雪），都不许多。"
         )
     else:
+        # v1.10.0：没有天气证据就不写天气。让模型「按氛围选」等于鼓励它把
+        # 聊天里的冷、歌名里的雨当成真实天气；宁可日期行少一个字段。
         weather_rule = (
-            f"第一行固定为 {date_str}，X。其中 X 从 晴/多云/阴/雨 里选一个贴合今天聊天氛围的，"
-            "只选一个字都不许多。"
+            f"第一行固定为 {date_str}。当天素材里**没有**明确的天气依据，"
+            "不要在日期行写天气，也不要在正文里虚构窗外天气。"
         )
     rules = [
         weather_rule,
@@ -1415,7 +1549,8 @@ def build_write_prompt(
         "客观事实可以补写。\n"
         "   ⚠️ 「我问/我说」只能用在**素材真有的互动**上：素材里没写我问过，就不要写我问过"
         "（这正是上面说的\"只有动作没内容\"）。缺转场就直接写结果（「她还没给新歌取名。」），"
-        "比编一个动作再让它落空强。\n"
+        "比编一个动作再让它落空强。素材里的「现场」是唯一可用的对话过程，"
+        "可以压缩，但不能补出现场没有的动作、时间、数字或结果。\n"
         "   涉及他人隐私、家庭矛盾、健康困境的，只作匿名概括：不写昵称、不引用原话、"
         "不补细节。素材里若有「一位群友」，就照这个匿名称呼写。\n"
         "   上面的跨天线索（若有）只能用来引出想法、疑问、期待，或带原日期的回顾；"
@@ -1436,6 +1571,14 @@ def build_write_prompt(
     if style_extra and style_extra.strip():
         rules.append(style_extra.strip())
     rules_text = "\n".join(f"{i}. {rule}" for i, rule in enumerate(rules, 1))
+    recent_block = ""
+    recent_openings = [str(x).strip() for x in (recent_openings or []) if str(x).strip()]
+    if recent_openings:
+        samples = "\n".join(f"- {x[:60]}" for x in recent_openings[:3])
+        recent_block = (
+            "\n最近几篇的开头（**禁止复用相同起手、句式和节奏**，只作反面参考）：\n"
+            f"{samples}\n"
+        )
     # 视角：素材是"脑子里还留着的片段"，不是"整理好的聊天记录复盘"。
     # 被设定成书记员 → 输出必然是转述体；过完了一天的人才会先有印象、再有顺序。
     return f"""{name_line}
@@ -1444,9 +1587,9 @@ def build_write_prompt(
 今天是 {date_str}。这一天过完了，睡前随手记一下。脑子里还留着这些片段：
 
 {events_text}
-{continuity_block}
+{continuity_block}{recent_block}
 现在以第一人称写一篇日记。
-开场：{opening_hint(date_str)}
+开场：{opening_hint(date_str, avoid_opening_hints or ())}
 规则（重要，逐条遵守）：
 {rules_text}
 
@@ -1640,7 +1783,7 @@ def trailing_date_line(content: str, date_str: str) -> tuple[str, str] | None:
     return weather, "\n".join(lines)
 
 
-def ensure_date_line(content: str, date_str: str) -> str:
+def ensure_date_line(content: str, date_str: str, *, allow_weather: bool = True) -> str:
     """保证第一行是日期行，并把它**规范成** ``<日期>，<天气>。``。
 
     五种输入都能正确处理：
@@ -1655,6 +1798,9 @@ def ensure_date_line(content: str, date_str: str) -> str:
     4. **写了另一天的日期行**（v1.4.3 修）→ 同样折叠掉，不让它在正文里留一行
        "第二行日期"。这一行里的天气**不采用**（它属于别的日子，用了会写错天气）。
 
+    v1.10.0 新增 ``allow_weather=False``：当天素材没有天气依据时，只保留
+    ``<日期>。``，不补默认「多云」，也不采用模型自行编造的天气。
+
     「模型写错了日期」这件事不再靠人眼看日志发现：调用方用 :func:`date_line_overridden`
     取到被替换掉的那一行，落进存档字段 ``model_date_line``（见 plugin `_save_diary`）。
 
@@ -1662,8 +1808,13 @@ def ensure_date_line(content: str, date_str: str) -> str:
     它是给「聊天里回看」兜底用的展示文案，**不是可发布的日记**。
     发布前必须先用 :func:`diary_output_problem` 判定，否则占位文本会被当成成品发出去。
     """
+    def _head(weather: str) -> str:
+        if allow_weather:
+            return f"{date_str}，{weather or DEFAULT_WEATHER}。"
+        return f"{date_str}。"
+
     if not content:
-        return f"{date_str}，{DEFAULT_WEATHER}。\n（今天没写出什么来。）"
+        return f"{_head('')}\n（今天没写出什么来。）"
     # ① 先处理**结尾**的日期行：删掉它，并把它写的天气留作备用。
     #    模型有时把日期行当签名写在最后，留着就是"两行日期"（真机 2026-10-08）。
     tail_weather = ""
@@ -1672,7 +1823,7 @@ def ensure_date_line(content: str, date_str: str) -> str:
         tail_weather, content = _tail
     if not content.strip():
         # 整篇就只有那一行日期（罕见）→ 保留它的天气，按空内容兜底
-        return f"{date_str}，{tail_weather or DEFAULT_WEATHER}。\n（今天没写出什么来。）"
+        return f"{_head(tail_weather)}\n（今天没写出什么来。）"
 
     lines = content.split("\n")
     # 跳过可能存在的空行，日期行必须是**第一个非空行**
@@ -1683,7 +1834,7 @@ def ensure_date_line(content: str, date_str: str) -> str:
         # 天气不采用 —— 那是别的日子的天气，用了会把今天的天气写错。
         # 这一行的正文残留（如 ``2026年9月28日，出来看流星雨`` 里的后半句）保留。
         leftover_head = _DATE_TAIL_RE.sub("", _strip_date_components(lines[idx])).strip()
-        lines[idx] = f"{date_str}，{DEFAULT_WEATHER}。"
+        lines[idx] = _head("")
         if leftover_head:
             lines.insert(idx + 1, leftover_head)
     elif parsed is None:
@@ -1691,11 +1842,11 @@ def ensure_date_line(content: str, date_str: str) -> str:
         # 而不是直接 return（曾经写成 `... if idx == 0 else content`，
         # 结果「空行开头且没写日期行」时整篇缺日期头）。
         # 天气优先用**结尾那行日期行**留下的（模型写了就别浪费），没有才用默认值。
-        lines.insert(idx, f"{date_str}，{tail_weather or DEFAULT_WEATHER}。")
+        lines.insert(idx, _head(tail_weather))
         return "\n".join(lines)
     else:
         weather, leftover = parsed
-        lines[idx] = f"{date_str}，{weather or DEFAULT_WEATHER}。"
+        lines[idx] = _head(weather)
         if leftover:
             # 模型把正文第一句挤进了日期行 → 拆出来，别丢内容
             lines.insert(idx + 1, leftover)

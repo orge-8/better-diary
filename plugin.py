@@ -30,7 +30,6 @@ if __package__:  # 包式加载（Runner 真机：插件目录作为包，不在
         build_continuity_line,
         build_extract_prompt,
         build_timeline,
-        build_timeline_fallback_text,
         build_write_prompt,
         choose_word_budget,
         chunk_coverage,
@@ -42,8 +41,10 @@ if __package__:  # 包式加载（Runner 真机：插件目录作为包，不在
         event_id,
         event_material_chars,
         events_to_text,
+        extraction_note_retryable,
         filter_continuity_by_evidence,
         limit_event_quotes,
+        opening_hint,
         parse_events_detailed,
         quote_attribution_risk,
         redact_sensitive_events,
@@ -57,6 +58,13 @@ if __package__:  # 包式加载（Runner 真机：插件目录作为包，不在
         weather_hint,
         filter_meta_against_evidence,
     )
+    from .bd_scene import (
+        attach_evidence,
+        build_recent_context,
+        diary_fact_risks,
+        merge_scene_fragments,
+        style_repeat_reasons,
+    )
     from .bd_cookie import CookieStore, redact_secrets
     from .bd_search import format_hits, on_this_day, search_diaries
 else:  # 平铺兜底（脚本直跑 / 旧测试夹具）
@@ -65,7 +73,6 @@ else:  # 平铺兜底（脚本直跑 / 旧测试夹具）
         build_continuity_line,
         build_extract_prompt,
         build_timeline,
-        build_timeline_fallback_text,
         build_write_prompt,
         choose_word_budget,
         chunk_coverage,
@@ -77,8 +84,10 @@ else:  # 平铺兜底（脚本直跑 / 旧测试夹具）
         event_id,
         event_material_chars,
         events_to_text,
+        extraction_note_retryable,
         filter_continuity_by_evidence,
         limit_event_quotes,
+        opening_hint,
         parse_events_detailed,
         quote_attribution_risk,
         redact_sensitive_events,
@@ -91,6 +100,13 @@ else:  # 平铺兜底（脚本直跑 / 旧测试夹具）
         update_continuity,
         weather_hint,
         filter_meta_against_evidence,
+    )
+    from bd_scene import (
+        attach_evidence,
+        build_recent_context,
+        diary_fact_risks,
+        merge_scene_fragments,
+        style_repeat_reasons,
     )
     from bd_cookie import CookieStore, redact_secrets
     from bd_search import format_hits, on_this_day, search_diaries
@@ -280,7 +296,7 @@ class DiarySection(PluginConfigBase):
     # 装在真机上的实例不会跟着改（config.toml 落盘后不回写），要改请在 config.toml 里改。
     word_target: int = Field(default=350, description="日记目标字数（正文）：按素材丰富度分短/中/长三档，这里是**长档**基准（短 0.4 倍 / 中 0.7 倍）。只是最舒服的长度，不是硬指标")
     word_tolerance: int = Field(default=150, description="目标字数的上下浮动（同样按档位缩放）。区间放宽一点，模型写长了不必回头删")
-    max_events: int = Field(default=4, description="日记最多写几件事（同一人最多占 2 件，名额会优先铺给不同人物与不同类型的事）")
+    max_events: int = Field(default=4, description="日记最多写几个场景（实际可为 1~4；同一人的连续片段会合并，近期同题材无新进展会降权）")
     min_messages: int = Field(default=20, description="当天消息少于此数不生成日记")
     chunk_chars: int = Field(default=6000, description="时间线分块字符数")
     max_chunks: int = Field(default=8, description="最多送入选材的分块数")
@@ -338,7 +354,7 @@ class LLMSection(PluginConfigBase):
     # 默认的 4096 会被思维链吃光 → 正文为空 → 当天日记直接判失败。
     # 这里按请求覆盖它，是**不动宿主全局配置**的前提下唯一能只救本插件的做法。
     max_tokens: int = Field(default=16384, description="单次 LLM 调用的输出 token 上限（传给 Host，覆盖 utils 任务的默认值）。思考型模型会把思维链算进这个额度，4096 会被思维链吃光导致正文为空。0 = 不传，沿用宿主配置")
-    empty_retry: int = Field(default=1, description="拿到**空输出**时额外重试几次。自适应思考是随机的（这一次想了、下一次可能直接答），重试能救回一部分。0 = 不重试")
+    empty_retry: int = Field(default=1, description="选材块**空输出或 JSON 不可解析**时额外补跑几次。只补故障，不重跑「模型明确返回空数组」。0 = 不重试")
     probe_max_tokens: bool = Field(default=True, description="首次 LLM 调用前探测一次 Host 是否真的接受并按预期应用 max_tokens；不支持时自动改为不传，并在日志里点名该怎么修。关掉则假定支持直接传")
 
 
@@ -2440,14 +2456,22 @@ class BetterDiaryPlugin(MaiBotPlugin):
         date_str: str,
         single: bool,
         sem: asyncio.Semaphore | None = None,
+        retry_note: str = "",
     ) -> Tuple[list[dict[str, Any]], str, bool]:
-        """跑一块选材，返回 ``(事件列表, 空块原因, 输出是否为空串)``。
+        """跑一块选材，返回 ``(事件列表, 空块原因, 是否值得补跑)``。
 
-        第三个返回值是 v1.7.0 新加的：``note`` 只能说明"这块空了"，分不出
-        「模型确实说这块没事」和「模型一个字都没吐」。后者可重试，前者不该重试 ——
-        把「确实无事」的 ``[]`` 拿去重跑，纯属烧钱还改变结果。
+        第三个返回值从 v1.10.0 起不再只表示「空字符串」：JSON 解析失败、
+        输出不是数组、数组里没有有效条目都属于**故障**，可以补跑一次；
+        只有模型明确返回 ``[]``（确实无事）不补跑。真机 2026-11-09 就是
+        8 条候选因未转义引号整块丢失，而旧逻辑不认为它可重试。
         """
         prompt = build_extract_prompt(date_str, chunk)
+        if retry_note:
+            prompt += (
+                "\n\n【格式返工】上一轮这块没有产出可用事件（"
+                f"{retry_note}）。请重新提取，严格只输出 JSON 数组；"
+                "字符串内不要出现英文双引号，时间、数字、原话必须照原文。"
+            )
         temp = self.config.llm.extract_temperature
 
         async def body() -> Tuple[list[dict[str, Any]], str, bool]:
@@ -2464,7 +2488,7 @@ class BetterDiaryPlugin(MaiBotPlugin):
                 return [], f"调用{kind}: {exc}", False
             events, note = parse_events_detailed(raw)
             if not events:
-                return [], note, not raw.strip()
+                return [], note, extraction_note_retryable(note, raw)
             return events, "ok", False
 
         if sem is not None:
@@ -2480,11 +2504,10 @@ class BetterDiaryPlugin(MaiBotPlugin):
         *,
         enabled: bool,
     ) -> list[Tuple[list[dict[str, Any]], str, bool]]:
-        """对「模型一个字没吐」的选材块**串行**补跑。
+        """对**故障型空块**做串行补跑（空输出 / JSON 不可解析 / 无有效条目）。
 
         单块时不进这里：单块走的是 :meth:`_call_llm_nonempty`，空输出已经在里面重跑过了，
-        再来一轮就是重复烧钱。
-        多块时也必须串行 —— 并发补跑会让整轮成文耗时失控（原设计刻意不给多块加重试）。
+        再来一轮就是重复烧钱。多块时必须串行，避免补跑把整轮成文耗时拖失控。
         """
         if not enabled:
             return list(results)
@@ -2495,12 +2518,28 @@ class BetterDiaryPlugin(MaiBotPlugin):
             if not targets:
                 break
             for i in targets:
-                self.ctx.logger.info("选材块%d 空输出，第 %d/%d 次补跑", i + 1, rd, rounds)
-                out[i] = list(await self._extract_one_chunk(chunks[i], date_str, False))
+                reason = str(out[i][1] or "无可用输出")
+                self.ctx.logger.info(
+                    "选材块%d 无可用事件（%s），第 %d/%d 次补跑",
+                    i + 1, reason[:80], rd, rounds,
+                )
+                out[i] = list(
+                    await self._extract_one_chunk(
+                        chunks[i], date_str, False, retry_note=reason,
+                    )
+                )
         return [cast(Tuple[list[dict[str, Any]], str, bool], tuple(r)) for r in out]
 
-    async def _extract_events(self, timeline: str, date_str: str) -> list[dict[str, Any]]:
-        """阶段一：分块选材 + 打分 + 合并排序。
+    async def _extract_events(
+        self,
+        timeline: str,
+        date_str: str,
+        *,
+        messages: list[dict[str, Any]] | None = None,
+        bot_qq: str = "",
+        bot_labels: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """阶段一：分块选材 + 打分 + 证据回填 + 场景合并。
 
         v1.4.0：**单块时**也走 :meth:`_call_llm_with_retry`（此前 `write_retry`
         只作用于成文，选材阶段完全没有重试 —— 真机实录里因此白废了整块选材）。
@@ -2545,6 +2584,32 @@ class BetterDiaryPlugin(MaiBotPlugin):
             if key not in seen:
                 seen.add(key)
                 unique.append(e)
+        if messages:
+            enriched = attach_evidence(
+                unique,
+                messages,
+                bot_qq=bot_qq,
+                bot_labels=bot_labels or {"我"},
+            )
+            missing = sum(1 for e in enriched if not e.get("evidence_ok", True))
+            risky = sum(1 for e in enriched if e.get("evidence_risks"))
+            if missing:
+                self.ctx.logger.warning(
+                    "选材证据回填：%d/%d 条找不到对应原消息，已排除出成文",
+                    missing, len(enriched),
+                )
+            if risky:
+                self.ctx.logger.warning(
+                    "选材事实校验：%d 条摘要含无法回查的时间/数字/原话，已改用现场原文",
+                    risky,
+                )
+            unique = merge_scene_fragments(enriched, messages, bot_qq=bot_qq)
+            merged_count = sum(1 for e in unique if int(e.get("fragment_count") or 1) > 1)
+            if merged_count:
+                self.ctx.logger.info(
+                    "场景合并：%d 个 episode 由多条连续摘要合成（避免同一场景重复占位）",
+                    merged_count,
+                )
         return unique
 
     async def _generate_for_date(self, date_str: str) -> tuple[bool, str]:
@@ -2595,18 +2660,36 @@ class BetterDiaryPlugin(MaiBotPlugin):
             "时间线构建完成: 消息 %d 条（bot %d / 用户 %d），时间线 %d 字符",
             stats["total"], stats["bot"], stats["user"], len(timeline),
         )
-        # 阶段一：选材；失败或为空则降级用时间线末尾
-        events = await self._extract_events(timeline, date_display(date_str))
-        # 作者本人的称呼：素材渲染靠它把"别人说的"与"我自己的话"分开（先于成文解析）
+        # 作者本人的称呼先解析：证据回填靠它把 bot 昵称形态也认成「我」。
         self_name = await self._resolve_nickname()
         self_labels = {"我", self_name}
+        # 阶段一：选材 + 原消息证据回填。没有可核验场景时不降级倾倒原始聊天。
+        events = await self._extract_events(
+            timeline,
+            date_display(date_str),
+            messages=messages,
+            bot_qq=bot_qq,
+            bot_labels=self_labels,
+        )
+        _diaries = self._load_diaries()
+        _recent = build_recent_context(_diaries, date_str, days=3)
         used_events: list[dict[str, Any]] = []
         _material_chars = 0
         if events:
-            # 内容优先：达到分数门槛的才写，最多 max_events 件，不强制写满。
+            # 内容优先：最多 max_events 个场景，不强制写满；同一人只留一个 episode。
             selected = select_events_for_write(
-                events, max_events=max(1, self.config.diary.max_events),
+                events,
+                max_events=max(1, self.config.diary.max_events),
+                max_per_who=1,
+                recent_events=_recent.get("events") or [],
             )
+            if not selected:
+                _no_evidence = sum(1 for e in events if not e.get("evidence_ok", True))
+                self.ctx.logger.warning(
+                    "候选 %d 条均未入选（无证据 %d 条；其余为近期重复或低于门槛），本日不生成",
+                    len(events), _no_evidence,
+                )
+                return False, "当天没有可核验且足够新鲜的可写场景，本日不生成"
             # 敏感事件在进入 prompt 前匿名化：不点名、不引用、不把原话写进公开成品。
             # 昵称全集取自当天时间线 —— 敏感摘要里可能提到未被选中的第三人。
             _known_names = {who for who, _ in timeline_speaker_lines(timeline)}
@@ -2617,18 +2700,15 @@ class BetterDiaryPlugin(MaiBotPlugin):
                 self.ctx.logger.info(
                     "敏感事件匿名化: %d 件（昵称与原话不进入成文 prompt）", _redacted,
                 )
-            # 篇幅档位的素材字数**必须在引用限额之前**取快照（v1.9.0）：
-            # event_material_chars 现在把 quote 计入，而 limit_event_quotes 会把多余的
-            # quote 清空 —— 顺序反了的话，「限额清掉 3 条原话」会顺手把档位从长压到短，
-            # 等于让反 AI 腔的约束去惩罚篇幅。素材量衡量的是「今天有多少可写的料」，
-            # 与「允许引用几句」是两件事。
-            _material_chars = event_material_chars(used_events)
             # 全篇最多一条别人的原话，其余 quote 在素材侧清掉。
             used_events, _quotes_removed = limit_event_quotes(
                 used_events, limit=1, self_labels=self_labels,
             )
             if _quotes_removed:
                 self.ctx.logger.info("引用限额: 移除 %d 条多余原话，全篇最多保留 1 处", _quotes_removed)
+            # v1.10.0：篇幅按**实际送入 prompt 的素材**算。旧顺序在限额前取快照，
+            # 真机里曾出现 197 → 87 字，档位却被已删除的 quote 抬到长档。
+            _material_chars = event_material_chars(used_events)
             events_text = events_to_text(used_events, self_labels=self_labels)
             self.ctx.logger.info(
                 "选材完成: %d 件入选（候选 %d 件，按分数取，不强制写满）",
@@ -2650,10 +2730,10 @@ class BetterDiaryPlugin(MaiBotPlugin):
                 ", ".join(event_id(date_str, e) for e in used_events),
             )
         else:
-            # 具体原因已在上方「选材空块」日志里按块列出（确实无事 / 解析失败 / 调用失败）；
-            # 这条保留同样的关键字，方便沿用旧的日志检索习惯，但不再笼统归因。
-            self.ctx.logger.warning("选材为空，降级用时间线末尾（原因见上方「选材空块」）")
-            events_text = build_timeline_fallback_text(timeline[-4000:])
+            # v1.10.0 fail-closed：阶段一没有产出可核验场景时，不再把未治理的原始
+            # 时间线直接交给成文模型。原因已在上方「选材空块」逐块列出，便于重试/调参。
+            self.ctx.logger.error("没有可核验的日记场景，本日不生成（不再降级倾倒原始时间线）")
+            return False, "当天没有提取到可核验的日记场景，本日不生成"
 
         # 阶段二：成文
         persona = await self._resolve_persona()
@@ -2677,16 +2757,13 @@ class BetterDiaryPlugin(MaiBotPlugin):
                 )
             else:
                 self.ctx.logger.info("连续性线索: 当天素材没有新证据，全部不注入")
-        # 篇幅三档：按**素材信息量**选档，不再「写了几件事 → 必然多长」。
-        # 三个短事可以写短，一件有细节的事也可以写长；档位由素材字符量确定性决定。
-        # v1.9.0：material_chars 用引用限额**之前**的快照（见上方 _material_chars），
-        # 避免 limit_event_quotes 清掉原话时顺手把档位压低。
+        # 篇幅三档：按实际进入 prompt 的素材信息量选档，不再按已删除的 quote 抬高。
         _budget = choose_word_budget(
             max(80, self.config.diary.word_target),
             max(0, self.config.diary.word_tolerance),
             event_count=len(used_events),
-            material_mode="events" if used_events else "timeline_tail",
-            material_chars=_material_chars if used_events else None,
+            material_mode="events",
+            material_chars=_material_chars,
         )
         self.ctx.logger.info(
             "篇幅档位: %s（目标 %d，区间 %d~%d，依据：%s）",
@@ -2697,6 +2774,11 @@ class BetterDiaryPlugin(MaiBotPlugin):
         _weather = weather_hint(timeline)
         if _weather:
             self.ctx.logger.info("天气线索（来自当天素材）: %s", _weather)
+        else:
+            self.ctx.logger.info("天气线索: 当天素材没有明确依据，日期行不写天气")
+        _recent_openings = list(_recent.get("openings") or [])
+        _avoid_hints = list(_recent.get("opening_hints") or [])
+        _opening_hint = opening_hint(date_display(date_str), avoid=_avoid_hints)
         prompt = build_write_prompt(
             date_str=date_display(date_str),
             events_text=events_text,
@@ -2710,21 +2792,13 @@ class BetterDiaryPlugin(MaiBotPlugin):
             temporal_anchor="" if is_today else date_display(date_str),
             continuity_text=build_continuity_line(continuity),
             weather_hint_text=_weather,
+            recent_openings=_recent_openings,
+            avoid_opening_hints=_avoid_hints,
         )
         raw = await self._call_llm_nonempty(prompt, self.config.llm.temperature, stage="日记成文")
         stripped = strip_diary_output(raw)
         # 结构化 META 永远不进正文（split_meta 会先切掉，即使解析失败也不泄漏）
         body, meta = split_meta(stripped)
-        # META 反幻觉（v1.6.0）：它不进正文、不发布，但会写进 continuity.json 并经
-        # get_day_digest 交给别的插件 —— 编错的术语会**每天在错的基础上继续累积**。
-        # 真机 2026-10-18 的 13 条里 12 条是幻觉，所以这里用素材做确定性回校。
-        meta, _meta_dropped = filter_meta_against_evidence(meta, timeline)
-        if _meta_dropped:
-            # 抑制分支必须留痕：否则「清洗太狠」会变成另一种看不见的静默
-            self.ctx.logger.warning(
-                "META 剔除 %d 条当天素材里找不到依据的术语（不进连续性）: %s",
-                len(_meta_dropped), "、".join(_meta_dropped[:6]),
-            )
         # 发布前的语义闸：拒答 / 空输出 / 残句一律判失败，本日不存档也不发布。
         # 日记成品会公开出现在 QQ 空间，绝不能把「抱歉，作为一个人工智能…」发出去。
         problem = diary_output_problem(body)
@@ -2738,7 +2812,68 @@ class BetterDiaryPlugin(MaiBotPlugin):
                 redact_secrets(body[:80]) or "（空）",
             )
             return False, f"模型没写出可用的日记（{problem}），本日不生成"
-        content = ensure_date_line(body, date_display(date_str))
+        display_date = date_display(date_str)
+        content = ensure_date_line(body, display_date, allow_weather=bool(_weather))
+        _fact_risks = diary_fact_risks(content, timeline)
+        _style_risks = style_repeat_reasons(content, _recent_openings)
+        if _fact_risks or _style_risks:
+            reasons = _fact_risks + _style_risks
+            # 日志只记「有几类问题」，不写正文与聊天原话。
+            self.ctx.logger.warning(
+                "成文质量检查：%d 项需返工（事实 %d / 风格 %d）",
+                len(reasons), len(_fact_risks), len(_style_risks),
+            )
+            correction = (
+                "\n\n【返工要求】上一版存在以下问题，请重写全文，其他事实保持不变：\n- "
+                + "\n- ".join(reasons)
+                + "\n不要解释，直接输出修正后的日记正文与 META。"
+            )
+            try:
+                retry_raw = await self._call_llm_nonempty(
+                    prompt + correction, self.config.llm.temperature, stage="日记返工",
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - 返工失败按原稿事实风险决定去留
+                retry_raw = ""
+                self.ctx.logger.warning("日记返工调用失败: %s", exc)
+            retry_body, retry_meta = split_meta(strip_diary_output(retry_raw))
+            retry_problem = diary_output_problem(retry_body)
+            if not retry_problem:
+                retry_content = ensure_date_line(
+                    retry_body, display_date, allow_weather=bool(_weather),
+                )
+                retry_fact = diary_fact_risks(retry_content, timeline)
+                if retry_fact:
+                    self.ctx.logger.error(
+                        "返工后仍有 %d 项事实无法回查，本日不发布", len(retry_fact),
+                    )
+                    return False, "日记返工后仍有无法回查的事实，本日不生成"
+                # 风格重复最多再试一次；第二次不追求完美，记录后接受，避免无限返工。
+                retry_style = style_repeat_reasons(retry_content, _recent_openings)
+                content, body, meta = retry_content, retry_body, retry_meta
+                _fact_risks, _style_risks = retry_fact, retry_style
+            elif _fact_risks:
+                self.ctx.logger.error(
+                    "日记返工不可用（%s），且原稿存在事实风险，本日不发布", retry_problem,
+                )
+                return False, "日记返工失败，本日不生成"
+            else:
+                self.ctx.logger.warning("日记返工不可用（%s），保留原稿", retry_problem)
+        if _style_risks:
+            self.ctx.logger.info(
+                "风格防重：返工后仍有 %d 项与近期相似，接受本稿（不再无限重写）",
+                len(_style_risks),
+            )
+        # META 反幻觉（v1.6.0）：它不进正文、不发布，但会写进 continuity.json 并经
+        # get_day_digest 交给别的插件 —— 编错的术语会**每天在错的基础上继续累积**。
+        meta, _meta_dropped = filter_meta_against_evidence(meta, timeline)
+        if _meta_dropped:
+            # 抑制分支必须留痕：否则「清洗太狠」会变成另一种看不见的静默
+            self.ctx.logger.warning(
+                "META 剔除 %d 条当天素材里找不到依据的术语（不进连续性）: %s",
+                len(_meta_dropped), "、".join(_meta_dropped[:6]),
+            )
         # 日期行被补写/规范化时留痕。真机踩坑（2026-09-28）：模型写成
         # 「2026年9月28日 星期一 雨」（漏逗号）→ 旧判据认不出 → 补出第二行日期、
         # 还把真实天气冲成默认值。有这条日志，同类形态一眼可见。
@@ -2804,11 +2939,12 @@ class BetterDiaryPlugin(MaiBotPlugin):
         if _tone:
             self.ctx.logger.info("AI 腔检测命中 %d 项: %s", len(_tone), "、".join(_tone))
 
-        material_mode = "events" if used_events else "timeline_tail"
+        material_mode = "events"
         self._save_diary(
             date_str, content, stats,
             events=used_events, material_mode=material_mode, meta=meta,
             model_date_line=model_date_line, tone_hits=_tone,
+            opening_hint=_opening_hint,
         )
         # 累积跨天连续性（纯累积 + 保序去重，不再额外调 LLM）
         if used_events or meta:
@@ -3048,6 +3184,7 @@ class BetterDiaryPlugin(MaiBotPlugin):
         meta: dict[str, Any] | None = None,
         model_date_line: str = "",
         tone_hits: list[str] | None = None,
+        opening_hint: str = "",
     ) -> None:
         path = self._store_path()
         try:
@@ -3081,6 +3218,8 @@ class BetterDiaryPlugin(MaiBotPlugin):
                 # v1.5.0：AI 腔检测的命中标签（空列表 = 没命中）。非阻断，只用于回看
                 # 「改了 prompt 之后腔调有没有真的降下来」，不参与任何发布判定。
                 "ai_tone_hits": [str(x) for x in (tone_hits or []) if str(x or "").strip()],
+                # v1.10.0：记录本次实际使用的开场骨架，下一篇选开场时避开最近两次。
+                "opening_hint": str(opening_hint or "")[:120],
             }
             tmp = path.with_suffix(".json.tmp")
             tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")

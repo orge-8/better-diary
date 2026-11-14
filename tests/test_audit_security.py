@@ -97,7 +97,7 @@ def build_plugin(llm_reply: str, msgs):
 
     async def fake_llm(prompt: str, temperature: float) -> str:
         if "只输出 JSON 数组" in prompt:  # 阶段一：选材
-            return '[{"who": "甲", "what": "聊了一件事", "quote": "原话", "score": 4}]'
+            return '[{"who": "用户0", "what": "聊完一件事，结果想早点睡", "quote": "闲聊第 0 句", "score": 4}]'
         return llm_reply  # 阶段二：成文
 
     plugin._call_llm = fake_llm  # type: ignore[assignment]
@@ -1548,7 +1548,7 @@ def test_generate_recovers_from_transient_timeout(tmp_path, monkeypatch):
 
     async def flaky(prompt, temperature):
         if "只输出 JSON 数组" in prompt:  # 阶段一选材
-            return '[{"who": "甲", "what": "聊了一件事", "quote": "原话", "score": 4}]'
+            return '[{"who": "用户0", "what": "聊完一件事，结果想早点睡", "quote": "闲聊第 0 句", "score": 4}]'
         writes.append(1)
         if len(writes) == 1:
             raise _timeout_exc()
@@ -1561,6 +1561,36 @@ def test_generate_recovers_from_transient_timeout(tmp_path, monkeypatch):
     assert ok is True, content
     assert len(writes) == 2, "应当重试一次后成功"
     assert plugin._load_diaries()["2026-09-26"]["content"]
+
+
+def test_unsupported_time_claim_triggers_one_rewrite(tmp_path, monkeypatch):
+    """成文出现素材没有推算时间（如「关门前13秒」）→ 最多返工一次，改对才落盘。"""
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    plugin = build_plugin("占位", make_messages(40))
+    plugin._data_dir = lambda: tmp_path  # type: ignore[assignment]
+    writes: list[str] = []
+
+    async def quality_llm(prompt, temperature):
+        if "只输出 JSON 数组" in prompt:
+            return '[{"who": "用户0", "what": "聊完一件事，结果想早点睡", "quote": "闲聊第 0 句", "score": 4}]'
+        writes.append(prompt)
+        if len(writes) == 1:
+            return (
+                "2026年9月26日 星期六，晴。\n"
+                "她回来得很晚，关门前13秒才刷脸进门，我在群里看着都替她着急。"
+            )
+        return (
+            "2026年9月26日 星期六，晴。\n"
+            "她回来得很晚，赶在门禁前进了宿舍，我在群里看着都替她着急。"
+        )
+
+    plugin._call_llm = quality_llm  # type: ignore[assignment]
+    ok, content = asyncio.run(plugin._generate_for_date("2026-09-26"))
+
+    assert ok is True, content
+    assert len(writes) == 2, f"事实风险应触发一次返工，实际成文调用 {len(writes)} 次"
+    assert "13秒" not in content
+    assert plugin._load_diaries()["2026-09-26"]["content"] == content
 
 
 def test_catch_up_isolates_single_day_failure(tmp_path):

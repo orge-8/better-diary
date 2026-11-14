@@ -467,7 +467,7 @@ print("NOHTTPX-LOAD-OK")
     )
     # 元凶：prompt 曾用「」当占位符（写「<日期>，X。」），教模型把「」当"待填框"
     check("日期行规则不得用「」做占位符", "「2026年9月27日 星期日，X。」" not in wp, wp.splitlines()[6:8])
-    check("日期行规则仍写明了格式", "2026年9月27日 星期日，X。" in wp)
+    check("日期行规则仍写明了格式", "第一行固定为 2026年9月27日 星期日。" in wp)
     check("规则要求「」内只放别人原话", "只能放" in wp and "原话" in wp)
     check("规则要求自己的话在引号外", "引号" in wp and "外面" in wp)
     check("给出了错误/正确写法对照", "错误写法" in wp and "正确写法" in wp)
@@ -570,7 +570,7 @@ print("NOHTTPX-LOAD-OK")
             check("存档带 ai_tone_hits 字段（空列表 = 没命中）",
                   _entry.get("ai_tone_hits") == [], str(_entry.get("ai_tone_hits")))
 
-        # ② 选材返回空数组 → 降级 timeline_tail → 短档 140±75
+        # ② 选材明确返回空数组 → v1.10.0 fail-closed，不倾倒原始时间线
         _prompts_tail: list[str] = []
 
         def llm_none(prompt: str) -> dict:
@@ -595,14 +595,11 @@ print("NOHTTPX-LOAD-OK")
                     "security": {"admin_ids": []},
                 }
             )
-            ok_tl, _ = asyncio.run(pt._generate_for_date("2026-09-28"))
-            check("选材为空也能降级成文", ok_tl)
-            _tail_prompt = next((p for p in _prompts_tail if "睡前随手记一下" in p), "")
-            check("降级 → 短档 140 字（65~215）",
-                  "篇幅：65~215 字，140 字上下" in _tail_prompt, "降级没走到短档")
-            _saved_tl = json.loads((tail_dir / "diaries.json").read_text(encoding="utf-8"))
-            check("降级那天 material_mode 仍是 timeline_tail",
-                  _saved_tl.get("2026-09-28", {}).get("material_mode") == "timeline_tail")
+            ok_tl, msg_tl = asyncio.run(pt._generate_for_date("2026-09-28"))
+            check("选材为空时拒绝生成（不再倾倒原始时间线）", not ok_tl, msg_tl)
+            check("空选材没有进入成文阶段",
+                  not any("睡前随手记一下" in p for p in _prompts_tail))
+            check("空选材不写存档", not (tail_dir / "diaries.json").exists())
 
         # ③ AI 腔检测：套话连篇的示例正文 → 命中标签落进存档（但照常成文）
         with tempfile.TemporaryDirectory() as td_tone:
@@ -610,7 +607,12 @@ print("NOHTTPX-LOAD-OK")
 
             def llm_tone(prompt: str) -> dict:
                 if "日记素材编辑" in prompt:
-                    return {"success": True, "response": "[]"}
+                    return {"success": True, "response": json.dumps([{
+                        "who": "秋枫叶语Acer",
+                        "what": "聊完一件事，结果想早点睡",
+                        "quote": "刚下大巴，饿死了",
+                        "score": 4,
+                    }], ensure_ascii=False)}
                 return {"success": True, "response": (
                     "2026年9月29日 星期二，晴。\n"
                     "今天真是充实的一天！！我意识到要慢下来，明天也要加油。"
@@ -1714,7 +1716,7 @@ print("NOHTTPX-LOAD-OK")
         weather_hint_text=_wh,
     )
     check("有线索时 prompt 把天气钉死", "不许凭感觉改成别的天气" in _wprompt)
-    check("无线索时保持旧规则", "选一个贴合今天聊天氛围的" in bd.build_write_prompt(
+    check("无线索时不猜天气", "不要在日期行写天气" in bd.build_write_prompt(
         date_str="2026年10月18日", events_text="x", name="鸣澜", persona="是个DJ"))
 
     # 真机 2026-10-18 那份 META：13 条里 12 条是幻觉

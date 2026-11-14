@@ -58,7 +58,8 @@ def _result(text: str, reasoning: str = "") -> dict:
 
 
 def _extract_reply(label: str) -> str:
-    return f'[{{"who": "甲", "what": "{label}", "quote": "原话说了一遍", "score": 4}}]'
+    # 与 make_messages 的真实消息对齐，确保 v1.10.0 的证据回填能命中。
+    return f'[{{"who": "用户0", "what": "{label}", "quote": "闲聊第 0 句", "score": 4}}]'
 
 
 def _is_probe(payload: dict) -> bool:

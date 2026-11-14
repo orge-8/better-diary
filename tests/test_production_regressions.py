@@ -219,8 +219,8 @@ def test_selection_caps_same_person():
     assert len(selected) == 3
 
 
-def test_selection_prefers_variety_over_single_person_domination():
-    """六天真机里心理委员 6/6 天霸榜；上限 2 + 回填后应铺开成多人物。"""
+def test_selection_stops_instead_of_backfilling_a_fourth_slot():
+    """v1.10.0：有 4 分候选时不再用 3 分凑第 4 席；1~4 件自然变化。"""
     events = [
         {"who": "A", "what": "a1", "quote": "", "score": 5},
         {"who": "A", "what": "a2", "quote": "", "score": 5},
@@ -231,10 +231,10 @@ def test_selection_prefers_variety_over_single_person_domination():
     ]
     selected = BD.select_events_for_write(events, max_events=4, max_per_who=2)
     whos = [e["who"] for e in selected]
-    # A 只占 2 席，B 进 strong，C 回填第 4 席；4 席铺出 3 个人物（旧行为是 A,A,A,B）
     assert whos.count("A") == 2
-    assert "B" in whos and "C" in whos
-    assert len({*whos}) == 3
+    assert "B" in whos
+    assert "C" not in whos and "D" not in whos
+    assert len(selected) == 3
 
 
 def test_selection_keeps_one_event_when_none_meets_threshold():
